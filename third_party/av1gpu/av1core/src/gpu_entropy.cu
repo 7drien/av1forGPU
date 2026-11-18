@@ -1,0 +1,1963 @@
+// av1core GPU entropy: GPU symbolization + entropy coding.
+//
+// Symbolization is parallel because every context of the AV1 intra syntax is a
+// function of the DecisionRecord only (never of CDF values):
+//   prep       k_blocks (1 thread / block): frame, tile, global tx block index, SB starts,
+//              decode-order checks; k_sbs (1 / SB): SB block ranges; k_tiles (1 warp / tile):
+//              tile block ranges + the delta-q CurrentQIndex chain (warp scan)
+//   k_maps     1 thread / block:   4x4 mode-info maps (MiSize, YMode, Skip, TxSize)
+//   k_txctx    1 thread / tx block: eob, culLevel, dcCategory -> per-plane 4x4
+//                                   context maps (= Above/Left Level/Dc contexts)
+//   k_txsym    1 thread / tx block: coefficient syntax (all_zero, tx type, eob,
+//                                   coeff_base(_eob), coeff_br, signs, Golomb)
+//   k_sbsym    1 thread / 64x64 SB: partition walk + mode info syntax
+//   (count pass -> CUB exclusive scan -> emit pass, so streams are in bitstream order)
+//   k_entropy_win  1 warp / tile: windows of 32 symbols - CDF adaptation lane-parallel
+//                  (serialised only between symbols of the same CDF), then lane 0 range-codes
+//                  the precomputed (fl, fh) words with in-place carry propagation
+//   k_pack     tile payloads -> one packed buffer
+// Output is byte-identical to the CPU writer (src/encoder.cpp), which uses the
+// same headers (dsp.h, blockinfo.h, cdfctx.h, symstream.h, entenc.h).
+#include "gpu_entropy.h"
+#include "internal.h"
+#include "av1g/av1g.h"
+#include "av1g/blockinfo.h"
+#include "av1g/cdfctx.h"
+#include "av1g/dsp.h"
+#include "av1g/entenc.h"
+#include "av1g/symstream.h"
+
+#include <cub/cub.cuh>
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <type_traits>
+#include <cstdio>
+#include <mutex>
+#include <cstring>
+
+namespace av1g_gpu {
+
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { err = std::string("CUDA: ") + cudaGetErrorString(e_) + " at " #x; return -1; } } while (0)
+
+struct FrameG {
+    int W, H, MiCols, MiRows, mono, qidx, reduced, txsel, sct, dq, dqRes, fi, cdefBits;  // cdefBits -1: CDEF off
+    int ssx, ssy;                                // chroma subsampling (4:2:0 / monochrome 1, 4:4:4 0)
+    uint64_t miBase;
+    uint64_t ctxBase[3];
+    uint64_t tctxBase[3];                        // trusted records: the frame's planes in DevBatch::ctxLvl / ctxDc
+    int ctxStride[3], ctxRows[3];
+    uint32_t blockBase, nBlocks, txbBase, nTxb;  // batch-global (relative to frame 0)
+    uint64_t coeffBase;                          // absolute index into the caller's coeffs[]
+    uint32_t sbBase, nSb, tileBase, nTiles;
+    int tileCols, tileRows, tileWsb, tileHsb;    // uniform tile grid
+    int bd;                                      // BitDepth (palette colours)
+    uint32_t palBase, nPal;                      // the frame's palettes: batch-global indices palBase .. + nPal
+    uint64_t mapBase;                            // its colour index maps in DevBatch::colorMap (absolute)
+};
+#define NO_PAL 0xFFFFFFFFu
+// lossless frame (base_q_idx 0, every DeltaQ 0: av1g_encode's rule): 4x4 WHT, no tx types, the lossless CfL rule.
+// The symbolization kernels take a template flag LL: batches without lossless frames run the LL = false
+// instantiations, which compile exactly as before lossless support.
+__device__ __forceinline__ int frame_lossless(const FrameG &F) { return F.qidx == 0; }
+struct TileG {
+    uint32_t frame;
+    int miRowStart, miRowEnd, miColStart, miColEnd;
+    uint32_t firstBlock, endBlock;               // device-computed
+    uint32_t sbBase, nSb;                        // global decode-order SB range
+    int sbRow0, sbCol0, sbCols;
+};
+struct SbG {
+    uint32_t frame, tile, firstBlock, endBlock;
+    int r, c;
+    int qBefore;  // CurrentQIndex before this SB (delta-q chain, computed per tile on the device)
+};
+
+// a dummy instance whose field addresses define the cdf ids (as in the CPU TeeSink)
+__device__ av1g_cdfs g_cdf_layout;
+#define CID(expr) ((uint32_t)((const uint16_t *)&(g_cdf_layout.expr) - (const uint16_t *)&g_cdf_layout))
+
+// EMIT = false: counting only (k_txsym's count pass, where everything that only feeds the symbol values -
+// contexts, the level map - compiles away)
+template <bool EMIT = true>
+struct Out {
+    uint32_t *p;
+    uint32_t n;
+    __device__ void put(uint32_t w) { if (EMIT && p) p[n] = w; n++; }
+    __device__ void sym(uint32_t cid, int s, int N) { put(av1g_sym_pack(AV1G_SYM_ADAPT, cid, (uint32_t)s, (uint32_t)N)); }
+    __device__ void bit(int b) { put(av1g_sym_pack(AV1G_SYM_BOOL, 0, (uint32_t)b, 2)); }
+    __device__ void lit(int v, int bits) { for (int i = bits - 1; i >= 0; i--) bit((v >> i) & 1); }   // L(bits)
+    __device__ void skip(uint32_t k) { n += k; }   // slots another kernel fills (palette tokens)
+};
+
+// ---------------------------------------------------------------------------
+// palette inputs of the symbolization (null in batches without screen-content frames)
+struct PalG {
+    const av1g_palette *pals;   // batch-global palette index -> entry (block frame-relative)
+    const uint8_t *cmap;        // DevBatch::colorMap
+    const uint32_t *blockPal;   // global block -> palette index, NO_PAL: none (null when the batch has no palettes)
+    uint8_t *mPalY, *mPalUV;    // PaletteSizes per 4x4 (miBase-relative like the other maps)
+    uint32_t *mPalIdx;          // palette index per 4x4
+    uint32_t *palTok;           // [2 * nPal] first symbol slot of the luma / chroma index-map tokens (emit pass)
+};
+
+__global__ void k_maps(const av1g_block *blocks, const uint32_t *blockFrame, const FrameG *frames, uint32_t nBlocks,
+                       uint8_t *mMiSize, uint8_t *mYMode, uint8_t *mSkip, uint8_t *mTx, PalG pg) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nBlocks) return;
+    const av1g_block k = blocks[b];
+    const FrameG &F = frames[blockFrame[b]];
+    const int bw4 = av1g_bw4(k.bsize), bh4 = av1g_bh4(k.bsize);
+    const int rEnd = min(k.mi_row + bh4, F.MiRows), cEnd = min(k.mi_col + bw4, F.MiCols);
+    const uint8_t tx = (uint8_t)av1g_luma_tx_size(k.bsize, k.tx_depth);
+    for (int y = k.mi_row; mMiSize && y < rEnd; y++)   // (null: the palette maps only - trusted records)
+        for (int x = k.mi_col; x < cEnd; x++) {
+            const uint64_t i = F.miBase + (uint64_t)y * F.MiCols + x;
+            mMiSize[i] = k.bsize;
+            mYMode[i] = k.y_mode;
+            mSkip[i] = k.skip;
+            mTx[i] = tx;
+        }
+    if (pg.mPalY) {   // batches with screen-content frames: PaletteSizes and the palette of every 4x4
+        const uint32_t gp = pg.blockPal ? pg.blockPal[b] : NO_PAL;
+        const uint8_t sy = gp != NO_PAL ? pg.pals[gp].size_y : 0, suv = gp != NO_PAL ? pg.pals[gp].size_uv : 0;
+        for (int y = k.mi_row; y < rEnd; y++)
+            for (int x = k.mi_col; x < cEnd; x++) {
+                const uint64_t i = F.miBase + (uint64_t)y * F.MiCols + x;
+                pg.mPalY[i] = sy;
+                pg.mPalUV[i] = suv;
+                pg.mPalIdx[i] = gp;
+            }
+    }
+}
+
+// batch-global palette index -> frame (frames' palettes are back to back)
+__device__ uint32_t frame_of_pal(const FrameG *F, uint32_t nF, uint32_t g) {
+    uint32_t lo = 0, hi = nF;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (F[mid].palBase <= g) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+// blockPal[global block] = its palette (the list is in increasing block order per frame)
+__global__ void k_palblocks(const FrameG *F, uint32_t nF, const av1g_palette *pals, uint32_t nPal, uint32_t *blockPal, DevStatus *st) {
+    const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= nPal) return;
+    const FrameG &f = F[frame_of_pal(F, nF, g)];
+    const av1g_palette p = pals[g];
+    const bool bad = p.block >= f.nBlocks || (g > f.palBase && pals[g - 1].block >= p.block) || p.size_y == 1 || p.size_y > 8 ||
+                     p.size_uv == 1 || p.size_uv > 8 || !(p.size_y | p.size_uv) || !f.sct;
+    if (bad) { atomicOr(&st->error, AV1G_GPU_ERR_ORDER); return; }
+    blockPal[f.blockBase + p.block] = g;
+}
+
+// palette_tokens: the colour-index symbols of one map (CUDA block per (palette, plane)), written into the slots
+// k_sbsym reserved after the first index (palTok), in the spec's anti-diagonal order
+__global__ void k_palsym(const FrameG *F, uint32_t nF, const av1g_block *blocks, PalG pg, uint32_t *syms, const uint32_t *symTotal,
+                         uint64_t symCap) {
+    const uint32_t g = blockIdx.x >> 1;
+    const int uv = blockIdx.x & 1;
+    if (*symTotal > symCap) return;
+    const av1g_palette p = pg.pals[g];
+    const int n = uv ? p.size_uv : p.size_y;
+    if (!n) return;
+    const FrameG &f = F[frame_of_pal(F, nF, g)];
+    const av1g_block k = blocks[f.blockBase + p.block];
+    int w, h, onW, onH;
+    av1g_palette_map_dims(k.bsize, k.mi_row, k.mi_col, f.MiRows, f.MiCols, uv, f.ssx, f.ssy, &w, &h, &onW, &onH);
+    const uint8_t *map = pg.cmap + f.mapBase + p.map_off;
+    if (uv && p.size_y) map += 4 * av1g_bw4(k.bsize) * 4 * av1g_bh4(k.bsize);   // after the luma map
+    __shared__ uint32_t diag[128];   // first slot of each anti-diagonal (diagonal 0 is the NS-coded first index)
+    const int nd = onH + onW - 1;
+    for (int t = threadIdx.x; t < nd; t += blockDim.x) diag[t] = t ? (uint32_t)(min(t, onW - 1) - max(0, t - onH + 1) + 1) : 0;
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int t = 1, s = 0; t < nd; t++) { const int l = diag[t]; diag[t] = s; s += l; }
+    __syncthreads();
+    const uint32_t base = pg.palTok[2 * g + uv];
+    for (int i = threadIdx.x; i < onW * onH; i += blockDim.x) {
+        const int r = i / onW, c = i % onW;
+        if (!r && !c) continue;
+        uint8_t order[8];
+        const int ctx = av1g_palette_color_context(map, w, r, c, n, order);
+        const int v = map[r * w + c];
+        int s = 0;
+        while (s < n - 1 && order[s] != v) s++;
+        const uint32_t cid = (uint32_t)(av1g_palette_color_cdf(&g_cdf_layout, uv, n, ctx) - (uint16_t *)&g_cdf_layout);
+        syms[base + diag[r + c] + (min(r + c, onW - 1) - c)] = av1g_sym_pack(AV1G_SYM_ADAPT, cid, (uint32_t)s, (uint32_t)n);
+    }
+}
+
+// inverse scans: iscan[(txSz * 3 + class) * 1024 + pos] = the scan index of coefficient pos, for the scans
+// av1g_get_scan returns (class 0: 2-D and IDTX, 1 / 2: the 1-D classes, transforms of up to 16x16)
+constexpr int kIscanTables = AV1G_TX_SIZES_ALL * 3;
+__device__ __forceinline__ int scan_class(int txType) { return txType == AV1G_IDTX ? AV1G_TX_CLASS_2D : av1g_tx_class(txType); }
+__global__ void k_iscan(uint16_t *iscan) {
+    const int txSz = blockIdx.x / 3, cls = blockIdx.x % 3;
+    if (cls != AV1G_TX_CLASS_2D && (AV1G_T(Tx_Width)[txSz] > 16 || AV1G_T(Tx_Height)[txSz] > 16)) return;
+    const uint16_t *scan = av1g_get_scan(txSz, cls == AV1G_TX_CLASS_2D ? AV1G_DCT_DCT : cls == AV1G_TX_CLASS_HORIZ ? AV1G_H_DCT : AV1G_V_DCT);
+    const int n = av1g_tx_coeffs(txSz);
+    for (int c = threadIdx.x; c < n; c += blockDim.x) iscan[(size_t)blockIdx.x * 1024 + scan[c]] = (uint16_t)c;
+}
+
+template <bool LL>
+__global__ void k_txctx(const av1g_block *blocks, const uint32_t *blockFrame, const FrameG *frames, const av1g_txb *txb,
+                        const uint32_t *txbBlock, const int16_t *coeffs, uint32_t nTxb, const uint16_t *iscan,
+                        uint8_t *ctxLvl, uint8_t *ctxDc, uint16_t *txbEob, uint8_t *txbType) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nTxb) return;
+    const uint32_t b = txbBlock[t];
+    const av1g_block k = blocks[b];
+    const FrameG &F = frames[blockFrame[b]];
+    const av1g_txb x = txb[t];
+    const int plane = x.plane, txSz = x.tx_size;
+    int type = plane ? av1g_chroma_tx_type(txSz, k.uv_mode, F.reduced) : x.tx_type;
+    if (LL && frame_lossless(F)) type = AV1G_DCT_DCT;   // lossless: compute_tx_type is DCT_DCT (the WHT) in every plane
+    int eob = 0, cul = 0, dc = 0;
+    if (!k.skip) {
+        // in coefficient order (sequential reads): eob = 1 + the largest scan index of a nonzero coefficient, culLevel
+        // = the sum over all of them (those past eob are 0)
+        const int16_t *q = coeffs + F.coeffBase + x.coeff_off;
+        const uint16_t *isc = iscan + (size_t)(txSz * 3 + scan_class(type)) * 1024;
+        const int n = av1g_tx_coeffs(txSz);
+        for (int i = 0; i < n; i++) {
+            const int v = q[i];
+            if (v) {
+                cul += v < 0 ? -v : v;
+                eob = max(eob, isc[i] + 1);
+            }
+        }
+        if (cul > 63) cul = 63;
+        dc = q[0] < 0 ? 1 : q[0] > 0 ? 2 : 0;
+    }
+    if (!eob && plane == 0) type = AV1G_DCT_DCT;
+    txbEob[t] = (uint16_t)eob;
+    txbType[t] = (uint8_t)type;
+    const int w4 = av1g_tx_w(txSz) >> 2, h4 = av1g_tx_h(txSz) >> 2;
+    const int stride = F.ctxStride[plane], rows = F.ctxRows[plane];
+    for (int i = 0; i < h4 && x.y4 + i < rows; i++)
+        for (int j = 0; j < w4 && x.x4 + j < stride; j++) {
+            const uint64_t o = F.ctxBase[plane] + (uint64_t)(x.y4 + i) * stride + x.x4 + j;
+            ctxLvl[o] = (uint8_t)cul;
+            ctxDc[o] = (uint8_t)dc;
+        }
+}
+
+// DevBatch::checkTrusted: the trusted inputs against the derivation (k_maps, k_txctx, the count pass); differences
+// counted in st->reserved.  blockIdx.y: 0 tx blocks (eob, type, count), 1 the mode-info maps, 2 + f frame f's context maps
+struct MapPtrs { const uint8_t *m[4]; };
+__global__ void k_check_trusted(const FrameG *frames, uint32_t nT, const av1g_txb *txb, const uint32_t *txbBlock, const uint16_t *dEob,
+                                const uint8_t *dType, const uint32_t *dCount, const uint32_t *tCount, uint64_t miTotal,
+                                MapPtrs dMaps, MapPtrs tMaps, const uint8_t *dLvl, const uint8_t *dDc,
+                                const uint8_t *tLvl, const uint8_t *tDc, DevStatus *st) {
+    const uint64_t i0 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x, step = (uint64_t)gridDim.x * blockDim.x;
+    int bad = 0;
+    if (blockIdx.y == 0) {
+        for (uint64_t t = i0; t < nT; t += step) {
+            const av1g_txb x = txb[t];
+            bad += x.eob != dEob[t] || x.tx_type != dType[t];
+            if (tCount) { const uint64_t it = t + txbBlock[t] + 1; bad += tCount[it] != dCount[it]; }
+        }
+    } else if (blockIdx.y == 1) {
+        for (uint64_t i = i0; i < miTotal; i += step)
+            for (int m = 0; m < 4; m++) bad += dMaps.m[m][i] != tMaps.m[m][i];
+    } else {
+        const FrameG &F = frames[blockIdx.y - 2];
+        for (int p = 0; p < (F.mono ? 1 : 3); p++) {
+            const uint64_t n = (uint64_t)F.ctxStride[p] * F.ctxRows[p];
+            for (uint64_t i = i0; i < n; i += step)
+                bad += dLvl[F.ctxBase[p] + i] != tLvl[F.tctxBase[p] + i] || dDc[F.ctxBase[p] + i] != tDc[F.tctxBase[p] + i];
+        }
+    }
+    if (bad) atomicAdd(&st->reserved, bad);
+}
+
+#include "gpu_coeff_payload.cuh"
+
+// coefficient syntax of one tx block (mirror of Encoder::code_coeffs, write mode)
+template <bool LL, bool EMIT>
+__global__ void k_txsym(const av1g_block *blocks, const uint32_t *blockFrame, const uint32_t *blockTile, const FrameG *frames,
+                        const TileG *tiles, const av1g_txb *txb, const uint32_t *txbBlock,
+                        const int16_t *coeffs, uint32_t nTxb, const uint8_t *ctxLvl, const uint8_t *ctxDc,
+                        const uint16_t *txbEob, const uint8_t *txbType, uint32_t *itemCount, const uint32_t *itemOff,
+                        uint32_t *syms, const uint32_t *symTotal, uint64_t symCap, int trusted) {
+    // trusted records: eob and tx type from the record, context maps at the frames' tctxBase
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nTxb) return;
+    if (EMIT && *symTotal > symCap) return;  // emit pass with too small a symbol buffer (reported later)
+    const uint32_t b = txbBlock[t];
+    const uint32_t item = t + b + 1;
+    const av1g_block k = blocks[b];
+    Out<EMIT> o{EMIT ? syms + itemOff[item] : nullptr, 0};
+    if (k.skip) {
+        if (!EMIT) itemCount[item] = 0;
+        return;
+    }
+    const FrameG &F = frames[blockFrame[b]];
+    const TileG &T = tiles[blockTile[b]];
+    const av1g_txb x = txb[t];
+    const int plane = x.plane, txSz = x.tx_size, ptype = plane > 0;
+    const int subX = plane ? F.ssx : 0, subY = plane ? F.ssy : 0;
+    const int x4 = x.x4, y4 = x.y4;
+    const int eob = trusted ? x.eob : txbEob[t], txType = trusted ? x.tx_type : txbType[t];
+    const int16_t *q = coeffs + F.coeffBase + x.coeff_off;
+    const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
+    const int w = AV1G_T(Tx_Width)[txSz], h = AV1G_T(Tx_Height)[txSz], w4 = w >> 2, h4 = h >> 2;
+    const int maxX4 = F.MiCols >> subX, maxY4 = F.MiRows >> subY;
+    const int stride = F.ctxStride[plane];
+    const uint64_t cb = trusted ? F.tctxBase[plane] : F.ctxBase[plane];
+    const uint8_t *L = ctxLvl + cb, *Dc = ctxDc + cb;
+    const bool hasAbove = y4 > (T.miRowStart >> subY), hasLeft = x4 > (T.miColStart >> subX);
+    auto aLvl = [&](int k_) -> int { return hasAbove ? L[(uint64_t)(y4 - 1) * stride + x4 + k_] : 0; };
+    auto aDc = [&](int k_) -> int { return hasAbove ? Dc[(uint64_t)(y4 - 1) * stride + x4 + k_] : 0; };
+    auto lLvl = [&](int k_) -> int { return hasLeft ? L[(uint64_t)(y4 + k_) * stride + x4 - 1] : 0; };
+    auto lDc = [&](int k_) -> int { return hasLeft ? Dc[(uint64_t)(y4 + k_) * stride + x4 - 1] : 0; };
+    int ctx;
+    {
+        const int bsz = plane ? av1g_uv_bsize(k.bsize, F.ssx, F.ssy) : k.bsize;
+        const int bw = 4 * av1g_bw4(bsz), bh = 4 * av1g_bh4(bsz);
+        if (plane == 0) {
+            int top = 0, left = 0;
+            for (int i = 0; i < w4; i++) if (x4 + i < maxX4) top = max(top, aLvl(i));
+            for (int i = 0; i < h4; i++) if (y4 + i < maxY4) left = max(left, lLvl(i));
+            const int mx = max(top, left), mn = min(top, left);
+            if (bw == w && bh == h) ctx = 0;
+            else if (top == 0 && left == 0) ctx = 1;
+            else if (top == 0 || left == 0) ctx = 2 + (mx > 3);
+            else if (mx <= 3) ctx = 4;
+            else if (mn <= 3) ctx = 5;
+            else ctx = 6;
+        } else {
+            int above = 0, left = 0;
+            for (int i = 0; i < w4; i++) if (x4 + i < maxX4) above |= aLvl(i) | aDc(i);
+            for (int i = 0; i < h4; i++) if (y4 + i < maxY4) left |= lLvl(i) | lDc(i);
+            ctx = (above != 0) + (left != 0) + 7;
+            if (bw * bh > w * h) ctx += 3;
+        }
+    }
+    o.sym(CID(txb_skip[txSzCtx][ctx]), eob == 0, 2);
+    if (eob > 0) {
+        if (plane == 0) {
+            const int set = av1g_get_tx_set_intra(txSz, F.reduced);
+            if (set > 0 && (!LL || F.qidx > 0)) {   // transform_type: coded only for base_q_idx > 0
+                const int sqr = AV1G_T(Tx_Size_Sqr)[txSz];
+                const int intraDir = k.filter_intra ? AV1G_T(Filter_Intra_Mode_To_Intra_Dir)[k.filter_intra - 1] : k.y_mode;
+                int idx = 0;
+                if (set == AV1G_TX_SET_INTRA_1) {
+                    for (int i = 0; i < 7; i++) if (AV1G_T(Tx_Type_Intra_Inv_Set1)[i] == txType) idx = i;
+                    o.sym(CID(intra_tx_set1[sqr][intraDir]), idx, 7);
+                } else {
+                    for (int i = 0; i < 5; i++) if (AV1G_T(Tx_Type_Intra_Inv_Set2)[i] == txType) idx = i;
+                    o.sym(CID(intra_tx_set2[sqr][intraDir]), idx, 5);
+                }
+            }
+        }
+        int dcSign = 0;
+        if (q[0]) {
+            for (int i = 0; i < w4; i++)
+                if (x4 + i < maxX4) { int sign = aDc(i); dcSign += sign == 1 ? -1 : sign == 2 ? 1 : 0; }
+            for (int i = 0; i < h4; i++)
+                if (y4 + i < maxY4) { int sign = lDc(i); dcSign += sign == 1 ? -1 : sign == 2 ? 1 : 0; }
+        }
+        emitCoeffPayload(o, q, eob, txSz, txType, txSzCtx, ptype, dcSign);
+    }
+    if (!EMIT) itemCount[item] = o.n;
+}
+
+// ---------------------------------------------------------------------------
+// superblock walk: partition + mode info (mirror of encode_partition / encode_block)
+struct Walk {
+    const FrameG *F;
+    const TileG *T;
+    const av1g_block *blocks;
+    const uint32_t *blockTxbG;
+    const uint8_t *mMiSize, *mYMode, *mSkip, *mTx;  // frame-relative
+    uint32_t cursor, end;
+    uint32_t *itemCount;
+    const uint32_t *itemOff;
+    uint32_t *syms;
+    uint32_t pend[8];
+    int npend;
+    int curQ, firstInSb, cdefDone;
+    DevStatus *st;
+    PalG pg;    // palette inputs; pg.mPal* frame-relative here
+    __device__ bool inside(int r, int c) const {
+        return c >= T->miColStart && c < T->miColEnd && r >= T->miRowStart && r < T->miRowEnd;
+    }
+    __device__ int map(const uint8_t *m, int r, int c) const { return m[(uint64_t)r * F->MiCols + c]; }
+    __device__ uint32_t pal_at(int r, int c) const { return pg.mPalIdx[(uint64_t)r * F->MiCols + c]; }
+};
+
+// palette colours of one plane (uv 0: Y, 1: U and V), as Encoder::code_palette_colors writes them.  The palette
+// helpers are not inlined: w_block is inlined into the recursive w_partition, whose every level would carry their
+// locals on the stack otherwise (the default 1 KB stack of the lossless path overflowed)
+template <bool EMIT>
+__device__ __noinline__ void w_pal_colors(const Walk &w, Out<EMIT> &o, int r, int c, int aL, const av1g_palette &p, int uv) {
+    const FrameG &F = *w.F;
+    const int n = uv ? p.size_uv : p.size_y, bd = F.bd, maxV = 1 << bd;
+    const uint8_t *sizes = uv ? w.pg.mPalUV : w.pg.mPalY;
+    int aboveN = 0, leftN = 0;
+    const uint16_t *above = nullptr, *left = nullptr;
+    if ((r * 4) % 64) {
+        aboveN = w.map(sizes, r - 1, c);
+        if (aboveN) above = w.pg.pals[w.pal_at(r - 1, c)].colors[uv];
+    }
+    if (aL) {
+        leftN = w.map(sizes, r, c - 1);
+        if (leftN) left = w.pg.pals[w.pal_at(r, c - 1)].colors[uv];
+    }
+    uint16_t cache[16], lits[8];
+    uint8_t found[16];
+    const int cacheN = av1g_palette_cache(above, aboveN, left, leftN, cache);
+    int nFlags = 0, extra = 0, bits = 0;
+    const int nLit = av1g_palette_split(p.colors[uv], n, cache, cacheN, bd, uv, found, &nFlags, lits, &extra, &bits);
+    for (int i = 0; i < nFlags; i++) o.bit(found[i]);
+    if (nLit) o.lit(lits[0], bd);
+    if (nLit > 1) {
+        const int minVal = uv ? 0 : 1;
+        o.lit(extra, 2);
+        for (int k = 1; k < nLit; k++) {
+            o.lit(lits[k] - lits[k - 1] - minVal, bits);
+            bits = min(bits, av1g_ceil_log2(maxV - lits[k] - minVal));
+        }
+    }
+    if (!uv) return;
+    const uint16_t *v = p.colors[2];
+    int vBits = 0, vExtra = 0;
+    const int delta = av1g_palette_v_delta(v, n, bd, &vBits, &vExtra);
+    o.bit(delta);
+    if (!delta) {
+        for (int i = 0; i < n; i++) o.lit(v[i], bd);
+        return;
+    }
+    o.lit(vExtra, 2);
+    o.lit(v[0], bd);
+    for (int i = 1; i < n; i++) {
+        if (v[i] == v[i - 1]) { o.lit(0, vBits); continue; }
+        const int d0 = v[i] > v[i - 1] ? v[i] - v[i - 1] : v[i - 1] - v[i], neg = v[i] < v[i - 1];
+        if (d0 <= maxV - d0) { o.lit(d0, vBits); o.bit(neg); }
+        else { o.lit(maxV - d0, vBits); o.bit(!neg); }
+    }
+}
+
+// palette_mode_info; returns PaletteSizeY
+template <bool EMIT>
+__device__ __noinline__ int w_pal_info(const Walk &w, Out<EMIT> &o, uint32_t gp, int r, int c, int bsize, int aU, int aL, int hasChroma,
+                                       int yMode, int uvMode) {
+    av1g_palette pal;
+    pal.size_y = pal.size_uv = 0;
+    if (gp != NO_PAL) pal = w.pg.pals[gp];
+    const int bsizeCtx = av1g_palette_bsize_ctx(bsize);
+    if (yMode == AV1G_DC_PRED) {
+        const int ctx = (aU && w.map(w.pg.mPalY, r - 1, c) > 0) + (aL && w.map(w.pg.mPalY, r, c - 1) > 0);
+        o.sym(CID(palette_y_mode[bsizeCtx][ctx]), pal.size_y > 0, 2);
+        if (pal.size_y) {
+            o.sym(CID(palette_y_size[bsizeCtx]), pal.size_y - 2, 7);
+            w_pal_colors(w, o, r, c, aL, pal, 0);
+        }
+    }
+    if (hasChroma && uvMode == AV1G_DC_PRED) {
+        o.sym(CID(palette_uv_mode[pal.size_y > 0]), pal.size_uv > 0, 2);
+        if (pal.size_uv) {
+            o.sym(CID(palette_uv_size[bsizeCtx]), pal.size_uv - 2, 7);
+            w_pal_colors(w, o, r, c, aL, pal, 1);
+        }
+    }
+    return pal.size_y;
+}
+
+// palette_tokens: the first index of each map (NS), then the slots k_palsym fills
+template <bool EMIT>
+__device__ __noinline__ void w_pal_tokens(const Walk &w, Out<EMIT> &o, uint32_t gp, int r, int c, int bsize, uint32_t item) {
+    const FrameG &F = *w.F;
+    const av1g_palette &pal = w.pg.pals[gp];
+    const uint8_t *map = w.pg.cmap + F.mapBase + pal.map_off;
+    for (int uv = 0; uv < 2; uv++) {
+        const int n = uv ? pal.size_uv : pal.size_y;
+        if (!n) continue;
+        int mw, mh, onW, onH;
+        av1g_palette_map_dims(bsize, r, c, F.MiRows, F.MiCols, uv, F.ssx, F.ssy, &mw, &mh, &onW, &onH);
+        int nb = 0;
+        for (int x = n; x; x >>= 1) nb++;
+        const int m = (1 << nb) - n, v0 = map[0];
+        if (v0 < m) o.lit(v0, nb - 1);
+        else { o.lit(m + ((v0 - m) >> 1), nb - 1); o.bit((v0 - m) & 1); }
+        if (w.syms) w.pg.palTok[2 * gp + uv] = w.itemOff[item] + o.n;
+        o.skip((uint32_t)(onW * onH - 1));
+        map += mw * mh;
+    }
+}
+
+__device__ int w_derive(Walk &w, int r, int c, int bSize, int hasRows, int hasCols) {
+    const av1g_block &b = w.blocks[w.cursor];
+    const int half = av1g_bw4(bSize) >> 1;
+    const int hz = AV1G_T(Partition_Subsize)[AV1G_PARTITION_HORZ][bSize];
+    const int vt = AV1G_T(Partition_Subsize)[AV1G_PARTITION_VERT][bSize];
+    const int sp = AV1G_T(Partition_Subsize)[AV1G_PARTITION_SPLIT][bSize];
+    const int h4 = AV1G_T(Partition_Subsize)[AV1G_PARTITION_HORZ_4][bSize];
+    const int v4 = AV1G_T(Partition_Subsize)[AV1G_PARTITION_VERT_4][bSize];
+    auto at = [&](uint32_t k, int rr, int cc, int bs) {
+        if (w.cursor + k >= w.end) return false;
+        const av1g_block &n = w.blocks[w.cursor + k];
+        return n.mi_row == rr && n.mi_col == cc && n.bsize == bs;
+    };
+    const int bs = b.bsize;
+    if (bs == bSize) return AV1G_PARTITION_NONE;
+    if (bs == hz) return at(1, r + half, c, sp) ? AV1G_PARTITION_HORZ_B : AV1G_PARTITION_HORZ;
+    if (bs == vt) return at(1, r, c + half, sp) ? AV1G_PARTITION_VERT_B : AV1G_PARTITION_VERT;
+    if (bs == sp && bSize > AV1G_BLOCK_8X8 && hasRows && hasCols && at(1, r + half, c, sp)) return AV1G_PARTITION_VERT_A;
+    if (bs == sp && bSize > AV1G_BLOCK_8X8 && hasRows && hasCols && at(1, r, c + half, sp) && at(2, r + half, c, hz))
+        return AV1G_PARTITION_HORZ_A;
+    if (bSize > AV1G_BLOCK_8X8 && bs == h4) return AV1G_PARTITION_HORZ_4;
+    if (bSize > AV1G_BLOCK_8X8 && bs == v4) return AV1G_PARTITION_VERT_4;
+    return AV1G_PARTITION_SPLIT;
+}
+
+template <bool LL>
+__device__ void w_block(Walk &w, int r, int c, int bsize) {
+    if (w.cursor >= w.end) { atomicOr(&w.st->error, AV1G_GPU_ERR_ORDER); return; }
+    const uint32_t bi = w.cursor++;
+    const av1g_block k = w.blocks[bi];
+    const FrameG &F = *w.F;
+    const uint32_t item = bi + w.blockTxbG[bi];
+    Out<> o{w.syms ? w.syms + w.itemOff[item] : nullptr, 0};
+    for (int i = 0; i < w.npend; i++) o.put(w.pend[i]);
+    w.npend = 0;
+    const int bw4 = av1g_bw4(bsize), bh4 = av1g_bh4(bsize);
+    const int hasChroma = av1g_has_chroma(bsize, r, c, F.mono, F.ssx, F.ssy);
+    const int aU = w.inside(r - 1, c), aL = w.inside(r, c - 1);
+    o.sym(CID(skip[(aU ? w.map(w.mSkip, r - 1, c) : 0) + (aL ? w.map(w.mSkip, r, c - 1) : 0)]), k.skip, 2);
+    if (F.cdefBits >= 0 && !k.skip && !w.cdefDone) {  // read_cdef: first non-skip block of the 64x64
+        for (int i = F.cdefBits - 1; i >= 0; i--) o.bit((k.cdef_idx >> i) & 1);
+        w.cdefDone = 1;
+    }
+    if (F.dq && w.firstInSb && !(bsize == AV1G_BLOCK_64X64 && k.skip)) {  // read_delta_qindex
+        const int reduced = ((int)k.sb_qindex - w.curQ) / (1 << F.dqRes);
+        const int a = reduced < 0 ? -reduced : reduced;
+        o.sym(CID(delta_q), min(a, (int)AV1G_DELTA_Q_SMALL), AV1G_DELTA_Q_SMALL + 1);
+        if (a >= AV1G_DELTA_Q_SMALL) {
+            int rem = 1;
+            while (((a - 1) >> (rem + 1)) > 0) rem++;
+            for (int i = 2; i >= 0; i--) o.bit(((rem - 1) >> i) & 1);
+            const int bits = (a - 1) - (1 << rem);
+            for (int i = rem - 1; i >= 0; i--) o.bit((bits >> i) & 1);
+        }
+        if (a) o.bit(reduced < 0);
+        w.curQ = k.sb_qindex;
+    }
+    w.firstInSb = 0;
+    {
+        const int am = AV1G_T(Intra_Mode_Context)[aU ? w.map(w.mYMode, r - 1, c) : AV1G_DC_PRED];
+        const int lm = AV1G_T(Intra_Mode_Context)[aL ? w.map(w.mYMode, r, c - 1) : AV1G_DC_PRED];
+        o.sym(CID(y_mode[am][lm]), k.y_mode, AV1G_INTRA_MODES);
+    }
+    if (bsize >= AV1G_BLOCK_8X8 && av1g_is_directional(k.y_mode))
+        o.sym(CID(angle_delta[k.y_mode - AV1G_V_PRED]), k.angle_delta_y + 3, 7);
+    if (hasChroma) {
+        if (av1g_cfl_allowed_ex(bsize, LL && frame_lossless(F), F.ssx, F.ssy)) o.sym(CID(uv_mode_cfl_allowed[k.y_mode]), k.uv_mode, 14);
+        else o.sym(CID(uv_mode_cfl_not_allowed[k.y_mode]), k.uv_mode, 13);
+        if (k.uv_mode == AV1G_UV_CFL_PRED) {
+            const int sU = k.cfl_alpha_u == 0 ? 0 : k.cfl_alpha_u < 0 ? 1 : 2;
+            const int sV = k.cfl_alpha_v == 0 ? 0 : k.cfl_alpha_v < 0 ? 1 : 2;
+            o.sym(CID(cfl_sign), sU * 3 + sV - 1, 8);
+            if (sU) o.sym(CID(cfl_alpha[(sU - 1) * 3 + sV]), (k.cfl_alpha_u < 0 ? -k.cfl_alpha_u : k.cfl_alpha_u) - 1, 16);
+            if (sV) o.sym(CID(cfl_alpha[(sV - 1) * 3 + sU]), (k.cfl_alpha_v < 0 ? -k.cfl_alpha_v : k.cfl_alpha_v) - 1, 16);
+        }
+        if (bsize >= AV1G_BLOCK_8X8 && av1g_is_directional(k.uv_mode))
+            o.sym(CID(angle_delta[k.uv_mode - AV1G_V_PRED]), k.angle_delta_uv + 3, 7);
+    }
+    // palette_mode_info (screen-content frames)
+    const uint32_t gp = F.sct && w.pg.blockPal ? w.pg.blockPal[bi] : NO_PAL;
+    const int palY = F.sct && av1g_palette_allowed(bsize) ? w_pal_info(w, o, gp, r, c, bsize, aU, aL, hasChroma, k.y_mode, k.uv_mode) : 0;
+    if (F.fi && k.y_mode == AV1G_DC_PRED && !palY && bw4 <= 8 && bh4 <= 8) {  // filter_intra_mode_info
+        o.sym(CID(filter_intra[bsize]), k.filter_intra != 0, 2);
+        if (k.filter_intra) o.sym(CID(filter_intra_mode), k.filter_intra - 1, 5);
+    }
+    if (gp != NO_PAL) w_pal_tokens(w, o, gp, r, c, bsize, item);
+    if (F.txsel && bsize > AV1G_BLOCK_4X4) {
+        const int maxRect = AV1G_T(Max_Tx_Size_Rect)[bsize];
+        const int maxTxDepth = AV1G_T(Max_Tx_Depth)[bsize];
+        const int aboveW = aU ? AV1G_T(Tx_Width)[w.map(w.mTx, r - 1, c)] : 0;
+        const int leftH = aL ? AV1G_T(Tx_Height)[w.map(w.mTx, r, c - 1)] : 0;
+        const int ctx = (aboveW >= AV1G_T(Tx_Width)[maxRect]) + (leftH >= AV1G_T(Tx_Height)[maxRect]);
+        if (maxTxDepth == 4) o.sym(CID(tx_64x64[ctx]), k.tx_depth, 3);
+        else if (maxTxDepth == 3) o.sym(CID(tx_32x32[ctx]), k.tx_depth, 3);
+        else if (maxTxDepth == 2) o.sym(CID(tx_16x16[ctx]), k.tx_depth, 3);
+        else o.sym(CID(tx_8x8[ctx]), k.tx_depth, 2);
+    }
+    if (!w.syms) w.itemCount[item] = o.n;
+}
+
+template <bool LL>
+__device__ void w_partition(Walk &w, int r, int c, int bSize) {
+    const FrameG &F = *w.F;
+    if (r >= F.MiRows || c >= F.MiCols) return;
+    const int half = av1g_bw4(bSize) >> 1, quarter = half >> 1;
+    const int hasRows = (r + half) < F.MiRows, hasCols = (c + half) < F.MiCols;
+    int p;
+    if (w.cursor >= w.end) { atomicOr(&w.st->error, AV1G_GPU_ERR_ORDER); return; }
+    if (bSize < AV1G_BLOCK_8X8) {
+        p = AV1G_PARTITION_NONE;
+    } else {
+        p = w_derive(w, r, c, bSize, hasRows, hasCols);
+        const int bsl = AV1G_T(Mi_Width_Log2)[bSize];
+        const int above = w.inside(r - 1, c) && AV1G_T(Mi_Width_Log2)[w.map(w.mMiSize, r - 1, c)] < bsl;
+        const int left = w.inside(r, c - 1) && AV1G_T(Mi_Height_Log2)[w.map(w.mMiSize, r, c - 1)] < bsl;
+        const int ctx = left * 2 + above;
+        const uint32_t cid = bsl == 1 ? CID(partition_w8[ctx]) : bsl == 2 ? CID(partition_w16[ctx])
+                           : bsl == 3 ? CID(partition_w32[ctx]) : CID(partition_w64[ctx]);
+        if (hasRows && hasCols) w.pend[w.npend++] = av1g_sym_pack(AV1G_SYM_ADAPT, cid, p, bsl == 1 ? 4 : 10);
+        else if (hasCols) w.pend[w.npend++] = av1g_sym_pack(AV1G_SYM_SPLIT_OR_HORZ, cid, p == AV1G_PARTITION_SPLIT, 2);
+        else if (hasRows) w.pend[w.npend++] = av1g_sym_pack(AV1G_SYM_SPLIT_OR_VERT, cid, p == AV1G_PARTITION_SPLIT, 2);
+    }
+    const int sub = AV1G_T(Partition_Subsize)[p][bSize];
+    const int sp = AV1G_T(Partition_Subsize)[AV1G_PARTITION_SPLIT][bSize];
+    switch (p) {
+    case AV1G_PARTITION_NONE: w_block<LL>(w, r, c, sub); break;
+    case AV1G_PARTITION_HORZ: w_block<LL>(w, r, c, sub); if (hasRows) w_block<LL>(w, r + half, c, sub); break;
+    case AV1G_PARTITION_VERT: w_block<LL>(w, r, c, sub); if (hasCols) w_block<LL>(w, r, c + half, sub); break;
+    case AV1G_PARTITION_SPLIT:
+        w_partition<LL>(w, r, c, sub); w_partition<LL>(w, r, c + half, sub);
+        w_partition<LL>(w, r + half, c, sub); w_partition<LL>(w, r + half, c + half, sub);
+        break;
+    case AV1G_PARTITION_HORZ_A: w_block<LL>(w, r, c, sp); w_block<LL>(w, r, c + half, sp); w_block<LL>(w, r + half, c, sub); break;
+    case AV1G_PARTITION_HORZ_B: w_block<LL>(w, r, c, sub); w_block<LL>(w, r + half, c, sp); w_block<LL>(w, r + half, c + half, sp); break;
+    case AV1G_PARTITION_VERT_A: w_block<LL>(w, r, c, sp); w_block<LL>(w, r + half, c, sp); w_block<LL>(w, r, c + half, sub); break;
+    case AV1G_PARTITION_VERT_B: w_block<LL>(w, r, c, sub); w_block<LL>(w, r, c + half, sp); w_block<LL>(w, r + half, c + half, sp); break;
+    case AV1G_PARTITION_HORZ_4:
+        for (int i = 0; i < 4; i++) if (i < 3 || r + quarter * 3 < F.MiRows) w_block<LL>(w, r + quarter * i, c, sub);
+        break;
+    default:
+        for (int i = 0; i < 4; i++) if (i < 3 || c + quarter * 3 < F.MiCols) w_block<LL>(w, r, c + quarter * i, sub);
+        break;
+    }
+}
+
+template <bool LL>
+__global__ void k_sbsym(const SbG *sbs, uint32_t nSb, const FrameG *frames, const TileG *tiles, const av1g_block *blocks,
+                        const uint32_t *blockTxbG, const uint8_t *mMiSize, const uint8_t *mYMode, const uint8_t *mSkip,
+                        const uint8_t *mTx, uint32_t *itemCount, const uint32_t *itemOff, uint32_t *syms,
+                        const uint32_t *symTotal, uint64_t symCap, DevStatus *st, PalG pg) {
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nSb) return;
+    if (syms && *symTotal > symCap) return;
+    const SbG sb = sbs[s];
+    Walk w;
+    w.F = &frames[sb.frame];
+    w.T = &tiles[sb.tile];
+    w.blocks = blocks;
+    w.blockTxbG = blockTxbG;
+    w.mMiSize = mMiSize + w.F->miBase;
+    w.mYMode = mYMode + w.F->miBase;
+    w.mSkip = mSkip + w.F->miBase;
+    w.mTx = mTx + w.F->miBase;
+    w.pg = pg;
+    if (pg.mPalY) {
+        w.pg.mPalY += w.F->miBase;
+        w.pg.mPalUV += w.F->miBase;
+        w.pg.mPalIdx += w.F->miBase;
+    }
+    w.cursor = sb.firstBlock;
+    w.end = sb.endBlock;
+    w.itemCount = itemCount;
+    w.itemOff = itemOff;
+    w.syms = syms;
+    w.npend = 0;
+    w.curQ = sb.qBefore;
+    w.firstInSb = 1;
+    w.cdefDone = 0;
+    w.st = st;
+    if (sb.firstBlock >= sb.endBlock) { atomicOr(&st->error, AV1G_GPU_ERR_ORDER); return; }
+    w_partition<LL>(w, sb.r, sb.c, AV1G_BLOCK_64X64);
+    if (w.cursor != w.end) atomicOr(&st->error, AV1G_GPU_ERR_ORDER);
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_entropy(const uint32_t *syms, const uint64_t *tBegin, const uint64_t *tEnd, const int *tQ,
+                          const uint64_t *capOff, av1g_cdfs *scratch, uint16_t *precarry, uint8_t *outBytes,
+                          int *outSize, uint32_t nTiles) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nTiles) return;
+    av1g_cdfs *cd = scratch + t;
+    av1g_cdfs_init(cd, tQ[t]);
+    const uint64_t n = tEnd[t] - tBegin[t];
+    const uint32_t cap = (uint32_t)(capOff[t + 1] - capOff[t]);
+    av1g_ec ec;
+    av1g_ec_init(&ec, precarry + capOff[t], cap);
+    av1g_code_symbols(syms + tBegin[t], (uint32_t)n, cd, &ec);
+    outSize[t] = av1g_ec_done(&ec, outBytes + capOff[t]);
+}
+
+// Same, with the tile's CDF state in shared memory (AV1G_ENT_TPB tiles per CUDA block).
+#define AV1G_ENT_TPB 4
+__global__ void k_entropy_smem(const uint32_t *syms, const uint64_t *tBegin, const uint64_t *tEnd, const int *tQ,
+                               const uint64_t *capOff, uint16_t *precarry, uint8_t *outBytes, int *outSize,
+                               uint32_t nTiles) {
+    extern __shared__ av1g_cdfs sh[];
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nTiles) return;
+    av1g_cdfs *cd = sh + threadIdx.x;
+    av1g_cdfs_init(cd, tQ[t]);
+    const uint64_t n = tEnd[t] - tBegin[t];
+    const uint32_t cap = (uint32_t)(capOff[t + 1] - capOff[t]);
+    av1g_ec ec;
+    av1g_ec_init(&ec, precarry + capOff[t], cap);
+    av1g_code_symbols(syms + tBegin[t], (uint32_t)n, cd, &ec);
+    outSize[t] = av1g_ec_done(&ec, outBytes + capOff[t]);
+}
+
+// One warp per tile: lane 0 runs od_ec, the N-1 CDF entries are adapted by N-1
+// lanes in parallel (same arithmetic as av1g_update_cdf).  CDF state in shared memory.
+__global__ void k_entropy_warp(const uint32_t *syms, const uint64_t *tBegin, const uint64_t *tEnd, const int *tQ,
+                               const uint64_t *capOff, uint16_t *precarry, uint8_t *outBytes, int *outSize,
+                               uint32_t nTiles) {
+    extern __shared__ av1g_cdfs sh[];
+    const uint32_t t = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (t >= nTiles) return;
+    av1g_cdfs *cd = sh;
+    uint16_t *base = (uint16_t *)cd;
+    {   // cooperative init: copy the defaults (prepared by lane 0 into shared memory, then spread)
+        if (lane == 0) av1g_cdfs_init(cd, tQ[t]);
+        __syncwarp();
+    }
+    const uint64_t b = tBegin[t], n = tEnd[t] - b;
+    const uint32_t cap = (uint32_t)(capOff[t + 1] - capOff[t]);
+    av1g_ec ec;
+    if (lane == 0) av1g_ec_init(&ec, precarry + capOff[t], cap);
+    for (uint64_t i = 0; i < n; i++) {
+        const uint32_t w = syms[b + i];
+        const uint32_t kind = w >> 24, s = (w >> 16) & 15u, N = ((w >> 20) & 15u) + 1, off = w & 0xFFFFu;
+        uint16_t *c = base + off;
+        if (kind == AV1G_SYM_ADAPT) {
+            const uint32_t cnt = c[N];
+            const uint32_t mine = lane < (int)N - 1 ? c[lane] : 0;
+            if (lane == 0) av1g_ec_encode_cdf(&ec, (int)s, c, (int)N);
+            __syncwarp();
+            if (lane < (int)N - 1) {
+                const int rate = 3 + (cnt > 15) + (cnt > 31) + (N >= 4 ? 2 : 1);
+                c[lane] = (uint16_t)((uint32_t)lane < s ? mine - (mine >> rate) : mine + ((32768u - mine) >> rate));
+            }
+            if (lane == 31) c[N] = (uint16_t)(cnt + (cnt < 32));
+            __syncwarp();
+        } else if (lane == 0) {
+            if (kind == AV1G_SYM_BOOL) av1g_ec_bool(&ec, (int)s);
+            else {
+                const uint32_t psum = av1g_split_or_psum(c, kind == AV1G_SYM_SPLIT_OR_VERT);
+                uint16_t tmp[2] = {(uint16_t)(32768u - psum), 32768u};
+                av1g_ec_encode_cdf(&ec, (int)s, tmp, 2);
+            }
+        }
+    }
+    if (lane == 0) outSize[t] = av1g_ec_done(&ec, outBytes + capOff[t]);
+}
+
+// ---------------------------------------------------------------------------
+// prep (all on the device; the host only lays out frame/tile tables from fp)
+template <class T, int K>
+struct Chunk {
+    T v[K];
+    uint32_t n, first;
+};
+template <class T, int K>
+__global__ void k_put(const Chunk<T, K> c, T *dst) {
+    for (uint32_t i = threadIdx.x; i < c.n; i += blockDim.x) dst[c.first + i] = c.v[i];
+}
+
+__global__ void k_cdf_defaults(av1g_cdfs *img) {  // one default CDF image per coefficient q context
+    const int q = blockIdx.x;
+    if (threadIdx.x == 0) av1g_cdfs_init(img + q, q == 0 ? 20 : q == 1 ? 60 : q == 2 ? 120 : 255);
+}
+
+__device__ uint32_t frame_of_block(const FrameG *F, uint32_t nF, uint32_t b) {
+    uint32_t lo = 0, hi = nF;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (F[mid].blockBase <= b) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+__device__ uint32_t tile_of_sb(const TileG *T, uint32_t nT, uint32_t s) {
+    uint32_t lo = 0, hi = nT;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (T[mid].sbBase <= s) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+// frame-relative decode-order SB index of a block + its tile (global)
+__device__ uint32_t sb_key(const FrameG &g, const TileG *T, const av1g_block &k, uint32_t &tile) {
+    const int sbR = k.mi_row >> 4, sbC = k.mi_col >> 4;
+    const int tr = min(sbR / g.tileHsb, g.tileRows - 1), tc = min(sbC / g.tileWsb, g.tileCols - 1);
+    tile = g.tileBase + (uint32_t)(tr * g.tileCols + tc);
+    const TileG &tl = T[tile];
+    return tl.sbBase - g.sbBase + (uint32_t)((sbR - tl.sbRow0) * tl.sbCols + (sbC - tl.sbCol0));
+}
+
+__global__ void k_blocks(const FrameG *F, uint32_t nF, const TileG *T, const av1g_block *blocks, const uint32_t *blockTxb,
+                         uint32_t nB, uint32_t nT, uint32_t *blockFrame, uint32_t *blockTile, uint32_t *blockTxbG,
+                         uint32_t *txbBlock, uint32_t *sbFirst, DevStatus *st) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    const uint32_t f = frame_of_block(F, nF, b);
+    const FrameG &g = F[f];
+    const av1g_block k = blocks[b];
+    const uint32_t lb = b - g.blockBase;
+    if (k.mi_row >= g.MiRows || k.mi_col >= g.MiCols) {
+        atomicOr(&st->error, AV1G_GPU_ERR_ORDER);
+        blockFrame[b] = f; blockTile[b] = g.tileBase; blockTxbG[b] = g.txbBase;
+        return;
+    }
+    uint32_t tile;
+    const uint32_t key = sb_key(g, T, k, tile);
+    blockFrame[b] = f;
+    blockTile[b] = tile;
+    const uint32_t t0 = blockTxb[b], t1 = lb + 1 < g.nBlocks ? blockTxb[b + 1] : g.nTxb;
+    bool bad = t1 < t0 || t1 > g.nTxb || (lb == 0 && t0 != 0);
+    blockTxbG[b] = g.txbBase + min(t0, g.nTxb);
+    if (!bad)
+        for (uint32_t t = t0; t < t1; t++) txbBlock[g.txbBase + t] = b;
+    if (lb == 0) {
+        if (key != 0) bad = true;
+        else sbFirst[g.sbBase] = b;
+    } else {
+        uint32_t pt;
+        const uint32_t pkey = sb_key(g, T, blocks[b - 1], pt);
+        if (key == pkey + 1) sbFirst[g.sbBase + key] = b;
+        else if (key != pkey) bad = true;
+    }
+    if (lb + 1 == g.nBlocks && key + 1 != g.nSb) bad = true;
+    if (bad) atomicOr(&st->error, AV1G_GPU_ERR_ORDER);
+    if (b + 1 == nB) blockTxbG[nB] = nT;
+}
+
+__global__ void k_sbs(const FrameG *F, const TileG *T, uint32_t nTiles, uint32_t nSb, const uint32_t *sbFirst, SbG *sbs,
+                      DevStatus *st) {
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nSb) return;
+    const uint32_t tile = tile_of_sb(T, nTiles, s);
+    const TileG &tl = T[tile];
+    const FrameG &g = F[tl.frame];
+    const uint32_t local = s - tl.sbBase;
+    SbG o;
+    o.frame = tl.frame;
+    o.tile = tile;
+    o.r = (tl.sbRow0 + (int)(local / tl.sbCols)) * 16;
+    o.c = (tl.sbCol0 + (int)(local % tl.sbCols)) * 16;
+    const uint32_t fEnd = g.blockBase + g.nBlocks;
+    o.firstBlock = sbFirst[s];
+    o.endBlock = s + 1 < g.sbBase + g.nSb ? sbFirst[s + 1] : fEnd;
+    if (o.firstBlock == 0xFFFFFFFFu || o.endBlock == 0xFFFFFFFFu || o.firstBlock >= o.endBlock || o.endBlock > fEnd) {
+        atomicOr(&st->error, AV1G_GPU_ERR_ORDER);
+        o.firstBlock = o.endBlock = g.blockBase;
+    }
+    o.qBefore = g.qidx;
+    sbs[s] = o;
+}
+
+// one warp per tile: tile block range + CurrentQIndex before every SB (reset to base_q_idx at
+// the tile start, updated by the first block of each SB unless it is a skipped 64x64)
+__global__ void k_tiles(const FrameG *F, TileG *T, SbG *sbs, const av1g_block *blocks) {
+    const uint32_t t = blockIdx.x;
+    const int lane = threadIdx.x;
+    const TileG tl = T[t];
+    const FrameG &g = F[tl.frame];
+    if (lane == 0) {
+        T[t].firstBlock = sbs[tl.sbBase].firstBlock;
+        T[t].endBlock = sbs[tl.sbBase + tl.nSb - 1].endBlock;
+    }
+    if (!g.dq) return;
+    int carry = g.qidx;
+    for (uint32_t base = 0; base < tl.nSb; base += 32) {
+        const uint32_t i = base + lane;
+        bool coded = false;
+        int val = 0;
+        if (i < tl.nSb) {
+            const SbG s = sbs[tl.sbBase + i];
+            if (s.firstBlock < s.endBlock) {
+                const av1g_block fb = blocks[s.firstBlock];
+                coded = !(fb.bsize == AV1G_BLOCK_64X64 && fb.skip);
+                val = fb.sb_qindex;
+            }
+        }
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, coded);
+        const uint32_t lower = mask & ((1u << lane) - 1u);
+        const int v = __shfl_sync(0xFFFFFFFFu, val, lower ? 31 - __clz((int)lower) : 0);
+        if (i < tl.nSb) sbs[tl.sbBase + i].qBefore = lower ? v : carry;
+        if (mask) carry = __shfl_sync(0xFFFFFFFFu, val, 31 - __clz((int)mask));
+    }
+}
+
+// per tile: symbol range, q, payload capacity (symbols / 2 + 256 bytes)
+__global__ void k_tilerange(const TileG *T, uint32_t nTiles, const FrameG *F, const uint32_t *blockTxbG, const uint32_t *off,
+                            uint64_t nItems, uint32_t nB, uint64_t symCap, uint64_t *tb, uint64_t *te, int *tq,
+                            uint64_t *capArr, uint64_t *sizeArr, DevStatus *st) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nTiles) return;
+    const uint64_t total = off[nItems];
+    const bool ovf = total > symCap;
+    auto itemOf = [&](uint32_t b) -> uint64_t { return b < nB ? off[(uint64_t)b + blockTxbG[b]] : total; };
+    uint64_t b = itemOf(T[t].firstBlock), e = itemOf(T[t].endBlock);
+    if (ovf || e < b) b = e = 0;
+    tb[t] = b;
+    te[t] = e;
+    tq[t] = F[T[t].frame].qidx;
+    capArr[t] = (e - b) / 2 + 256;
+    if (t == 0) {
+        capArr[nTiles] = 0;
+        sizeArr[nTiles] = 0;
+        st->symbols = total;
+        st->symbolCapacity = symCap;
+        if (ovf) atomicOr(&st->error, AV1G_GPU_ERR_SYMBOLS);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// windowed warp entropy coder
+//
+// Range coder of the consumer thread: libaom's current od_ec formulation (aom_dsp/entenc.c with
+// the 64-bit window: up to 7 bytes flushed at once when 40+ bits are pending, carries propagated
+// backwards into the output at flush time), fed with precomputed (fl, fh) words.  libaom documents
+// it as bit-identical to the 32-bit precarry encoder (av1g_ec in entenc.h, used by the CPU writer).
+struct Rc64 {
+    uint64_t low;
+    uint32_t rng, offs, cap;
+    int cnt, ovf;
+    uint8_t *out;
+    __device__ void init(uint8_t *o, uint32_t c) { low = 0; rng = 0x8000; cnt = -9; offs = 0; cap = c; ovf = 0; out = o; }
+    __device__ void carry_bwd(uint32_t k) {  // propagate_carry_bwd(out, k)
+        for (;;) {
+            const uint32_t x = out[k] + 1u;
+            out[k] = (uint8_t)x;
+            if (x <= 0xFFu || k == 0) break;
+            k--;
+        }
+    }
+    __device__ void flush(int &c, int s) {  // the s >= 40 branch of od_ec_enc_normalize
+        const int nb = (s >> 3) + 1;
+        c += 24 - (nb << 3);
+        uint64_t output = low >> c;
+        low &= ((uint64_t)1 << c) - 1;
+        const uint64_t mask = (uint64_t)1 << (nb << 3);
+        const bool carry = (output & mask) != 0;
+        output &= mask - 1;
+        if (offs + (uint32_t)nb > cap) { ovf = 1; offs = 0; }
+        for (int i = 0; i < nb; i++) out[offs + i] = (uint8_t)(output >> ((nb - 1 - i) << 3));
+        if (carry && offs > 0) carry_bwd(offs - 1);
+        offs += (uint32_t)nb;
+    }
+    __device__ int done() {
+        const uint64_t m = 0x3FFF;
+        uint64_t e = ((low + m) & ~m) | (m + 1);
+        int c = cnt, s = 10 + c;
+        if (s > 0) {
+            uint64_t n = ((uint64_t)1 << (c + 16)) - 1;
+            do {
+                if (offs >= cap) { ovf = 1; break; }
+                const uint32_t val = (uint32_t)(e >> (c + 16)) & 0xFFFFu;
+                out[offs] = (uint8_t)val;
+                if ((val & 0x100u) && offs > 0) carry_bwd(offs - 1);
+                offs++;
+                e &= n;
+                s -= 8;
+                c -= 8;
+                n >>= 8;
+            } while (s > 0);
+        }
+        return ovf ? -1 : (int)offs;
+    }
+};
+
+#ifdef AV1G_ENTROPY_PROFILE
+// per tile: [0] total cycles, [1] phase A cycles, [2] phase B cycles, [3] max group size summed over
+// windows, [4] windows, [5] bytes emitted, [6] carries, [7] carry propagation steps
+__device__ unsigned long long g_prof[4096][8];
+#define PROF(...) __VA_ARGS__
+#else
+#define PROF(...)
+#endif
+
+__device__ __forceinline__ uint32_t coded_word(uint32_t fl, uint32_t fh, uint32_t nms) {
+    return (fl < 32768u ? 0x80000000u : 0u) | ((fl >> 6) << 21) | ((fh >> 6) << 11) | nms;
+}
+
+// The same encoder in the 32-bit precarry formulation (av1g_ec) with the most recent byte held in a
+// register (a carry normally lands there) - kept for A/B measurements (g_entropy_mode 4).
+struct Rc32 {
+    uint32_t low, rng, offs, cap;
+    int cnt, ovf, pend;
+    uint8_t *out;
+    __device__ void init(uint8_t *o, uint32_t c) { low = 0; rng = 0x8000; cnt = -9; offs = 0; cap = c; ovf = 0; pend = -1; out = o; }
+    __device__ __forceinline__ void emit(uint32_t v) {  // v = byte + carry (<= 0x1FF)
+        if (v > 0xFFu && pend >= 0) {
+            pend++;
+            if (pend > 0xFF) {
+                pend = 0;
+                uint32_t k = offs;
+                while (k > 0) {
+                    k--;
+                    const uint32_t x = out[k] + 1u;
+                    out[k] = (uint8_t)x;
+                    if (x <= 0xFFu) break;
+                }
+            }
+        }
+        if (pend >= 0) {
+            if (offs < cap) out[offs] = (uint8_t)pend;
+            else ovf = 1;
+            offs++;
+        }
+        pend = (int)(v & 0xFFu);
+    }
+    __device__ int done() {
+        int c = cnt, s = 10 + c;
+        const uint32_t m = 0x3FFF;
+        uint32_t en = ((low + m) & ~m) | (m + 1);
+        if (s > 0) {
+            uint32_t n = (1u << (c + 16)) - 1;
+            do {
+                emit(en >> (c + 16));
+                en &= n;
+                s -= 8;
+                c -= 8;
+                n >>= 8;
+            } while (s > 0);
+        }
+        if (pend >= 0) {
+            if (offs < cap) out[offs] = (uint8_t)pend;
+            else ovf = 1;
+            offs++;
+        }
+        return ovf ? -1 : (int)offs;
+    }
+};
+
+// od_ec_encode_q15 + normalize; u = r when fl >= 32768 (then low is unchanged and r -= v).
+// cw: bit 31 = (fl < 32768), bits 21..30 fl >> 6, bits 11..20 fh >> 6, bits 0..4 nsyms - 1 - s.
+__device__ __forceinline__ void rc_code(Rc64 &rc, uint32_t cw PROF(, unsigned long long *pc)) {
+    uint32_t r = rc.rng;
+    const uint32_t r8 = r >> 8, nms4 = 4u * (cw & 31u);
+    const uint32_t v = ((r8 * ((cw >> 11) & 1023u)) >> 1) + nms4;
+    const uint32_t uq = ((r8 * ((cw >> 21) & 1023u)) >> 1) + nms4 + 4u;
+    const uint32_t u = (cw >> 31) ? uq : r;
+    uint64_t l = rc.low + (r - u);
+    r = u - v;
+    const int d = __clz((int)r) - 16;
+    int c = rc.cnt;
+    int s = c + d;
+    if (s >= 40) {
+        PROF(pc[0]++;)
+        rc.low = l;
+        rc.flush(c, s);
+        l = rc.low;
+        s = c + d - 24;
+    }
+    rc.low = l << d;
+    rc.rng = r << d;
+    rc.cnt = s;
+}
+// The same, split in two for k_entropy_win's two coder threads.  rc_range: the range, the serial chain from one
+// symbol to the next; returns (r - u) | d << 16 (r - u < 2^16: u <= r < 2^16).  rc_low: low, carries and bytes from it.
+__device__ __forceinline__ uint32_t rc_range(uint32_t &rng, uint32_t cw) {
+    const uint32_t r = rng;
+    const uint32_t r8 = r >> 8, nms4 = 4u * (cw & 31u);
+    const uint32_t v = ((r8 * ((cw >> 11) & 1023u)) >> 1) + nms4;
+    const uint32_t uq = ((r8 * ((cw >> 21) & 1023u)) >> 1) + nms4 + 4u;
+    const uint32_t u = (cw >> 31) ? uq : r;
+    const uint32_t rr = u - v;
+    const int d = __clz((int)rr) - 16;
+    rng = rr << d;
+    return (r - u) | ((uint32_t)d << 16);
+}
+__device__ __forceinline__ void rc_low(Rc64 &rc, uint32_t x PROF(, unsigned long long *pc)) {
+    const int d = (int)(x >> 16);
+    uint64_t l = rc.low + (x & 0xFFFFu);
+    int c = rc.cnt;
+    int s = c + d;
+    if (s >= 40) {
+        PROF(pc[0]++;)
+        rc.low = l;
+        rc.flush(c, s);
+        l = rc.low;
+        s = c + d - 24;
+    }
+    rc.low = l << d;
+    rc.cnt = s;
+}
+__device__ __forceinline__ void rc_code(Rc32 &rc, uint32_t cw PROF(, unsigned long long *pc)) {
+    uint32_t l = rc.low, r = rc.rng;
+    const uint32_t r8 = r >> 8, nms4 = 4u * (cw & 31u);
+    const uint32_t v = ((r8 * ((cw >> 11) & 1023u)) >> 1) + nms4;
+    const uint32_t uq = ((r8 * ((cw >> 21) & 1023u)) >> 1) + nms4 + 4u;
+    const uint32_t u = (cw >> 31) ? uq : r;
+    l += r - u;
+    r = u - v;
+    const int d = __clz((int)r) - 16;
+    int c = rc.cnt, s = c + d;
+    if (s >= 0) {
+        c += 16;
+        uint32_t m = (1u << c) - 1;
+        if (s >= 8) {
+            PROF(pc[0]++;)
+            rc.emit(l >> c);
+            l &= m;
+            c -= 8;
+            m >>= 8;
+        }
+        PROF(pc[0]++;)
+        rc.emit(l >> c);
+        s = c + d - 24;
+        l &= m;
+    }
+    rc.low = l << d;
+    rc.rng = r << d;
+    rc.cnt = s;
+}
+
+// value of cr[idx] for a runtime idx without local memory
+template <int NC>
+__device__ __forceinline__ uint32_t sel(const uint32_t (&cr)[NC], uint32_t idx) {
+    uint32_t v = 0;
+#pragma unroll
+    for (int i = 0; i < NC; i++) v = (uint32_t)i == idx ? cr[i] : v;
+    return v;
+}
+
+// One CDF group of a window (lanes m: the symbols sharing the CDF c, in stream order), applied with the CDF in
+// registers: cr[NC], NC = 16, or 4 for alphabets of up to 4 symbols (most of the coefficient syntax; a quarter of
+// the work per symbol).  split_or_* words only use partition CDFs of 10 symbols, so NC = 4 groups have none.
+template <int NC>
+__device__ __forceinline__ void win_group(uint16_t *c, uint32_t N, uint32_t m, const uint32_t *sw, uint32_t *sc) {
+    uint32_t cr[NC];
+#pragma unroll
+    for (int i = 0; i < NC; i++) cr[i] = (uint32_t)i < N ? c[i] : 0u;
+    uint32_t cnt = c[N];
+    // the next member's lane and word are fetched one step ahead (they do not depend on the CDF), so each step's
+    // chain is the CDF update alone, not __ffs + the shared load + the update
+    int j = __ffs((int)m) - 1;
+    m &= m - 1;
+    uint32_t x = sw[j];
+    for (;;) {
+        const bool more = m != 0;
+        const int jn = __ffs((int)m) - 1;
+        m &= m - 1;
+        const uint32_t xn = more ? sw[jn] : 0u;
+        const uint32_t sj = x & 15u;
+        bool adapt = true;
+        if constexpr (NC == 16) {
+            if ((x >> 8) != AV1G_SYM_ADAPT) {  // split_or_horz / split_or_vert: read-only use of the partition CDF
+#define P_(k) (cr[k] - ((k) > 0 ? cr[(k) > 0 ? (k) - 1 : 0] : 0u))
+                const uint32_t psum = (x >> 8) == AV1G_SYM_SPLIT_OR_HORZ
+                    ? P_(AV1G_PARTITION_VERT) + P_(AV1G_PARTITION_SPLIT) + P_(AV1G_PARTITION_HORZ_A) +
+                          P_(AV1G_PARTITION_VERT_A) + P_(AV1G_PARTITION_VERT_B) + P_(AV1G_PARTITION_VERT_4)
+                    : P_(AV1G_PARTITION_HORZ) + P_(AV1G_PARTITION_SPLIT) + P_(AV1G_PARTITION_HORZ_A) +
+                          P_(AV1G_PARTITION_HORZ_B) + P_(AV1G_PARTITION_VERT_A) + P_(AV1G_PARTITION_HORZ_4);
+#undef P_
+                sc[j] = coded_word(sj ? psum : 32768u, sj ? 0u : psum, 1u - sj);
+                adapt = false;
+            }
+        }
+        if (adapt) {
+            sc[j] = coded_word(sj ? 32768u - sel(cr, sj - 1) : 32768u, 32768u - sel(cr, sj), N - 1 - sj);
+            const int rate = 3 + (cnt > 15) + (cnt > 31) + (N >= 4 ? 2 : 1);
+            // all NC entries unconditionally (straight-line code): cr[N-1] == 32768 stays 32768, entries >= N are
+            // never read nor written back
+#pragma unroll
+            for (int i = 0; i < NC; i++) {
+                const uint32_t y = cr[i];
+                cr[i] = (uint32_t)i < sj ? y - (y >> rate) : y + ((32768u - y) >> rate);
+            }
+            cnt += cnt < 32;
+        }
+        if (!more) break;
+        j = jn;
+        x = xn;
+    }
+#pragma unroll
+    for (int i = 0; i < NC - 1; i++)
+        if ((uint32_t)i + 1 < N) c[i] = (uint16_t)cr[i];
+    c[N] = (uint16_t)cnt;
+}
+
+// Three warps per tile: warp 0 computes the coded words of 32-symbol windows (phase A, CDF
+// adaptation) into a shared ring; warp 1 lane 0 runs the range of the coder over them (phase B1:
+// the serial chain from symbol to symbol) into a second ring, and warp 2 lane 0 the low end, carries
+// and bytes (phase B2).  The per-window cost is max(A, B1, B2) instead of A + B.  (Rc32, the A/B
+// variant, keeps one coder thread: warp 1 lane 0 does B1 + B2.)
+#define AV1G_WIN_RING 8
+struct WinShared {
+    uint32_t ring[AV1G_WIN_RING][32];   // coded words
+    uint32_t ring2[AV1G_WIN_RING][32];  // B1 -> B2: (r - u) | d << 16
+    uint32_t sw[32];                    // producer: per lane s | kind << 8
+    int prod, cons;                     // windows produced / consumed by B1
+    int prod2, cons2;                   // windows B1 handed to B2 / B2 consumed
+};
+constexpr size_t kWinSmem = sizeof(av1g_cdfs) + sizeof(WinShared);
+constexpr int kWinThreads = 96;
+
+__device__ __forceinline__ int vload(const int *p) { return *(const volatile int *)p; }
+__device__ __forceinline__ void vstore(int *p, int v) { *(volatile int *)p = v; }
+
+template <class Coder>
+__global__ void __launch_bounds__(kWinThreads) k_entropy_win(const uint32_t *syms, const uint64_t *tb, const uint64_t *te,
+                                                              const int *tq, const uint64_t *capOff, const av1g_cdfs *cdfDef,
+                                                              uint8_t *out, uint64_t *sizeArr, DevStatus *st) {
+    constexpr bool kSplit = std::is_same<Coder, Rc64>::value;   // B1 / B2 on two threads (Rc64 only)
+    extern __shared__ uint4 sh4[];
+    uint16_t *cdf = (uint16_t *)sh4;
+    WinShared &W = *(WinShared *)(sh4 + sizeof(av1g_cdfs) / 16);
+    const uint32_t t = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    {
+        const uint4 *src = (const uint4 *)(cdfDef + av1g_coeff_cdf_q_ctx(tq[t]));
+        for (int i = threadIdx.x; i < (int)(sizeof(av1g_cdfs) / 16); i += kWinThreads) sh4[i] = src[i];
+        if (threadIdx.x == 0) { W.prod = 0; W.cons = 0; W.prod2 = 0; W.cons2 = 0; }
+        __syncthreads();
+    }
+    const uint64_t b = tb[t], e = te[t];
+    const uint32_t nWin = (uint32_t)((e - b + 31) / 32);
+    PROF(unsigned long long pT0 = clock64(), pA = 0, pB = 0, pG = 0, pW = 0, pc[2] = {0, 0};)
+    if (warp == 0) {
+        // ---------------- phase A (producer) ----------------
+        uint32_t next = b + lane < e ? syms[b + lane] : 0u;
+        for (uint32_t w = 0; w < nWin; w++) {
+            const uint64_t w0 = b + 32ull * w;
+            const uint32_t nv = (uint32_t)min((uint64_t)32, e - w0);
+            const uint32_t word = next;
+            next = w0 + 32 + lane < e ? syms[w0 + 32 + lane] : 0u;  // prefetch the next window
+            if (lane == 0)
+                while ((int)w - vload(&W.cons) >= AV1G_WIN_RING) __nanosleep(32);
+            __syncwarp();
+            PROF(const unsigned long long pa0 = clock64();)
+            uint32_t *sc = W.ring[w % AV1G_WIN_RING];
+            const uint32_t kind = (uint32_t)lane < nv ? word >> 24 : AV1G_SYM_BOOL;
+            const uint32_t s = (word >> 16) & 15u, off = word & 0xFFFFu;
+            // symbols sharing a CDF form a group; its first lane applies the group's updates in
+            // stream order with the CDF in registers
+            const uint32_t key = kind == AV1G_SYM_BOOL ? 0x10000u | (uint32_t)lane : off;
+            const uint32_t peers = __match_any_sync(0xFFFFFFFFu, key);
+            W.sw[lane] = s | (kind << 8);
+            if (kind == AV1G_SYM_BOOL) sc[lane] = coded_word(s ? 16384u : 32768u, s ? 0u : 16384u, 1u - (s & 1u));
+            __syncwarp();
+            PROF(pG += __reduce_max_sync(0xFFFFFFFFu, (uint32_t)__popc(peers)); pW++;)
+            if (kind != AV1G_SYM_BOOL && (peers & ((1u << lane) - 1u)) == 0) {
+                // alphabet of the CDF: a split_or_* word carries the bool's N; its partition CDF has 10
+                const uint32_t N = kind == AV1G_SYM_ADAPT ? ((word >> 20) & 15u) + 1 : 10u;
+                if (N <= 4) win_group<4>(cdf + off, N, peers, W.sw, sc);
+                else win_group<16>(cdf + off, N, peers, W.sw, sc);
+            }
+            __syncwarp();
+            PROF(pA += clock64() - pa0;)
+            if (lane == 0) {
+                __threadfence_block();
+                vstore(&W.prod, (int)w + 1);
+            }
+        }
+    } else if (kSplit && warp == 1) {
+        if (lane == 0) {
+            // ---------------- phase B1 (the range, one thread): coded word -> (r - u, d) ----------------
+            uint32_t rng = 0x8000;   // Rc64::init
+            for (uint32_t w = 0; w < nWin; w++) {
+                while (vload(&W.prod) <= (int)w) __nanosleep(32);   // backing off: a spinning thread slows the producer's shared-memory accesses
+                while ((int)w - vload(&W.cons2) >= AV1G_WIN_RING) __nanosleep(32);
+                __threadfence_block();
+                PROF(const unsigned long long pb0 = clock64();)
+                const uint32_t *sc = W.ring[w % AV1G_WIN_RING];
+                uint32_t *so = W.ring2[w % AV1G_WIN_RING];
+                const uint32_t nv = (uint32_t)min((uint64_t)32, (uint64_t)(e - (b + 32ull * w)));
+                if (nv == 32) {   // a full window (all but a tile's last): 16-byte loads and stores
+                    const uint4 *s4 = (const uint4 *)sc;
+                    uint4 *o4 = (uint4 *)so;
+                    uint4 q = s4[0];
+#pragma unroll 2
+                    for (int k = 0; k < 8; k++) {
+                        const uint4 cur = q;
+                        q = s4[k + 1 < 8 ? k + 1 : 7];
+                        uint4 o;
+                        o.x = rc_range(rng, cur.x);
+                        o.y = rc_range(rng, cur.y);
+                        o.z = rc_range(rng, cur.z);
+                        o.w = rc_range(rng, cur.w);
+                        o4[k] = o;
+                    }
+                } else {
+                    for (uint32_t j = 0; j < nv; j++) so[j] = rc_range(rng, sc[j]);
+                }
+                __threadfence_block();
+                vstore(&W.cons, (int)w + 1);
+                vstore(&W.prod2, (int)w + 1);
+                PROF(pB += clock64() - pb0;)
+            }
+        }
+    } else if (kSplit && warp == 2) {
+        if (lane == 0) {
+            // ---------------- phase B2 (low, carries and bytes, one thread) ----------------
+            Rc64 rc;
+            rc.init(out + capOff[t], (uint32_t)(capOff[t + 1] - capOff[t]));
+            PROF(unsigned long long pC = 0;)
+            for (uint32_t w = 0; w < nWin; w++) {
+                while (vload(&W.prod2) <= (int)w) __nanosleep(32);
+                __threadfence_block();
+                PROF(const unsigned long long pc0 = clock64();)
+                const uint32_t *so = W.ring2[w % AV1G_WIN_RING];
+                const uint32_t nv = (uint32_t)min((uint64_t)32, (uint64_t)(e - (b + 32ull * w)));
+                if (nv == 32) {
+                    const uint4 *s4 = (const uint4 *)so;
+                    uint4 q = s4[0];
+#pragma unroll 2
+                    for (int k = 0; k < 8; k++) {
+                        const uint4 cur = q;
+                        q = s4[k + 1 < 8 ? k + 1 : 7];
+                        rc_low(rc, cur.x PROF(, pc));
+                        rc_low(rc, cur.y PROF(, pc));
+                        rc_low(rc, cur.z PROF(, pc));
+                        rc_low(rc, cur.w PROF(, pc));
+                    }
+                } else {
+                    for (uint32_t j = 0; j < nv; j++) rc_low(rc, so[j] PROF(, pc));
+                }
+                __threadfence_block();
+                vstore(&W.cons2, (int)w + 1);
+                PROF(pC += clock64() - pc0;)
+            }
+            const int n = rc.done();
+            PROF(if (t < 4096) { g_prof[t][0] = clock64() - pT0; g_prof[t][5] = pc[0]; g_prof[t][6] = pC; })
+            sizeArr[t] = n < 0 ? 0 : (uint64_t)n;
+            if (n < 0) atomicOr(&st->error, AV1G_GPU_ERR_OUTPUT);
+        }
+    } else if (warp == 1 && lane == 0) {
+        // ---------------- phase B (consumer, one thread; the Rc32 A/B variant) ----------------
+        Coder rc;
+        rc.init(out + capOff[t], (uint32_t)(capOff[t + 1] - capOff[t]));
+        for (uint32_t w = 0; w < nWin; w++) {
+            while (vload(&W.prod) <= (int)w) {}
+            __threadfence_block();
+            PROF(const unsigned long long pb0 = clock64();)
+            const uint32_t *sc = W.ring[w % AV1G_WIN_RING];
+            const uint32_t nv = (uint32_t)min((uint64_t)32, (uint64_t)(e - (b + 32ull * w)));
+            uint32_t cw = sc[0];
+            for (uint32_t j = 0; j < nv; j++) {
+                const uint32_t cur = cw;
+                cw = sc[j + 1 < 32 ? j + 1 : 31];
+                rc_code(rc, cur PROF(, pc));
+            }
+            __threadfence_block();
+            vstore(&W.cons, (int)w + 1);
+            PROF(pB += clock64() - pb0;)
+        }
+        const int n = rc.done();
+        PROF(if (t < 4096) { g_prof[t][0] = clock64() - pT0; g_prof[t][2] = pB; g_prof[t][5] = pc[0]; g_prof[t][6] = pc[1]; })
+        sizeArr[t] = n < 0 ? 0 : (uint64_t)n;
+        if (n < 0) atomicOr(&st->error, AV1G_GPU_ERR_OUTPUT);
+    }
+#ifdef AV1G_ENTROPY_PROFILE
+    if (kSplit && warp == 1 && lane == 0 && t < 4096) g_prof[t][2] = pB;
+#endif
+#ifdef AV1G_ENTROPY_PROFILE
+    if (warp == 0 && lane == 0 && t < 4096) { g_prof[t][1] = pA; g_prof[t][3] = pG; g_prof[t][4] = pW; }
+#endif
+}
+
+// tile payloads (at capOff) -> packed (at tileOff); one CTA per tile
+__global__ void k_pack(const uint8_t *staging, const uint64_t *capOff, const uint64_t *sizeArr, const uint64_t *tileOff,
+                       uint8_t *packed, uint32_t nTiles, DevStatus *st) {
+    const uint32_t t = blockIdx.x;
+    const uint8_t *src = staging + capOff[t];
+    uint8_t *dst = packed + tileOff[t];
+    const uint64_t n = sizeArr[t];
+    for (uint64_t i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+    if (t == 0 && threadIdx.x == 0) st->bytes = tileOff[nTiles];
+}
+
+int g_entropy_mode = 3;  // 3 two-warp windowed coder (64-bit od_ec window), 4 same with the 32-bit precarry
+                         // coder; 2 M4 warp/tile; 1 shared 4 tiles/warp; 0 global-memory CDFs
+
+static void launch_entropy_m4(bool smem, const uint32_t *syms, const uint64_t *b, const uint64_t *e, const int *q,
+                              const uint64_t *cap, av1g_cdfs *scr, uint16_t *pre, uint8_t *out, int *sz, uint32_t n) {
+    if (smem && g_entropy_mode == 2)
+        k_entropy_warp<<<n, 32, sizeof(av1g_cdfs)>>>(syms, b, e, q, cap, pre, out, sz, n);
+    else if (smem)
+        k_entropy_smem<<<(n + AV1G_ENT_TPB - 1) / AV1G_ENT_TPB, AV1G_ENT_TPB, AV1G_ENT_TPB * sizeof(av1g_cdfs)>>>(
+            syms, b, e, q, cap, pre, out, sz, n);
+    else
+        k_entropy<<<(n + 31) / 32, 32>>>(syms, b, e, q, cap, scr, pre, out, sz, n);
+}
+
+bool g_entropy_smem = true;
+
+// ---------------------------------------------------------------------------
+// host: scratch plan (shared by the size query and the call)
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kFrameChunk = 128, kTileChunk = 512;
+static_assert(sizeof(Chunk<FrameG, kFrameChunk>) < 32000, "kernel parameter limit");
+static_assert(sizeof(Chunk<TileG, kTileChunk>) < 32000, "kernel parameter limit");
+
+size_t al(size_t x) { return (x + 255) & ~(size_t)255; }
+
+struct Plan {
+    std::vector<FrameG> F;
+    std::vector<TileG> T;
+    std::vector<uint32_t> frameTile0;
+    uint32_t nF = 0, nB = 0, nT = 0, nSb = 0, nTiles = 0;
+    uint64_t nItems = 0, miTotal = 0, ctxAll = 0, symCap = 0, capBytes = 0;
+    size_t cubItems = 0, cubTiles = 0;
+    // scratch offsets
+    size_t oF, oT, oSb, oBFrame, oBTile, oBTxbG, oTxbBlock, oSbFirst, oMap[4], oCtxL, oCtxD, oEob, oType, oCount, oOff, oCub,
+        oSyms, oTb, oTe, oTq, oCapArr, oCapOff, oSizes, oStaging, oPacked, oResult, oCdfDef, oIscan, total;
+    // palettes: screen-content frames get the PaletteSizes / palette maps, batches with palettes the block -> palette
+    // table and the token slots
+    uint32_t nPal = 0;
+    bool anySct = false;
+    size_t oPalMap[2] = {0, 0}, oPalIdx = 0, oBlockPal = 0, oPalTok = 0;
+    // trusted records (DevBatch::miSize .. ctxDc): derive = the derivation runs too (untrusted, or checkTrusted), counted =
+    // the tx blocks' counts are given; the arrays only the derivation / the count pass use are not reserved otherwise
+    bool trusted = false, derive = true, counted = false;
+};
+
+int build_plan(const DevBatch &b, Plan &P, std::string &err) {
+    P = Plan();
+    if (!b.frames || !b.nFrames) { err = "no frames"; return -1; }
+    P.nF = b.nFrames;
+    P.F.resize(P.nF);
+    P.frameTile0.assign(P.nF + 1, 0);
+    const uint32_t b0 = b.frames[0].blockBase, t0 = b.frames[0].txbBase, p0 = b.frames[0].palBase;
+    uint64_t miTotal = 0, ctxTotal[3] = {0, 0, 0}, pixels = 0, llSamples = 0, mapTotal = 0;
+    for (uint32_t f = 0; f < P.nF; f++) {
+        const DevFrame &d = b.frames[f];
+        const av1g_frame_params &fp = d.fp;
+        if (d.blockBase != b0 + P.nB || d.txbBase != t0 + P.nT) {
+            err = "frames must be stored in order and contiguously in blocks/blockTxb and txb (frame " + std::to_string(f) + ")";
+            return -1;
+        }
+        if (!d.nBlocks || !d.nTxb) { err = "frame " + std::to_string(f) + " has no blocks / tx blocks"; return -1; }
+        FrameG &g = P.F[f];
+        memset(&g, 0, sizeof g);
+        g.W = fp.width; g.H = fp.height;
+        g.MiCols = av1g_mi_cols(g.W); g.MiRows = av1g_mi_rows(g.H);
+        g.mono = fp.monochrome; g.qidx = fp.base_q_idx; g.reduced = fp.reduced_tx_set;
+        g.ssx = av1g_ssx(&fp); g.ssy = av1g_ssy(&fp);
+        g.txsel = fp.tx_mode_select; g.sct = fp.allow_screen_content_tools;
+        g.dq = fp.delta_q_present; g.dqRes = fp.delta_q_res; g.fi = fp.enable_filter_intra;
+        g.cdefBits = fp.enable_cdef ? fp.cdef_bits : -1;
+        if (av1g_lossless(&fp)) llSamples += (uint64_t)fp.width * fp.height * (fp.monochrome ? 2 : g.ssx ? 3 : 6) / 2;
+        g.miBase = miTotal;
+        miTotal += (uint64_t)g.MiCols * g.MiRows;
+        for (int p = 0; p < 3; p++) {
+            g.ctxStride[p] = g.MiCols >> (p ? g.ssx : 0);
+            g.ctxRows[p] = g.MiRows >> (p ? g.ssy : 0);
+            g.ctxBase[p] = ctxTotal[p];
+            if (p == 0 || !g.mono) ctxTotal[p] += (uint64_t)g.ctxStride[p] * g.ctxRows[p];
+        }
+        for (int p = 0; p < 3; p++) g.tctxBase[p] = d.ctxOff[p];
+        g.blockBase = P.nB; g.nBlocks = d.nBlocks; g.txbBase = P.nT; g.nTxb = d.nTxb; g.coeffBase = d.coeffBase;
+        P.nB += d.nBlocks;
+        P.nT += d.nTxb;
+        g.bd = av1g_bit_depth(&fp);
+        if (d.nPal && (d.palBase != p0 + P.nPal || !fp.allow_screen_content_tools || !b.palettes || !b.colorMap)) {
+            err = "palettes of frame " + std::to_string(f) + ": not back to back in frame order, or no allow_screen_content_tools / arrays";
+            return -1;
+        }
+        g.palBase = P.nPal; g.nPal = d.nPal; g.mapBase = d.mapBase;
+        P.nPal += d.nPal;
+        P.anySct |= fp.allow_screen_content_tools != 0;
+        mapTotal += d.nMap;
+        pixels += (uint64_t)fp.width * fp.height * (g.ssx ? 1 : 2);   // 4:4:4: twice the samples of 4:2:0
+        av1g::TileInfo ti;
+        if (!av1g::compute_tiles(fp.width, fp.height, fp.tile_cols_log2, fp.tile_rows_log2, ti)) {
+            err = "bad tiling in frame " + std::to_string(f);
+            return -1;
+        }
+        const int sbCols = (g.MiCols + 15) >> 4, sbRows = (g.MiRows + 15) >> 4;
+        g.tileCols = (int)ti.cols; g.tileRows = (int)ti.rows;
+        g.tileWsb = ti.cols > 1 ? (int)(ti.miColStarts[1] >> 4) : sbCols;
+        g.tileHsb = ti.rows > 1 ? (int)(ti.miRowStarts[1] >> 4) : sbRows;
+        g.sbBase = P.nSb; g.tileBase = (uint32_t)P.T.size(); g.nTiles = ti.cols * ti.rows;
+        P.frameTile0[f] = g.tileBase;
+        for (uint32_t tr = 0; tr < ti.rows; tr++)
+            for (uint32_t tc = 0; tc < ti.cols; tc++) {
+                TileG tg;
+                memset(&tg, 0, sizeof tg);
+                tg.frame = f;
+                tg.miRowStart = ti.miRowStarts[tr]; tg.miRowEnd = ti.miRowStarts[tr + 1];
+                tg.miColStart = ti.miColStarts[tc]; tg.miColEnd = ti.miColStarts[tc + 1];
+                if ((int)ti.miColStarts[tc] != (int)tc * g.tileWsb * 16 || (int)ti.miRowStarts[tr] != (int)tr * g.tileHsb * 16) {
+                    err = "non-uniform tiling";
+                    return -1;
+                }
+                tg.sbRow0 = tg.miRowStart >> 4; tg.sbCol0 = tg.miColStart >> 4;
+                tg.sbCols = ((tg.miColEnd + 15) >> 4) - tg.sbCol0;
+                tg.nSb = (uint32_t)(tg.sbCols * (((tg.miRowEnd + 15) >> 4) - tg.sbRow0));
+                tg.sbBase = P.nSb;
+                P.nSb += tg.nSb;
+                P.T.push_back(tg);
+            }
+        g.nSb = P.nSb - g.sbBase;
+    }
+    for (auto &g : P.F) { g.ctxBase[1] += ctxTotal[0]; g.ctxBase[2] += ctxTotal[0] + ctxTotal[1]; }
+    P.nTiles = (uint32_t)P.T.size();
+    P.frameTile0[P.nF] = P.nTiles;
+    P.miTotal = miTotal;
+    P.ctxAll = ctxTotal[0] + ctxTotal[1] + ctxTotal[2];
+    P.nItems = (uint64_t)P.nB + P.nT;
+    if (P.nItems + 1 > 0x7FFFFFFFull) { err = "batch too large (items)"; return -1; }
+    // default bound; lossless frames code every sample's WHT coefficient (sign, base / range levels, Golomb bits)
+    P.symCap = b.symbolCapacity ? b.symbolCapacity : pixels * 3 / 4 + 16ull * P.nB + 8ull * P.nT + 6ull * llSamples + mapTotal +
+                                                         64ull * P.nPal;   // a token per map entry, colour bits
+    P.capBytes = P.symCap / 2 + 256ull * P.nTiles;
+    size_t t1 = 0, t2 = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, t1, (const uint32_t *)nullptr, (uint32_t *)nullptr, (int)(P.nItems + 1));
+    cub::DeviceScan::ExclusiveSum(nullptr, t2, (const uint64_t *)nullptr, (uint64_t *)nullptr, (int)(P.nTiles + 1));
+    P.cubItems = t1;
+    P.cubTiles = t2;
+    size_t o = 0;
+    auto take = [&](size_t bytes) { const size_t at = o; o = al(o + bytes); return at; };
+    P.oF = take(sizeof(FrameG) * P.nF);
+    P.oT = take(sizeof(TileG) * P.nTiles);
+    P.oSb = take(sizeof(SbG) * P.nSb);
+    P.oBFrame = take(4ull * P.nB);
+    P.oBTile = take(4ull * P.nB);
+    P.oBTxbG = take(4ull * (P.nB + 1));
+    P.oTxbBlock = take(4ull * P.nT);
+    P.oSbFirst = take(4ull * P.nSb);
+    {
+        bool anyLL = false;
+        for (const FrameG &g : P.F) anyLL |= g.qidx == 0;
+        P.trusted = !anyLL && b.miSize && b.yMode && b.skip && b.txSize && b.ctxLvl && b.ctxDc;
+        P.derive = !P.trusted || b.checkTrusted;
+        P.counted = P.trusted && b.itemCount;
+    }
+    for (int i = 0; i < 4; i++) P.oMap[i] = P.derive ? take(P.miTotal) : 0;
+    P.oCtxL = P.derive ? take(P.ctxAll) : 0;
+    P.oCtxD = P.derive ? take(P.ctxAll) : 0;
+    P.oEob = P.derive ? take(2ull * P.nT) : 0;
+    P.oType = P.derive ? take(P.nT) : 0;
+    P.oCount = !P.counted || b.checkTrusted ? take(4ull * (P.nItems + 1)) : 0;
+    P.oOff = take(4ull * (P.nItems + 1));
+    P.oCub = take(std::max(t1, t2));
+    P.oSyms = take(4ull * P.symCap);
+    P.oTb = take(8ull * P.nTiles);
+    P.oTe = take(8ull * P.nTiles);
+    P.oTq = take(4ull * P.nTiles);
+    P.oCapArr = take(8ull * (P.nTiles + 1));
+    P.oCapOff = take(8ull * (P.nTiles + 1));
+    P.oSizes = take(8ull * (P.nTiles + 1));
+    P.oStaging = take(P.capBytes);
+    P.oPacked = take(P.capBytes);
+    P.oResult = take(sizeof(DevStatus) + 8ull * (P.nTiles + 1));
+    P.oCdfDef = take(4 * sizeof(av1g_cdfs));
+    P.oIscan = take(2ull * kIscanTables * 1024);
+    if (P.anySct) {
+        P.oPalMap[0] = take(P.miTotal);
+        P.oPalMap[1] = take(P.miTotal);
+        P.oPalIdx = take(4ull * P.miTotal);
+    }
+    if (P.nPal) {
+        P.oBlockPal = take(4ull * P.nB);
+        P.oPalTok = take(8ull * P.nPal);
+    }
+    P.total = o;
+    return 0;
+}
+
+}  // namespace
+
+size_t run_batch_device_scratch_bytes(const DevBatch &b) {
+    Plan P;
+    std::string err;
+    return build_plan(b, P, err) ? 0 : P.total;
+}
+
+// k_sbsym's partition walk is recursive, so its stack need is not known to the driver: k_sbsym (208 bytes) + 5 levels
+// of w_partition (176 each, 128x128 superblocks) + the palette helpers (w_pal_info 152, w_pal_colors 184) = 1,424
+// bytes (ptxas, sm_89), above the default 1 KB.  Raised once, never lowered (the lossy encoder sets more already).
+static void ensure_walk_stack() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        size_t cur = 0;
+        if (cudaDeviceGetLimit(&cur, cudaLimitStackSize) == cudaSuccess && cur < 2048 &&
+            cudaDeviceSetLimit(cudaLimitStackSize, 2048) != cudaSuccess)
+            cudaGetLastError();
+    });
+}
+
+int run_batch_device(const DevBatch &b, cudaStream_t s, void *scratch, size_t scratchBytes, DevResult &out, std::string &err,
+                     const DevEvents *ev) {
+    ensure_walk_stack();
+    Plan P;
+    if (build_plan(b, P, err)) return -1;
+    if (!scratch || scratchBytes < P.total) {
+        err = "scratch too small: " + std::to_string(scratchBytes) + " < " + std::to_string(P.total);
+        return -1;
+    }
+    if (((uintptr_t)scratch & 255) != 0) { err = "scratch must be 256-byte aligned"; return -1; }
+    if (!b.blocks || !b.blockTxb || !b.txb || !b.coeffs) { err = "null device array"; return -1; }
+    uint8_t *S = (uint8_t *)scratch;
+    FrameG *dF = (FrameG *)(S + P.oF);
+    TileG *dT = (TileG *)(S + P.oT);
+    SbG *dSb = (SbG *)(S + P.oSb);
+    uint32_t *dBFrame = (uint32_t *)(S + P.oBFrame), *dBTile = (uint32_t *)(S + P.oBTile), *dBTxbG = (uint32_t *)(S + P.oBTxbG);
+    uint32_t *dTxbBlock = (uint32_t *)(S + P.oTxbBlock), *dSbFirst = (uint32_t *)(S + P.oSbFirst);
+    uint8_t *mMiSize = S + P.oMap[0], *mYMode = S + P.oMap[1], *mSkip = S + P.oMap[2], *mTx = S + P.oMap[3];
+    uint8_t *cL = S + P.oCtxL, *cD = S + P.oCtxD;
+    uint16_t *dEob = (uint16_t *)(S + P.oEob);
+    uint8_t *dType = S + P.oType;
+    uint32_t *dCount = (uint32_t *)(S + P.oCount), *dOff = (uint32_t *)(S + P.oOff), *dSyms = (uint32_t *)(S + P.oSyms);
+    void *dCub = S + P.oCub;
+    uint64_t *dTb = (uint64_t *)(S + P.oTb), *dTe = (uint64_t *)(S + P.oTe);
+    int *dTq = (int *)(S + P.oTq);
+    uint64_t *dCapArr = (uint64_t *)(S + P.oCapArr), *dCapOff = (uint64_t *)(S + P.oCapOff), *dSizes = (uint64_t *)(S + P.oSizes);
+    uint8_t *dStaging = S + P.oStaging, *dPacked = S + P.oPacked;
+    DevStatus *dSt = (DevStatus *)(S + P.oResult);
+    uint64_t *dTileOff = (uint64_t *)(dSt + 1);
+    av1g_cdfs *dCdfDef = (av1g_cdfs *)(S + P.oCdfDef);
+    uint16_t *dIscan = (uint16_t *)(S + P.oIscan);
+    // caller's arrays, shifted so that frame 0 starts at index 0
+    const av1g_block *blocks = b.blocks + b.frames[0].blockBase;
+    const uint32_t *blockTxb = b.blockTxb + b.frames[0].blockBase;
+    const av1g_txb *txb = b.txb + b.frames[0].txbBase;
+    const uint32_t nB = P.nB, nT = P.nT, nSb = P.nSb, nTiles = P.nTiles;
+    const uint64_t nItems = P.nItems;
+    auto rec = [&](int i) { if (ev) cudaEventRecord(ev->e[i], s); };
+    const int TB = 128;
+    auto grid = [](uint64_t n, int tb) { return (unsigned)((n + tb - 1) / tb); };
+
+    rec(0);
+    CK(cudaMemsetAsync(dSt, 0, sizeof(DevStatus), s));
+    CK(cudaMemsetAsync(dSbFirst, 0xFF, 4ull * nSb, s));
+    for (uint32_t i = 0; i < P.nF; i += kFrameChunk) {
+        Chunk<FrameG, kFrameChunk> c;
+        c.n = std::min<uint32_t>(kFrameChunk, P.nF - i);
+        c.first = i;
+        std::copy(P.F.begin() + i, P.F.begin() + i + c.n, c.v);
+        k_put<FrameG, kFrameChunk><<<1, 128, 0, s>>>(c, dF);
+    }
+    for (uint32_t i = 0; i < nTiles; i += kTileChunk) {
+        Chunk<TileG, kTileChunk> c;
+        c.n = std::min<uint32_t>(kTileChunk, nTiles - i);
+        c.first = i;
+        std::copy(P.T.begin() + i, P.T.begin() + i + c.n, c.v);
+        k_put<TileG, kTileChunk><<<1, 256, 0, s>>>(c, dT);
+    }
+    k_cdf_defaults<<<4, 1, 0, s>>>(dCdfDef);
+    k_iscan<<<kIscanTables, 256, 0, s>>>(dIscan);
+    k_blocks<<<grid(nB, TB), TB, 0, s>>>(dF, P.nF, dT, blocks, blockTxb, nB, nT, dBFrame, dBTile, dBTxbG, dTxbBlock, dSbFirst, dSt);
+    k_sbs<<<grid(nSb, TB), TB, 0, s>>>(dF, dT, nTiles, nSb, dSbFirst, dSb, dSt);
+    k_tiles<<<nTiles, 32, 0, s>>>(dF, dT, dSb, blocks);
+    PalG pg;
+    memset(&pg, 0, sizeof pg);
+    if (P.anySct) {
+        pg.mPalY = S + P.oPalMap[0];
+        pg.mPalUV = S + P.oPalMap[1];
+        pg.mPalIdx = (uint32_t *)(S + P.oPalIdx);
+    }
+    if (P.nPal) {
+        pg.pals = b.palettes + b.frames[0].palBase;   // batch-global palette index 0 = frame 0's first
+        pg.cmap = b.colorMap;
+        uint32_t *dBlockPal = (uint32_t *)(S + P.oBlockPal);
+        pg.blockPal = dBlockPal;
+        pg.palTok = (uint32_t *)(S + P.oPalTok);
+        CK(cudaMemsetAsync(dBlockPal, 0xFF, 4ull * nB, s));
+        k_palblocks<<<grid(P.nPal, TB), TB, 0, s>>>(dF, P.nF, pg.pals, P.nPal, dBlockPal, dSt);
+    }
+    rec(1);
+    bool anyLL = false;   // lossless frames in the batch: the LL instantiations (handle lossy frames too)
+    for (const FrameG &g : P.F) anyLL |= g.qidx == 0;
+    // trusted records: the producer's maps, eob and tx types (and maybe its tx-block symbol counts) instead of deriving them
+    const bool trusted = P.trusted, derive = P.derive, counted = P.counted;
+    if (!derive) {   // (not reserved: build_plan)
+        mMiSize = mYMode = mSkip = mTx = cL = cD = dType = nullptr;
+        dEob = nullptr;
+    }
+    if (!P.oCount) dCount = nullptr;
+    if (derive || P.anySct)   // (screen-content frames: the palette maps too; without derive, only those)
+        k_maps<<<grid(nB, TB), TB, 0, s>>>(blocks, dBFrame, dF, nB, mMiSize, mYMode, mSkip, mTx, pg);
+    if (derive) {
+        if (anyLL) k_txctx<true><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dF, txb, dTxbBlock, b.coeffs, nT, dIscan, cL, cD, dEob, dType);
+        else k_txctx<false><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dF, txb, dTxbBlock, b.coeffs, nT, dIscan, cL, cD, dEob, dType);
+    }
+    rec(2);
+    uint32_t *cnt = counted ? b.itemCount : dCount;   // the item counts that are scanned
+    CK(cudaMemsetAsync(cnt + nItems, 0, 4, s));
+    if (!counted || b.checkTrusted) {
+        if (anyLL) k_txsym<true, false><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dBTile, dF, dT, txb, dTxbBlock, b.coeffs, nT, cL, cD,
+                                                   dEob, dType, dCount, nullptr, nullptr, nullptr, 0, 0);
+        else k_txsym<false, false><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dBTile, dF, dT, txb, dTxbBlock, b.coeffs, nT, cL, cD,
+                                                   dEob, dType, dCount, nullptr, nullptr, nullptr, 0, 0);
+    }
+    const uint8_t *sMiSize = trusted ? b.miSize : mMiSize, *sYMode = trusted ? b.yMode : mYMode, *sSkip = trusted ? b.skip : mSkip,
+                  *sTx = trusted ? b.txSize : mTx, *sLvl = trusted ? b.ctxLvl : cL, *sDc = trusted ? b.ctxDc : cD;
+    if (anyLL) k_sbsym<true><<<grid(nSb, 32), 32, 0, s>>>(dSb, nSb, dF, dT, blocks, dBTxbG, sMiSize, sYMode, sSkip, sTx, cnt, nullptr, nullptr,
+                                          nullptr, 0, dSt, pg);
+    else k_sbsym<false><<<grid(nSb, 32), 32, 0, s>>>(dSb, nSb, dF, dT, blocks, dBTxbG, sMiSize, sYMode, sSkip, sTx, cnt, nullptr, nullptr,
+                                          nullptr, 0, dSt, pg);
+    if (trusted && b.checkTrusted) {
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        MapPtrs dm = {{mMiSize, mYMode, mSkip, mTx}}, tm = {{b.miSize, b.yMode, b.skip, b.txSize}};
+        k_check_trusted<<<dim3(std::max(1, sms) * 2, 2 + P.nF), 256, 0, s>>>(dF, nT, txb, dTxbBlock, dEob, dType, dCount,
+                                                                            counted ? b.itemCount : nullptr, P.miTotal, dm, tm, cL, cD,
+                                                                            b.ctxLvl, b.ctxDc, dSt);
+    }
+    rec(3);
+    size_t cubBytes = P.cubItems;
+    CK(cub::DeviceScan::ExclusiveSum(dCub, cubBytes, cnt, dOff, (int)(nItems + 1), s));
+    rec(4);
+    if (anyLL) k_txsym<true, true><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dBTile, dF, dT, txb, dTxbBlock, b.coeffs, nT, sLvl, sDc,
+                                              dEob, dType, cnt, dOff, dSyms, dOff + nItems, P.symCap, trusted);
+    else k_txsym<false, true><<<grid(nT, TB), TB, 0, s>>>(blocks, dBFrame, dBTile, dF, dT, txb, dTxbBlock, b.coeffs, nT, sLvl, sDc,
+                                              dEob, dType, cnt, dOff, dSyms, dOff + nItems, P.symCap, trusted);
+    if (anyLL) k_sbsym<true><<<grid(nSb, 32), 32, 0, s>>>(dSb, nSb, dF, dT, blocks, dBTxbG, sMiSize, sYMode, sSkip, sTx, cnt, dOff, dSyms,
+                                          dOff + nItems, P.symCap, dSt, pg);
+    else k_sbsym<false><<<grid(nSb, 32), 32, 0, s>>>(dSb, nSb, dF, dT, blocks, dBTxbG, sMiSize, sYMode, sSkip, sTx, cnt, dOff, dSyms,
+                                          dOff + nItems, P.symCap, dSt, pg);
+    if (P.nPal) k_palsym<<<2 * P.nPal, 128, 0, s>>>(dF, P.nF, blocks, pg, dSyms, dOff + nItems, P.symCap);
+    rec(5);
+    k_tilerange<<<grid(nTiles, 64), 64, 0, s>>>(dT, nTiles, dF, dBTxbG, dOff, nItems, nB, P.symCap, dTb, dTe, dTq, dCapArr,
+                                                dSizes, dSt);
+    cubBytes = P.cubTiles;
+    CK(cub::DeviceScan::ExclusiveSum(dCub, cubBytes, dCapArr, dCapOff, (int)(nTiles + 1), s));
+    if (g_entropy_mode == 4)
+        k_entropy_win<Rc32><<<nTiles, kWinThreads, kWinSmem, s>>>(dSyms, dTb, dTe, dTq, dCapOff, dCdfDef, dStaging, dSizes, dSt);
+    else
+        k_entropy_win<Rc64><<<nTiles, kWinThreads, kWinSmem, s>>>(dSyms, dTb, dTe, dTq, dCapOff, dCdfDef, dStaging, dSizes, dSt);
+    rec(6);
+    cubBytes = P.cubTiles;
+    CK(cub::DeviceScan::ExclusiveSum(dCub, cubBytes, dSizes, dTileOff, (int)(nTiles + 1), s));
+    k_pack<<<nTiles, 128, 0, s>>>(dStaging, dCapOff, dSizes, dTileOff, dPacked, nTiles, dSt);
+    rec(7);
+    CK(cudaGetLastError());
+    out = DevResult();
+    out.result = dSt;
+    out.resultBytes = sizeof(DevStatus) + 8ull * (nTiles + 1);
+    out.status = dSt;
+    out.tileOffset = dTileOff;
+    out.bytes = dPacked;
+    out.bytesCapacity = P.capBytes;
+    out.nTiles = nTiles;
+    out.frameTile0 = P.frameTile0;
+    out.syms = dSyms;
+    out.symBegin = dTb;
+    out.symEnd = dTe;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// host convenience wrapper: upload records -> run_batch_device -> download
+// ---------------------------------------------------------------------------
+template <class T>
+static int up(T *&d, const T *h, size_t n, size_t &bytes, std::string &err) {
+    CK(cudaMalloc(&d, std::max<size_t>(1, n) * sizeof(T)));
+    if (n) CK(cudaMemcpy(d, h, n * sizeof(T), cudaMemcpyHostToDevice));
+    bytes += n * sizeof(T);
+    return 0;
+}
+template <class T>
+static int up(T *&d, const std::vector<T> &h, size_t &bytes, std::string &err) {
+    return up(d, h.data(), h.size(), bytes, err);
+}
+
+int run_batch(const std::vector<const av1g_decision_record *> &frames, bool keepSyms, BatchResult &res, std::string &err) {
+    res = BatchResult();
+    const uint32_t nF = (uint32_t)frames.size();
+    std::vector<DevFrame> df(nF);
+    std::vector<av1g_block> blocks;
+    std::vector<uint32_t> blockTxb;
+    std::vector<av1g_txb> txb;
+    std::vector<int16_t> coeffs;
+    std::vector<av1g_palette> pals;
+    std::vector<uint8_t> cmap;
+    // the arrays to upload: one frame (single-file mode) straight from its record, several concatenated
+    const av1g_block *hB = nullptr; const uint32_t *hBT = nullptr; const av1g_txb *hT = nullptr; const int16_t *hC = nullptr;
+    const av1g_palette *hP = nullptr; const uint8_t *hM = nullptr;
+    size_t nBk = 0, nTx = 0, nCo = 0, nPa = 0, nMa = 0;
+    for (uint32_t f = 0; f < nF; f++) {
+        const av1g_decision_record &R = *frames[f];
+        const bool pal = R.fp.version >= 5 && R.n_palettes;
+        DevFrame &d = df[f];
+        d.fp = R.fp;
+        d.blockBase = (uint32_t)nBk;
+        d.nBlocks = R.n_blocks;
+        d.txbBase = (uint32_t)nTx;
+        d.nTxb = R.n_txb;
+        d.coeffBase = nCo;
+        d.palBase = (uint32_t)nPa;
+        d.mapBase = nMa;
+        if (pal) {
+            d.nPal = R.n_palettes;
+            d.nMap = R.n_color_map;
+        }
+        nBk += R.n_blocks;
+        nTx += R.n_txb;
+        nCo += R.n_coeffs;
+        if (pal) { nPa += R.n_palettes; nMa += R.n_color_map; }
+        if (nF == 1) {
+            hB = R.blocks; hBT = R.block_txb; hT = R.txb; hC = R.coeffs;
+            if (pal) { hP = R.palettes; hM = R.color_map; }
+            continue;
+        }
+        blocks.insert(blocks.end(), R.blocks, R.blocks + R.n_blocks);
+        blockTxb.insert(blockTxb.end(), R.block_txb, R.block_txb + R.n_blocks);
+        txb.insert(txb.end(), R.txb, R.txb + R.n_txb);
+        coeffs.insert(coeffs.end(), R.coeffs, R.coeffs + R.n_coeffs);
+        if (pal) {
+            pals.insert(pals.end(), R.palettes, R.palettes + R.n_palettes);
+            cmap.insert(cmap.end(), R.color_map, R.color_map + R.n_color_map);
+        }
+    }
+    if (nF != 1) {
+        hB = blocks.data(); hBT = blockTxb.data(); hT = txb.data(); hC = coeffs.data(); hP = pals.data(); hM = cmap.data();
+    }
+    cudaEvent_t eu0, eu1, ed0, ed1;
+    cudaEventCreate(&eu0); cudaEventCreate(&eu1); cudaEventCreate(&ed0); cudaEventCreate(&ed1);
+    DevEvents ev;
+    for (auto &e : ev.e) cudaEventCreate(&e);
+    size_t bytes = 0;
+    cudaEventRecord(eu0);
+    av1g_block *dB; uint32_t *dBT; av1g_txb *dT; int16_t *dC;
+    av1g_palette *dP;
+    uint8_t *dM;
+    if (up(dB, hB, nBk, bytes, err) || up(dBT, hBT, nBk, bytes, err) || up(dT, hT, nTx, bytes, err) || up(dC, hC, nCo, bytes, err) ||
+        up(dP, hP, nPa, bytes, err) || up(dM, hM, nMa, bytes, err))
+        return -1;
+    cudaEventRecord(eu1);
+    DevBatch b;
+    b.frames = df.data();
+    b.nFrames = nF;
+    b.blocks = dB; b.blockTxb = dBT; b.txb = dT; b.coeffs = dC;
+    b.palettes = dP; b.colorMap = dM;
+    void *scratch = nullptr;
+    DevResult r;
+    DevStatus st;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const size_t need = run_batch_device_scratch_bytes(b);
+        if (!need) { std::string e2; Plan P; build_plan(b, P, e2); err = e2; return -1; }
+        CK(cudaMalloc(&scratch, need));
+        if (run_batch_device(b, 0, scratch, need, r, err, &ev)) return -1;
+        CK(cudaMemcpy(&st, r.status, sizeof st, cudaMemcpyDeviceToHost));
+        bytes += need;
+        if (!(st.error & AV1G_GPU_ERR_SYMBOLS)) break;
+        cudaFree(scratch);
+        scratch = nullptr;
+        bytes -= need;
+        b.symbolCapacity = st.symbols;  // exact count, rerun
+    }
+    if (st.error) { err = "run_batch_device error flags " + std::to_string(st.error); return -1; }
+    cudaEventRecord(ed0);
+    std::vector<uint64_t> toff(r.nTiles + 1);
+    CK(cudaMemcpy(toff.data(), r.tileOffset, 8ull * (r.nTiles + 1), cudaMemcpyDeviceToHost));
+    std::vector<uint8_t> hout(toff[r.nTiles]);
+    if (!hout.empty()) CK(cudaMemcpy(hout.data(), r.bytes, hout.size(), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> hsyms;
+    std::vector<uint64_t> sb(r.nTiles), se(r.nTiles);
+    if (keepSyms) {
+        hsyms.resize(st.symbols);
+        if (st.symbols) CK(cudaMemcpy(hsyms.data(), r.syms, 4ull * st.symbols, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(sb.data(), r.symBegin, 8ull * r.nTiles, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(se.data(), r.symEnd, 8ull * r.nTiles, cudaMemcpyDeviceToHost));
+    }
+    cudaEventRecord(ed1);
+    CK(cudaEventSynchronize(ed1));
+    float m;
+    cudaEventElapsedTime(&m, eu0, eu1); res.msUpload = m;
+    double *dst[7] = {&res.msPrep, &res.msMaps, &res.msCount, &res.msScan, &res.msEmit, &res.msEntropy, &res.msPack};
+    for (int i = 0; i < 7; i++) { cudaEventElapsedTime(&m, ev.e[i], ev.e[i + 1]); *dst[i] = m; }
+    cudaEventElapsedTime(&m, ed0, ed1); res.msDownload = m;
+    res.tileBytes.assign(nF, {});
+    if (keepSyms) res.tileSyms.assign(nF, {});
+    for (uint32_t f = 0; f < nF; f++)
+        for (uint32_t i = r.frameTile0[f]; i < r.frameTile0[f + 1]; i++) {
+            res.tileBytes[f].emplace_back(hout.begin() + toff[i], hout.begin() + toff[i + 1]);
+            if (keepSyms) res.tileSyms[f].emplace_back(hsyms.begin() + sb[i], hsyms.begin() + se[i]);
+        }
+    res.totalSyms = st.symbols;
+    res.nTiles = r.nTiles;
+    {
+        Plan P;
+        build_plan(b, P, err);
+        res.nSb = P.nSb;
+        res.nBlocks = P.nB;
+        res.nTxb = P.nT;
+    }
+    res.deviceBytes = bytes;
+    cudaFree(dB); cudaFree(dBT); cudaFree(dT); cudaFree(dC); cudaFree(dP); cudaFree(dM); cudaFree(scratch);
+    for (auto &e : ev.e) cudaEventDestroy(e);
+    cudaEventDestroy(eu0); cudaEventDestroy(eu1); cudaEventDestroy(ed0); cudaEventDestroy(ed1);
+    return 0;
+}
+
+// Entropy-code given per-tile symbol streams on the GPU only (benchmark utility).
+int code_streams(const std::vector<const std::vector<uint32_t> *> &streams, const std::vector<int> &qidx,
+                 std::vector<std::vector<uint8_t>> &out, double &ms, std::string &err) {
+    const uint32_t n = (uint32_t)streams.size();
+    std::vector<uint32_t> syms;
+    std::vector<uint64_t> b(n), e(n), cap(n + 1, 0);
+    std::vector<std::pair<const void *, uint64_t>> seen;  // identical stream objects share device data
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t at = UINT64_MAX;
+        for (auto &pr : seen) if (pr.first == streams[i]) at = pr.second;
+        if (at == UINT64_MAX) {
+            at = syms.size();
+            seen.push_back({streams[i], at});
+            syms.insert(syms.end(), streams[i]->begin(), streams[i]->end());
+        }
+        b[i] = at;
+        e[i] = at + streams[i]->size();
+        cap[i + 1] = cap[i] + streams[i]->size() / 2 + 256;
+    }
+    size_t bytes = 0;
+    uint32_t *dS; uint64_t *dB, *dE, *dCap, *dSz64; int *dQ, *dSize; av1g_cdfs *dScr = nullptr, *dDef; uint16_t *dPre = nullptr;
+    uint8_t *dOut; DevStatus *dSt;
+    if (up(dS, syms, bytes, err) || up(dB, b, bytes, err) || up(dE, e, bytes, err) || up(dCap, cap, bytes, err) ||
+        up(dQ, qidx, bytes, err)) return -1;
+    const bool win = g_entropy_mode >= 3;
+    if (!win) {
+        CK(cudaMalloc(&dScr, (size_t)n * sizeof(av1g_cdfs)));
+        CK(cudaMalloc(&dPre, cap[n] * 2));
+    }
+    CK(cudaMalloc(&dDef, 4 * sizeof(av1g_cdfs)));
+    CK(cudaMalloc(&dOut, cap[n]));
+    CK(cudaMalloc(&dSize, n * sizeof(int)));
+    CK(cudaMalloc(&dSz64, n * 8));
+    CK(cudaMalloc(&dSt, sizeof(DevStatus)));
+    CK(cudaMemset(dSt, 0, sizeof(DevStatus)));
+    k_cdf_defaults<<<4, 1>>>(dDef);
+    CK(cudaDeviceSynchronize());
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    if (g_entropy_mode == 4) k_entropy_win<Rc32><<<n, kWinThreads, kWinSmem>>>(dS, dB, dE, dQ, dCap, dDef, dOut, dSz64, dSt);
+    else if (win) k_entropy_win<Rc64><<<n, kWinThreads, kWinSmem>>>(dS, dB, dE, dQ, dCap, dDef, dOut, dSz64, dSt);
+    else launch_entropy_m4(g_entropy_smem, dS, dB, dE, dQ, dCap, dScr, dPre, dOut, dSize, n);
+    cudaEventRecord(e1);
+    CK(cudaEventSynchronize(e1));
+    CK(cudaGetLastError());
+    float f;
+    cudaEventElapsedTime(&f, e0, e1);
+    ms = f;
+    std::vector<int> sz(n);
+    if (win) {
+        std::vector<uint64_t> s64(n);
+        DevStatus st;
+        CK(cudaMemcpy(s64.data(), dSz64, n * 8, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&st, dSt, sizeof st, cudaMemcpyDeviceToHost));
+        for (uint32_t i = 0; i < n; i++) sz[i] = (st.error & AV1G_GPU_ERR_OUTPUT) && !s64[i] ? -1 : (int)s64[i];
+    } else {
+        CK(cudaMemcpy(sz.data(), dSize, n * sizeof(int), cudaMemcpyDeviceToHost));
+    }
+    std::vector<uint8_t> hout(cap[n]);
+    CK(cudaMemcpy(hout.data(), dOut, cap[n], cudaMemcpyDeviceToHost));
+    out.assign(n, {});
+    for (uint32_t i = 0; i < n; i++) {
+        if (sz[i] < 0) { err = "entropy output buffer overflow (stream " + std::to_string(i) + ")"; return -1; }
+        out[i].assign(hout.begin() + cap[i], hout.begin() + cap[i] + sz[i]);
+    }
+    cudaFree(dS); cudaFree(dB); cudaFree(dE); cudaFree(dCap); cudaFree(dQ); cudaFree(dScr); cudaFree(dPre); cudaFree(dDef);
+    cudaFree(dOut); cudaFree(dSize); cudaFree(dSz64); cudaFree(dSt);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return 0;
+}
+
+}  // namespace av1g_gpu

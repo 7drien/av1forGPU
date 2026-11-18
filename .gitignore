@@ -1,0 +1,13 @@
+/build/
+/build-*/
+*.o
+*.a
+*.so
+*.ivf
+*.obu
+*.mp4
+*.yuv
+*.json
+*.seconds
+__pycache__/
+!benckmark/inter_sweep/README.md

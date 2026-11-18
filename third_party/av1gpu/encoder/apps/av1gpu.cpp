@@ -1,0 +1,1027 @@
+// av1gpu CLI: GPU AV1/AVIF still-image encoder.
+//
+//   av1gpu IN OUT.avif [options]             single image
+//   av1gpu --batch LIST|DIR --outdir DIR     many images in flight (throughput); see --help
+//
+// --debug-outputs additionally writes OUT.avif.obu (with a temporal delimiter, for dav1d --demuxer
+// section5) and OUT.avif.recon.yuv (the encoder's reconstruction) for decoder identity checks.
+#include "pipeline.h"
+#include "imageio.h"
+#include "ingest_api.h"
+#include "av1g/av1g.h"
+#include "av1f/tuneiq.h"
+
+#include <cuda_runtime.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+#include <vector>
+
+#ifdef _WIN32
+// POSIX setenv on the CRT environment (_putenv_s also updates the process environment, which the CUDA driver reads)
+static int setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
+extern "C" __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int codePage);
+extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int ms);
+extern "C" __declspec(dllimport) void *__stdcall LoadLibraryA(const char *name);
+#endif
+
+// Defaults = the configuration validated in production (avifenc -q 60 equivalent): applied before the
+// command-line options, so any option overrides them; --no-defaults starts from the bare encoder.
+static const char *const kDefaultArgs[] = {"--quality", "60", "--tune", "iq", "--edge-filter", "--preset", "turbo",
+                                           "--small-preset", "base", "--gpu-entropy"};
+
+static void usage(FILE *to = stderr) {
+    fprintf(to,
+            "usage: av1gpu IN OUT.avif [options]\n"
+            "       av1gpu --batch LIST|DIR --outdir DIR [options]\n"
+            "       av1gpu --help\n"
+            "\n"
+            "Input: JPEG (GPU decode), PNG (8 or 16 bits per sample) or WebP (CPU decode).  Output: 8-bit 4:2:0\n"
+            "(or monochrome) AVIF, 4:4:4 with --yuv 444, 10-bit with --depth 10, mathematically lossless with --lossless;\n"
+            "PNG / WebP transparency as an AVIF alpha item (--alpha-quality, --no-alpha).\n"
+            "Defaults: --quality 60 --tune iq --edge-filter --preset turbo --small-preset base --gpu-entropy\n"
+            "\n"
+            "common options:\n"
+            "  --quality Q             0..100, same scale as avifenc -q with tune=iq (default 60 = qindex 120)\n"
+            "  --qindex Q[,Q2,...]     AV1 base_q_idx 1..255 instead of --quality (batch mode: one pass per value)\n"
+            "  --preset P              slow|base|fast|faster|turbo|turbo2|turbo3 (default turbo)\n"
+            "  --small-preset P|none   preset for images below --small-mp megapixels (default base, 1 MP)\n"
+            "  --tiles MIN_MP,C,R      images of at least MIN_MP megapixels get 2^C x 2^R uniform tiles (C, R: 0..6) instead\n"
+            "                          of the preset's tiling (turbo, the default, turbo2 and turbo3: 2,2,2 = 4x4 tiles from\n"
+            "                          2 MP; base, slow and the others: none).  MIN_MP 0: no extra tiles, only\n"
+            "                          those AV1 requires (frames wider than 4096 or larger than 9.4 MP); an image too small\n"
+            "                          for the grid gets those too.  More tiles shorten the wavefront (L4: 4x4 is 12 %%\n"
+            "                          faster than 2x2 = 2,1,1 on photos, +0.6 %% BD-rate) and each costs a little compression.\n"
+            "                          Applies wherever it is given (before or after --preset), also to lossy alpha frames;\n"
+            "                          lossless frames use --ll-tile-area\n"
+            "  --tune iq|none          libaom tune=iq tool set: chroma delta-q, QM, variance boost, deblock, CDEF\n"
+            "  --yuv 420|444           chroma format of colour images (default 420).  444: full-resolution chroma,\n"
+            "                          AV1 High profile; PNG/WebP are converted without chroma downsampling, 4:4:4\n"
+            "                          JPEGs keep their chroma, subsampled JPEGs are upsampled like libjpeg-turbo's\n"
+            "                          decoder does (bigger files, no detail gained for them)\n"
+            "  --depth 8|10            bit depth of the output (default 8).  10: AV1 high_bitdepth (Main profile, High with\n"
+            "                          --yuv 444); 16-bit PNGs are converted to YCbCr at full precision and rounded to 10 bits,\n"
+            "                          8-bit sources (JPEG, PNG, WebP) are rescaled to 10 bits like libavif does for 8-bit\n"
+            "                          input (full range: Y * 1023 / 255, chroma (C - 128) * 1023 / 255 + 512)\n"
+            "  --lossless              lossless AVIF (AV1 lossless: qindex 0, 4x4 Walsh-Hadamard, no post-filters); the\n"
+            "                          quality / preset / tune options do not apply.  PNG / WebP (RGB): identity / GBR 4:4:4\n"
+            "                          (CICP matrix 0, as avifenc -l) at the source depth: 8 bits, or 10 bits for 16-bit\n"
+            "                          PNGs that hold 10 significant bits (samples = v * 65535 / 1023, as avifdec writes\n"
+            "                          10-bit images; 16-bit PNGs with 8 significant bits, v * 257, are coded 8-bit; others\n"
+            "                          are rejected); grayscale PNG: monochrome.  JPEGs are refused (skipped in batch mode):\n"
+            "                          a lossless AVIF of a JPEG is about twice its size, or more.  The alpha channel is\n"
+            "                          lossless too.  --yuv / --depth cannot be combined with it.  Lossless batches need about\n"
+            "                          1 GB of GPU memory per megapixel of GP_ENCODE_MP (below)\n"
+            "  --ycgco-re              with --lossless: RGB as YCgCo-Re (CICP matrix 16, libavif / H.273) instead of GBR:\n"
+            "                          8-bit RGB -> 10-bit 4:4:4 (2 extra bits); usually smaller than GBR for photos\n"
+            "  --palette auto|on|off   palette mode for flat colours (screen content, graphics): auto (default) tries it in\n"
+            "                          the images that pass a screen-content detection (libaom's: few colours per 16x16\n"
+            "                          block, with sharp edges; photos do not and are encoded exactly as with off), on in\n"
+            "                          every image, off never.  Lossy: luma palettes; --lossless: luma and chroma\n"
+            "  --ll-tile-area N        with --lossless: uniform tiles of at most N pixels (default 262144; more tiles code\n"
+            "                          faster on the GPU, each costs ~0.1-0.4 %%; 0: the --tiles / preset tiling)\n"
+            "  --alpha-quality Q       0..100: quality of the alpha channel; alpha quality defaults to --quality, as in avifenc\n"
+            "                          1.2+; 100 = lossless.  PNG / WebP inputs with transparency (any alpha below the maximum)\n"
+            "                          get an AVIF alpha item (straight alpha, as libavif writes it): a monochrome AV1 image at\n"
+            "                          the colour's bit depth, coded like avifenc --qalpha Q codes alpha (libavif's alpha\n"
+            "                          tuning: quantizer (100 - Q) * 63 / 100, no tune=iq tools, the --preset preset also for\n"
+            "                          small images; 100: the lossless path).  Default --quality 60: alpha qindex 100.\n"
+            "                          The colour under transparent pixels is kept as stored.  A fully opaque alpha channel\n"
+            "                          gets no alpha item (as avifenc).  With --qindex instead of --quality the alpha frames\n"
+            "                          use the colour's qindex.  16-bit PNG alpha is rounded to the output depth (8, or 10\n"
+            "                          with --depth 10) like avifenc does; with --lossless it must hold 8 / 10 significant\n"
+            "                          bits like the colour samples.\n"
+            "  --no-alpha              do not code the alpha channel (as before alpha support): PNG colour is composited onto\n"
+            "                          black, WebP and --lossless keep the stored RGB; a note says so\n"
+            "  --crop WxH+X+Y          crop the decoded image on the GPU (also X,Y,W,H): source pixels, before the EXIF\n"
+            "                          rotation; clipped to the image like ImageMagick's -crop; a crop outside it is an error\n"
+            "                          (batch mode: the image is skipped).  With --lossless the crop is exact\n"
+            "  --max-size WxH          shrink to fit inside WxH (Wx or xH: one side only), aspect kept, never enlarged, on the\n"
+            "                          GPU after the crop: ImageMagick's -resize 'WxH>' size and filter (Lanczos, 3 lobes)\n"
+            "                          on the YCbCr planes; transparent images with alpha-weighted colour, as ImageMagick.\n"
+            "                          The box is the displayed size (turned for EXIF rotations by 90 degrees).  With\n"
+            "                          --lossless the shrunk image is coded losslessly\n"
+            "  --max-height H          same as --max-size xH\n"
+            "  --resize GEOMETRY       resize after the crop / trim, with ImageMagick's -resize geometry: W, xH, WxH (fit\n"
+            "                          inside), W^, xH^, WxH^ (fill), W!, xH!, WxH! (exactly; a side not given stays), with\n"
+            "                          > (only shrink) or < (only enlarge); N%%, xN%%, N%%xM%%; @AREA or AREA@ (pixels).\n"
+            "                          Filters as ImageMagick chooses them: Lanczos to shrink (as --max-size), Mitchell\n"
+            "                          (B = C = 1/3) to enlarge and for images with alpha; ImageMagick also takes Mitchell\n"
+            "                          for palette and gray images, av1gpu does not.  The geometry is for the displayed image\n"
+            "                          (EXIF rotations by 90 degrees turn it).  The last of --resize / --max-size counts.\n"
+            "                          A batch LIST line may add resize=GEOMETRY\n"
+            "  --max-mp MP             largest picture encoded, after crop / trim / resize (default 35.6 = AV1 level 6.3, the\n"
+            "                          most AVIF's Advanced profile allows; single PNG / WebP images: no limit); larger ones\n"
+            "                          are refused, and the message gives the value to use.  Above 35.6 the stream says level\n"
+            "                          31 (no limits): dav1d and libavif decode it, decoders that enforce levels may not\n"
+            "                          (libavif's default limits: 32768 pixels per side, 268 MP).  Whatever the limit, AV1\n"
+            "                          codes at most 65536 pixels per side\n"
+            "  --max-input-mp MP       largest source decoded (default and at least: the --max-mp limit); with --crop,\n"
+            "                          --trim, --max-size or --resize, a larger source is decoded at full size and encoded\n"
+            "                          once it fits --max-mp\n"
+            "  --trim                  remove the border, on the GPU after --crop and before --max-size: the box of\n"
+            "                          ImageMagick's -trim (the bounding box of the pixels that differ from the corners by\n"
+            "                          more than --fuzz: left and top edges against the top-left corner, right against the\n"
+            "                          top-right, bottom against the bottom-left and, left of the right edge, the\n"
+            "                          bottom-right), measured on the decoded planes as whole RGB samples.  An image that is\n"
+            "                          all border is encoded whole (ImageMagick makes it 1x1; see --skip-blank).  The options\n"
+            "                          below only apply with --trim\n"
+            "  --fuzz D%%               how far a colour may be from the corner and still count as the border, as ImageMagick's\n"
+            "                          -fuzz: the summed squared RGB differences (0..1 each) are at most 6 (D / 100)^2, so a\n"
+            "                          gray within 1.41 D percent passes (--fuzz 10%%: 36 steps of 255).  Also D in Q16 units,\n"
+            "                          0..65535; default 0: exactly the corner colour.  With alpha the colour distance is\n"
+            "                          weighted by both alphas and alphas must be equal\n"
+            "  --trim-margin N|N%%      keep N pixels (N%%: percent of the shorter side) of the border around what --trim keeps\n"
+            "  --trim-limits MIN%%,MAX%% trim only when that removes MIN..MAX percent of the width and MIN..MAX percent of the\n"
+            "                          height (each rounded down to whole pixels); otherwise the image is encoded whole\n"
+            "  --trim-lightness L      trim only when the border is light: 3 of the 4 corners at HSL lightness L%% or more\n"
+            "                          (paper, not a dark frame or a picture running off the edge)\n"
+            "  --skip-blank P          an image whose trim would remove more than P percent of its width or height is not\n"
+            "                          encoded: skipped with a message (exit status 3 for a single image).  A page split\n"
+            "                          into two flat colours (its edges meet: no box) is kept\n"
+            "  --auto-level            stretch the smallest..largest R, G or B sample of the (cropped, trimmed) image to the\n"
+            "                          full range (ImageMagick's -auto-level: channels together).  At 4:2:0 from PNG / WebP\n"
+            "                          the range is read through the shared chroma, and one colour edge can set it, which\n"
+            "                          shifts the whole picture: use --yuv 444 with it there\n"
+            "  --level B[,W[,G]]       ImageMagick's -level on each RGB channel: ((v - B) / (W - B)) ^ (1 / G), clipped.  B and\n"
+            "                          W are Q16 units (0..65535), or percentages if either has a %%; W defaults to 100%% - B\n"
+            "  --gamma G               ImageMagick's -gamma: v ^ (1 / G) on each RGB channel; 0 < G <= 100\n"
+            "  --negate                ImageMagick's -negate: 1 - v\n"
+            "                          (these four run on the GPU after --trim and before the resize, in this order, on the\n"
+            "                          gamma-encoded RGB of each pixel, with 4:2:0 JPEG chroma upsampled as their decoders do\n"
+            "                          and 4:2:0 chroma written as the mean of its 2x2 pixels'; at 4:2:0 from PNG / WebP, or\n"
+            "                          from a JPEG not coded 4:2:0, colour edges can differ from ImageMagick's, which works on\n"
+            "                          full RGB: --yuv 444 matches it closely.  Alpha is left alone, as ImageMagick's\n"
+            "                          -channel RGB)\n"
+            "  --grayscale METHOD      monochrome output, on the GPU after the resize: ImageMagick's -grayscale on the\n"
+            "                          gamma-encoded RGB: Rec601Luma (on JPEG / PNG / WebP planes: their own luma, no\n"
+            "                          work), Rec709Luma, Average, Brightness (max), Lightness ((max + min) / 2) or RMS\n"
+            "  --colorspace Gray       same as --grayscale Rec709Luma (ImageMagick 7's -colorspace Gray; any case)\n"
+            "  --cpu-entropy           entropy-code on the CPU instead of the GPU (identical bytes)\n"
+            "  --batch LIST|DIR        encode every file in LIST (one path per line) or DIR; outputs <name>.avif.  A LIST line\n"
+            "                          may add TAB-separated crop=WxH+X+Y, max-size=WxH and resize=GEOMETRY for its image\n"
+            "                          (they replace --crop / --max-size / --resize for it; a line that names an existing\n"
+            "                          file is a path; a line with a bad option is skipped)\n"
+            "  --outdir DIR            batch output directory (outputs are named <input file name>.avif)\n"
+            "  --name-q                batch: add .q<Q> to the output names even for one --qindex (several always do)\n"
+            "  --stats                 print one JSON line with timings / counts\n"
+            "  --video-obu             write one all-intra video OBU stream (experimental; no container)\n"
+            "  --debug-outputs         also write <out>.obu and <out>.recon.yuv (decoder identity tests)\n"
+            "  --no-defaults           do not apply the defaults above (expert / research use)\n"
+            "  --verbose               notes on stderr (pruning the partition options switch off)\n"
+            "  -h, --help              print this list\n"
+            "\n"
+            "expert options:\n"
+            "  --q Q                   alias of --qindex\n"
+            "  --small-mp X            --small-preset threshold in megapixels (default 1)\n"
+            "  --lambda M --lambda-c M lambda multiplier (default 1.0); chroma lambda relative to luma\n"
+            "  --K k --Krecheck k      analysis top-K, closed-loop re-check count\n"
+            "  --no-txsearch --no-txsearch-cl --no-deltas --no-cfl --uvK k\n"
+            "  --shapes HEX --part8 HEX --partN HEX --maxpart N\n"
+            "                          Where they leave the flat / variance pruning no block to fall back on (e.g.\n"
+            "                          --maxpart 8 with turbo), every block is analysed instead (--verbose says so);\n"
+            "                          options without a partition at some frame size are refused.\n"
+            "  --rnd R --zbin Z --rndc R --zbinc Z --satd-lambda S --uv-overhead B --split-bias S\n"
+            "  --qm L|auto --qm-uv L --edge-filter --no-edge-filter --lf q|LEVEL --lf-mul M\n"
+            "  --cdef ypri,ysec,uvpri,uvsec,damp-3\n"
+            "  --vb 0|1 --vb-order tile|row|nearest --vb-strength PCT --f-lf off|q|search --f-cdef off|aom|search\n"
+            "  --f-dist 0|1            av1f distortion: 0 SSE, 1 variance-weighted\n"
+            "  --tuneiq-frame 0|1      frame-level tune=iq decisions alone\n"
+            "  --ssim-lambda 0|1       tune=iq per-16x16 SSIM scaling of lambda\n"
+            "  --qm-dist 0|1           weight coefficient errors by the QM (libaom dist-metric=qm-psnr)\n"
+            "  --qm-rnd 0|1            scale the rounding offset by the QM (libaom's FP quantizer with QM)\n"
+            "  --small-kernel 0|1      thread-per-block analysis for shapes of up to 64 pixels\n"
+            "  --prune-var V --prune-area A   skip blocks of at least A pixels with variance above V step^2\n"
+            "  --prune-flat V          skip shapes below 16x16 in 16x16 regions whose 8x8 variances are all below V step^2\n"
+            "  --screen-sub 2          checkerboard-subsampled SATD screening for blocks of 256 pixels or more\n"
+            "  --filter-intra          filter-intra candidates in the closed loop\n"
+            "  --tx-all                closed loop evaluates every transform type of every re-checked candidate\n"
+            "  --tx-size               closed-loop transform size search (largest against one split)\n"
+            "  --uv-deltas 0|1         chroma angle deltas in the closed loop\n"
+            "  --uv-in-dp              add an open-loop chroma term to the analysis (chroma-aware partitioning)\n"
+            "  --uv-shortlist N        chroma modes: the closed loop runs its exact RD on the N best modes of an open-loop SATD\n"
+            "                          screen (source edges, every block at once before the wavefront) plus CfL instead of\n"
+            "                          screening the modes itself.  It replaces --uvK (--uvK alone switches it off);\n"
+            "                          chroma transforms above 8x8 without a CfL candidate take at most 2.  In turbo2 and\n"
+            "                          turbo3 (--uvK 1) only N 1 saves time.  0: off, 1..6 (base and turbo: 3; other presets: 0)\n"
+            "  --tx-shortlist N        luma: the closed loop's tx-type search tries only the N best types of an open-loop\n"
+            "                          ranking (source edges, transform-domain L1, before the wavefront).  No effect in turbo2\n"
+            "                          and turbo3 (no closed-loop tx search), slow (--tx-all), on --tx-size's split blocks or\n"
+            "                          with N >= 7; in base, fast and faster only where the closed loop keeps the analysis'\n"
+            "                          first candidate.  0: off, 1..16 (base and turbo: 4; other presets: 0)\n"
+            "  --k-large K             analysis top-K for shapes of 1024 pixels or more\n"
+            "  --deltas-max-area A     angle-delta screening only for shapes up to A pixels (0: all)\n"
+            "  (the next two and the two shortlists above trade a little compression for speed: they change decisions and\n"
+            "  output.  On in the presets base and turbo, so with the defaults (--topdown 1 --prune-41 10 --uv-shortlist 3\n"
+            "  --tx-shortlist 4), off in the other presets; given on the command line they apply to every preset, the\n"
+            "  small-image one included, wherever they stand among the options.  --topdown 0 --prune-41 off --uv-shortlist 0\n"
+            "  --tx-shortlist 0 gives the decisions of v0.12.  Lossless frames ignore all four; with --small-kernel 0 the\n"
+            "  shapes of up to 64 pixels are analysed in full)\n"
+            "  --topdown 0|1           top-down analysis: the shapes with a side of 8 only in the 16x16 cells where a partition\n"
+            "                          DP over the larger shapes picks a block with a side of 16 (or next to such a cell), then\n"
+            "                          the shapes with a side of 4 likewise in 8x8 cells (0: off; base and turbo: 1)\n"
+            "  --prune-41 off|PCT      analyse a node's 4:1 shapes (16x4 .. 64x16) only where its 2:1 partition costs at most\n"
+            "                          PCT %% more than the best of its other partitions; PCT 0..1000 or off (base and turbo:\n"
+            "                          10).  Only presets with 4:1 shapes have any to prune (slow, base: with the defaults,\n"
+            "                          the images below --small-mp); in fast .. turbo3 it changes nothing\n"
+            "  --no-lossless-cfl       with --lossless: no CfL on 4x4 chroma blocks\n"
+            "  --prof                  per-phase cycle accounting in k_recon\n"
+            "  --check                 compare the reconstruction with av1core's CPU decode of the record\n"
+            "  --dump-source F         (single image) write the encoder's input planes (visible Y, U, V, then alpha) to F\n"
+            "  --gpu-entropy           GPU symbolization + entropy coding (default)\n"
+            "  --dev-entropy           (single image) the batch mode's device-resident entropy path\n"
+            "  --check-entropy         (single image) compare that path's bytes with the CPU writer's\n"
+            "\n"
+            "environment (batch mode): GP_ENCODERS (concurrent encoders, default 3), GP_ENCODE_MP (MP per GPU batch,\n"
+            "  default 48), GP_INGEST_WORKERS (JPEG parse/decode threads) and GP_FALLBACK_WORKERS (PNG/WebP decode threads;\n"
+            "  both default to one per CPU the process may use), GP_INGEST_DECODER=1 (no nvJPEG)\n");
+}
+
+struct Opts {
+    std::vector<int> qlist;   // --qindex a,b,c (batch mode: one pass per q, outputs <name>.q<Q>.avif)
+    bool nameQ = false;       // --name-q: add .q<Q> to batch output names even for a single q
+    std::string in, out, batch, outdir, dumpSource;
+    bool check = false, gpuEntropy = false, stats = false, devEntropy = false, checkEntropy = false, debugOutputs = false;
+    bool videoObu = false;
+    bool yuvSet = false, depthSet = false;   // explicit --yuv / --depth (not combinable with --lossless)
+    int colourQuality = -1;   // the last --quality value (-1: --qindex set the colour quantizer)
+    int alphaQuality = -1;    // --alpha-quality (-1: follow --quality)
+    bool tilesSet = false;    // --tiles (the last one): applied after all options, so a --preset after it keeps it
+    float tileMinMp = 0;
+    int tileColsLog2 = 0, tileRowsLog2 = 0;
+    bool trimOpts = false;    // --fuzz / --trim-margin / --trim-limits / --trim-lightness / --skip-blank (need --trim)
+    // --topdown / --prune-41 given (applied after all options to every preset, the small-image one included)
+    bool topdownSet = false, prune41Set = false;
+    GpAnOpts an;
+    // --uv-shortlist / --tx-shortlist given (likewise: every preset, wherever they stand); --uvK given
+    bool uvShortSet = false, txShortSet = false, uvKSet = false;
+    int uvShortlist = 0, txShortlist = 0;
+};
+
+// --topdown: 0 or 1 exactly
+static bool parse_topdown(const char *v, int &out) {
+    if (!strcmp(v, "0") || !strcmp(v, "1")) { out = v[0] - '0'; return true; }
+    return false;
+}
+// --prune-41: "off" or a percentage 0..1000 (the whole value a finite number, no sign)
+static bool parse_prune41(const char *v, float &out) {
+    if (!strcmp(v, "off")) { out = -1.f; return true; }
+    if (!*v || *v == '-' || *v == '+') return false;
+    char *end = nullptr;
+    const double d = strtod(v, &end);
+    if (end == v || *end || !std::isfinite(d) || d < 0 || d > 1000) return false;
+    out = (float)d;
+    return true;
+}
+
+// alpha quality -> qindex as libavif codes alpha with libaom (tune=psnr: quantizer ((100 - Q) * 63 + 50) / 100, libaom's
+// quantizer_to_qindex); 100 -> 0 = lossless (av1gpu's lossless path: --quality 100 gives qindex 1, not lossless)
+static int alpha_qindex_for_quality(int q) {
+    if (q >= 100) return 0;
+    const int qp = ((100 - q) * 63 + 50) / 100;
+    return qp == 63 ? 255 : qp == 62 ? 249 : 4 * qp;
+}
+
+#include "presets.h"
+
+static bool parse(int argc, char **argv, GpConfig &cfg, Opts &o) {
+    std::string smallPreset;
+    std::vector<std::string> pos, args;
+    bool defaults = true;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--no-defaults")) defaults = false;
+    if (defaults) args.assign(std::begin(kDefaultArgs), std::end(kDefaultArgs));
+    for (int i = 1; i < argc; i++) args.push_back(argv[i]);
+    const int nargs = (int)args.size();
+    for (int i = 0; i < nargs; i++) {
+        const std::string a = args[i];
+        auto nxt = [&]() -> const char * {
+            if (i + 1 >= nargs) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(2); }
+            return args[++i].c_str();
+        };
+        if (a == "--no-defaults") continue;
+        if (a == "--quality") {
+            const int qv = atoi(nxt());
+            if (qv < 0 || qv > 100) { fprintf(stderr, "--quality must be 0..100\n"); return false; }
+            o.qlist.assign(1, std::max(1, av1f_qindex_for_quality(qv)));
+            cfg.qindex = o.qlist[0];
+            o.colourQuality = qv;
+        }
+        else if (a == "--alpha-quality") {
+            const char *v = nxt();
+            char *end = nullptr;
+            const long qv = strtol(v, &end, 10);
+            if (!*v || *end || qv < 0 || qv > 100) { fprintf(stderr, "--alpha-quality must be 0..100\n"); return false; }
+            o.alphaQuality = (int)qv;
+        }
+        else if (a == "--no-alpha") cfg.alpha = 0;
+        else if (a == "--qindex" || a == "--q") {
+            o.colourQuality = -1;
+            o.qlist.clear();
+            for (const char *s = nxt(); *s;) {
+                o.qlist.push_back(atoi(s));
+                while (*s && *s != ',') s++;
+                if (*s == ',') s++;
+            }
+            cfg.qindex = o.qlist.empty() ? 0 : o.qlist[0];
+        }
+        else if (a == "--name-q") o.nameQ = true;
+        else if (a == "--lambda") cfg.P.lambdaMul = (float)atof(nxt());
+        else if (a == "--lambda-c") cfg.P.lambdaCMul = (float)atof(nxt());
+        else if (a == "--K") cfg.P.K = atoi(nxt());
+        else if (a == "--Krecheck") cfg.P.Krecheck = atoi(nxt());
+        else if (a == "--no-txsearch") cfg.P.txSearch = 0;
+        else if (a == "--no-txsearch-cl") cfg.P.txSearchCL = 0;
+        else if (a == "--no-deltas") cfg.P.deltas = 0;
+        else if (a == "--no-cfl") cfg.P.cfl = 0;
+        else if (a == "--uvK") { cfg.P.uvK = atoi(nxt()); o.uvKSet = true; }
+        else if (a == "--uv-shortlist" || a == "--tx-shortlist") {
+            const char *v = nxt();
+            char *end = nullptr;
+            const long n = strtol(v, &end, 10);
+            const int hi = a == "--uv-shortlist" ? GP_UV_SHORT_MAX : 16;
+            if (!*v || *end || n < 0 || n > hi) { fprintf(stderr, "%s must be a whole number 0..%d, not %s\n", a.c_str(), hi, v); return false; }
+            if (a == "--uv-shortlist") o.uvShortlist = (int)n, o.uvShortSet = true;
+            else o.txShortlist = (int)n, o.txShortSet = true;
+        }
+        else if (a == "--shapes") cfg.P.shapeMask = (int)strtol(nxt(), nullptr, 16);
+        else if (a == "--part8") cfg.P.partMask8 = (int)strtol(nxt(), nullptr, 16);
+        else if (a == "--partN") cfg.P.partMaskN = (int)strtol(nxt(), nullptr, 16);
+        else if (a == "--maxpart") cfg.P.maxPart = atoi(nxt());
+        else if (a == "--rnd") cfg.P.rnd = (float)atof(nxt());
+        else if (a == "--zbin") cfg.P.zbin = (float)atof(nxt());
+        else if (a == "--rndc") cfg.P.rndC = (float)atof(nxt());
+        else if (a == "--zbinc") cfg.P.zbinC = (float)atof(nxt());
+        else if (a == "--satd-lambda") cfg.P.satdLambda = (float)atof(nxt());
+        else if (a == "--uv-overhead") cfg.P.uvOverheadBits = (float)atof(nxt());
+        else if (a == "--split-bias") cfg.P.splitBias = (float)atof(nxt());
+        else if (a == "--qm") { const char *v = nxt(); cfg.qm = !strcmp(v, "auto") ? -2 : atoi(v); }
+        else if (a == "--qm-uv") cfg.qmUV = atoi(nxt());
+        else if (a == "--edge-filter") cfg.edgeFilter = 1;
+        else if (a == "--no-edge-filter") cfg.edgeFilter = 0;
+        else if (a == "--lf") { const char *v = nxt(); if (!strcmp(v, "q")) cfg.lfMode = 1; else { cfg.lfMode = 2; cfg.lfLevel = atoi(v); } }
+        else if (a == "--lf-mul") { cfg.lfMode = 1; cfg.lfMul = (float)atof(nxt()); }
+        else if (a == "--cdef") {  // ypri,ysec,uvpri,uvsec,damping-3
+            cfg.cdef = 1;
+            sscanf(nxt(), "%d,%d,%d,%d,%d", &cfg.cdefYPri, &cfg.cdefYSec, &cfg.cdefUVPri, &cfg.cdefUVSec, &cfg.cdefDampingMinus3);
+        }
+        else if (a == "--preset") {
+            // speed presets (applied in order with the other options; later options override)
+            const char *v = nxt();
+            if (!apply_preset(cfg, v)) { fprintf(stderr, "unknown preset %s (slow, base, fast, faster, turbo, turbo2, turbo3)\n", v); return false; }
+        }
+        else if (a == "--small-preset") {
+            smallPreset = nxt();
+            if (smallPreset == "none") smallPreset.clear();
+            else if (cfg.smallMp <= 0) cfg.smallMp = 1.0;
+        }
+        else if (a == "--small-mp") cfg.smallMp = atof(nxt());
+        else if (a == "--tune") {
+            const char *v = nxt();
+            // libaom SSIM rdmult scaling: --ssim-lambda 1 (measured +1.5 % worse here).  QM-scaled rounding +
+            // QM-weighted RD distortion (libaom's weighted-FP rounding form; dev turbo −1.6 %): on, --qm-rnd 0 --qm-dist 0 = off
+            if (!strcmp(v, "iq")) { cfg.tuneIq = 1; cfg.vb = 1; cfg.fLf = 1; cfg.fCdef = 1; cfg.qm = -2; cfg.P.qmRnd = 1; cfg.P.qmDist = 1; }
+            else if (!strcmp(v, "none")) {
+                const GpConfig d;
+                cfg.tuneIq = d.tuneIq; cfg.vb = d.vb; cfg.fLf = d.fLf; cfg.fCdef = d.fCdef; cfg.qm = d.qm;
+                cfg.P.qmRnd = d.P.qmRnd; cfg.P.qmDist = d.P.qmDist;
+            }
+            else { fprintf(stderr, "unknown --tune %s (iq, none)\n", v); return false; }
+        }
+        else if (a == "--yuv") {
+            const char *v = nxt();
+            if (!strcmp(v, "444")) cfg.yuv444 = 1;
+            else if (!strcmp(v, "420")) cfg.yuv444 = 0;
+            else { fprintf(stderr, "unknown --yuv %s (420, 444)\n", v); return false; }
+            o.yuvSet = true;
+        }
+        else if (a == "--depth") {
+            const char *v = nxt();
+            if (!strcmp(v, "10")) cfg.depth = 10;
+            else if (!strcmp(v, "8")) cfg.depth = 8;
+            else { fprintf(stderr, "unknown --depth %s (8, 10)\n", v); return false; }
+            o.depthSet = true;
+        }
+        else if (a == "--dump-source") o.dumpSource = nxt();
+        else if (a == "--lossless") cfg.lossless = 1;
+        else if (a == "--palette") {
+            const char *v = nxt();
+            if (!strcmp(v, "auto")) cfg.palette = 1;
+            else if (!strcmp(v, "off")) cfg.palette = 0;
+            else if (!strcmp(v, "on")) cfg.palette = 2;
+            else { fprintf(stderr, "unknown --palette %s (auto, on, off)\n", v); return false; }
+        }
+        else if (a == "--crop" || a == "--max-size" || a == "--max-height" || a == "--resize") {
+            const std::string v = a == "--max-height" ? std::string("x") + nxt() : nxt();
+            std::string why;
+            if (!(a == "--crop" ? gp_parse_crop(v.c_str(), cfg.xform, &why)
+                  : a == "--resize" ? gp_parse_resize(v.c_str(), cfg.xform, &why)
+                                    : gp_parse_max_size(v.c_str(), cfg.xform, &why))) {
+                fprintf(stderr, "bad %s %s: %s\n", a.c_str(), a == "--max-height" ? v.c_str() + 1 : v.c_str(),
+                        a == "--max-height" ? "expected a height in whole pixels, at least 1" : why.c_str());
+                return false;
+            }
+        }
+        else if (a == "--trim") cfg.trim.on = true;
+        else if (a == "--auto-level") cfg.tone.autoLevel = true;
+        else if (a == "--negate") cfg.tone.negate = true;
+        else if (a == "--level") {
+            const char *v = nxt();
+            std::string why;
+            if (!gp_parse_level(v, cfg.tone, &why)) { fprintf(stderr, "bad --level %s: %s\n", v, why.c_str()); return false; }
+        }
+        else if (a == "--gamma") {
+            const char *v = nxt();
+            char *end = nullptr;
+            const double g = strtod(v, &end);
+            if (end == v || *end || !(g > 0 && g <= 100)) { fprintf(stderr, "bad --gamma %s: expected a number above 0, up to 100 (ImageMagick's -gamma)\n", v); return false; }
+            cfg.tone.gamma = g;
+        }
+        else if (a == "--grayscale" || a == "--colorspace") {
+            const char *v = nxt();
+            std::string lower(v);
+            for (char &c : lower) c = (char)tolower((unsigned char)c);
+            cfg.gray = a == "--colorspace" ? (lower == "gray" ? (int)GP_GRAY_REC709 : 0) : gp_parse_gray(v);
+            if (!cfg.gray) {
+                fprintf(stderr, "bad %s %s: %s\n", a.c_str(), v,
+                        a == "--colorspace" ? "only Gray (Rec709Luma, as ImageMagick's -colorspace Gray)"
+                                            : "Rec601Luma, Rec709Luma, Average, Brightness, Lightness or RMS");
+                return false;
+            }
+        }
+        else if (a == "--fuzz" || a == "--trim-margin" || a == "--trim-limits" || a == "--trim-lightness" || a == "--skip-blank") {
+            const char *v = nxt();
+            std::string why;
+            const bool ok = a == "--fuzz"          ? gp_parse_fuzz(v, cfg.trim, &why)
+                            : a == "--trim-margin" ? gp_parse_trim_margin(v, cfg.trim, &why)
+                            : a == "--trim-limits" ? gp_parse_trim_limits(v, cfg.trim, &why)
+                                                   : gp_parse_percent(v, a == "--skip-blank" ? &cfg.trim.blankPct : &cfg.trim.lightness, &why);
+            if (!ok) { fprintf(stderr, "bad %s %s: %s\n", a.c_str(), v, why.c_str()); return false; }
+            o.trimOpts = true;
+        }
+        else if (a == "--max-mp" || a == "--max-input-mp") {
+            const char *v = nxt();
+            char *end = nullptr;
+            const double mp = strtod(v, &end);
+            if (end == v || *end || !(mp > 0 && mp <= 1000)) { fprintf(stderr, "bad %s %s: megapixels, 0 < MP <= 1000\n", a.c_str(), v); return false; }
+            (a == "--max-mp" ? cfg.maxMp : cfg.maxInputMp) = mp;
+        }
+        else if (a == "--ycgco-re") cfg.ycgcoRe = 1;
+        else if (a == "--no-lossless-cfl") cfg.losslessCfl = 0;
+        else if (a == "--ll-tile-area") cfg.llTileArea = atoi(nxt());
+        else if (a == "--tuneiq-frame") cfg.tuneIq = atoi(nxt());
+        else if (a == "--vb") cfg.vb = atoi(nxt());
+        else if (a == "--ssim-lambda") cfg.ssimLambda = atoi(nxt());
+        else if (a == "--qm-dist") cfg.P.qmDist = atoi(nxt());
+        else if (a == "--qm-rnd") cfg.P.qmRnd = atoi(nxt());
+        else if (a == "--small-kernel") cfg.P.smallKernel = atoi(nxt());
+        else if (a == "--prune-var") cfg.P.pruneVar = (float)atof(nxt());
+        else if (a == "--prune-area") cfg.P.pruneMinArea = atoi(nxt());
+        else if (a == "--screen-sub") cfg.P.screenSub = atoi(nxt());
+        else if (a == "--filter-intra") cfg.P.filterIntra = 1;
+        else if (a == "--tx-all") cfg.P.txAllCL = 1;
+        else if (a == "--tx-size") cfg.P.txSizeSearch = 1;
+        else if (a == "--uv-deltas") cfg.P.uvDeltas = atoi(nxt());
+        else if (a == "--prune-flat") cfg.P.pruneFlat = (float)atof(nxt());
+        else if (a == "--k-large") cfg.P.kLarge = atoi(nxt());
+        else if (a == "--tiles") {
+            const char *v = nxt();
+            float mp = 0;
+            int c = 0, r = 0;
+            char tail = 0;
+            if (sscanf(v, "%f,%d,%d%c", &mp, &c, &r, &tail) != 3 || !(mp >= 0) || c < 0 || c > 6 || r < 0 || r > 6) {
+                fprintf(stderr, "--tiles needs MIN_MP,COLS_LOG2,ROWS_LOG2 (MIN_MP >= 0, log2 values 0..6), e.g. 2,2,2\n");
+                return false;
+            }
+            o.tilesSet = true; o.tileMinMp = mp; o.tileColsLog2 = c; o.tileRowsLog2 = r;
+        }
+        else if (a == "--deltas-max-area") cfg.P.deltasMaxArea = atoi(nxt());
+        else if (a == "--topdown") {
+            const char *v = nxt();
+            if (!parse_topdown(v, o.an.topdown)) { fprintf(stderr, "bad --topdown %s: 0 (off) or 1\n", v); return false; }
+            o.topdownSet = true;
+        }
+        else if (a == "--prune-41") {
+            const char *v = nxt();
+            if (!parse_prune41(v, o.an.prune41)) { fprintf(stderr, "bad --prune-41 %s: off, or a percentage 0..1000\n", v); return false; }
+            o.prune41Set = true;
+        }
+        else if (a == "--prof") cfg.P.profile = 1;
+        else if (a == "--uv-in-dp") { cfg.P.uvInDp = 1; cfg.P.uvOverheadBits = 0.f; }
+        else if (a == "--vb-order") { const char *v = nxt(); cfg.vbOrder = !strcmp(v, "row") ? 1 : !strcmp(v, "nearest") ? 2 : 0; }
+        else if (a == "--vb-strength") cfg.vbStrength = atoi(nxt());
+        else if (a == "--f-lf") { const char *v = nxt(); cfg.fLf = !strcmp(v, "off") ? 0 : !strcmp(v, "q") ? 1 : !strcmp(v, "search") ? 2 : -1; }
+        else if (a == "--f-cdef") { const char *v = nxt(); cfg.fCdef = !strcmp(v, "aom") ? 1 : !strcmp(v, "search") ? 2 : 0; if (cfg.fLf < 0) cfg.fLf = 0; }
+        else if (a == "--f-dist") cfg.fDist = atoi(nxt());
+        else if (a == "--check") o.check = true;
+        else if (a == "--gpu-entropy") o.gpuEntropy = true;
+        else if (a == "--cpu-entropy") o.gpuEntropy = false;
+        else if (a == "--debug-outputs") o.debugOutputs = true;
+        else if (a == "--dev-entropy") o.devEntropy = true;
+        else if (a == "--check-entropy") o.checkEntropy = true;
+        else if (a == "--stats") o.stats = true;
+        else if (a == "--video-obu") o.videoObu = true;
+        else if (a == "--verbose") cfg.verbose = true;
+        else if (a == "--batch") o.batch = nxt();
+        else if (a == "--outdir") o.outdir = nxt();
+        else if (a == "-h" || a == "--help") { usage(stdout); exit(0); }
+        else if (a.size() > 1 && a[0] == '-' && a[1] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return false; }
+        else pos.push_back(a);
+    }
+    // --tiles replaces the preset's tiling wherever it appears (apply_preset resets the tiling, so --preset after
+    // --tiles would otherwise undo it).  The small preset only contributes its speed knobs (cfg.Psmall), so these
+    // tiles apply to images below --small-mp too, and to lossy alpha frames (gp_alpha_config keeps them); lossless
+    // frames use --ll-tile-area unless it is 0
+    if (o.tilesSet) { cfg.tileMinMp = o.tileMinMp; cfg.tileColsLog2 = o.tileColsLog2; cfg.tileRowsLog2 = o.tileRowsLog2; }
+    if (o.batch.empty()) {
+        if (pos.size() != 2) return false;
+        o.in = pos[0];
+        o.out = pos[1];
+    }
+    if (!smallPreset.empty()) {
+        GpConfig cs = cfg;
+        if (!apply_preset(cs, smallPreset.c_str())) { fprintf(stderr, "unknown small preset %s\n", smallPreset.c_str()); return false; }
+        cfg.Psmall = cs.P;
+        cfg.anSmall = cs.an;
+    } else {
+        cfg.smallMp = 0;
+    }
+    // --topdown / --prune-41 given: for every preset (the main one and the small-image one), wherever they stand
+    if (o.topdownSet) cfg.an.topdown = cfg.anSmall.topdown = o.an.topdown;
+    if (o.prune41Set) cfg.an.prune41 = cfg.anSmall.prune41 = o.an.prune41;
+    if (cfg.ycgcoRe && !cfg.lossless) { fprintf(stderr, "--ycgco-re needs --lossless\n"); return false; }
+    if (o.trimOpts && !cfg.trim.on) {
+        fprintf(stderr, "--fuzz, --trim-margin, --trim-limits, --trim-lightness and --skip-blank need --trim\n");
+        return false;
+    }
+    if (cfg.lossless && (o.yuvSet || o.depthSet)) {
+        fprintf(stderr, "--yuv / --depth cannot be combined with --lossless (the format follows the input; --ycgco-re for 10-bit 4:4:4)\n");
+        return false;
+    }
+    // alpha: lossless with --lossless; else --alpha-quality, or --quality (avifenc 1.2+: alpha quality = colour quality),
+    // or (--qindex) the colour's qindex
+    if (cfg.lossless && o.alphaQuality >= 0 && o.alphaQuality != 100) {
+        fprintf(stderr, "--alpha-quality cannot be set with --lossless, except to 100 (alpha is lossless)\n");
+        return false;
+    }
+    cfg.alphaQindex = cfg.lossless ? 0
+                      : o.alphaQuality >= 0 ? alpha_qindex_for_quality(o.alphaQuality)
+                      : o.colourQuality >= 0 ? alpha_qindex_for_quality(o.colourQuality) : -1;
+    if (cfg.lossless) o.qlist.assign(1, cfg.qindex > 0 ? cfg.qindex : 1);   // (qindex is not used: one pass)
+    if (o.qlist.empty()) o.qlist.push_back(cfg.qindex);
+    for (int q : o.qlist)
+        if (q < 1 || q > 255) { fprintf(stderr, "qindex must be 1..255\n"); return false; }
+    if (o.batch.empty() && o.qlist.size() > 1) { fprintf(stderr, "several qindex values need --batch\n"); return false; }
+    cfg.P.K = std::max(1, std::min(cfg.P.K, GP_MAXK));
+    cfg.P.Krecheck = std::max(1, std::min(cfg.P.Krecheck, cfg.P.K));
+    // --uv-shortlist / --tx-shortlist given: for every preset (the main one and the small-image one), wherever they
+    // stand.  --uvK given without --uv-shortlist: the chroma shortlist of the presets is off, so --uvK keeps its meaning
+    if (o.uvShortSet) cfg.P.uvShortlist = cfg.Psmall.uvShortlist = o.uvShortlist;
+    else if (o.uvKSet) cfg.P.uvShortlist = cfg.Psmall.uvShortlist = 0;
+    if (o.txShortSet) cfg.P.txShortlist = cfg.Psmall.txShortlist = o.txShortlist;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// single image
+const char *gp_fallback_reason(int r);   // batch.cpp
+extern const char *const gp_lossless_jpeg_refusal;                                              // batch.cpp
+std::string gp_lossless_oom_hint(const GpConfig &cfg, const std::string &err, double batchMp);   // batch.cpp
+static int run_single(const GpConfig &cfg0, const Opts &o) {
+    std::string err;
+    // the reconstruction (CDEF applied, downloaded) only for the outputs that use it, as in batch mode
+    GpConfig cfg = cfg0;
+    cfg.wantRecon = o.debugOutputs || o.check;
+    const GpFileKind kind = gp_sniff(o.in);
+    if (kind == GP_FILE_JPEG && cfg.lossless) { fprintf(stderr, "%s: %s\n", o.in.c_str(), gp_lossless_jpeg_refusal); return 3; }
+    // the largest picture encoded and source decoded (megapixels, 0: none): JPEGs 35.6, PNG / WebP none without the options
+    const double dfltMp = kind == GP_FILE_JPEG ? 35.6 : 0, encMaxMp = gp_enc_max_mp(cfg, dfltMp), decMaxMp = gp_dec_max_mp(cfg, dfltMp);
+    GpEncoder enc;
+    GpFrameIn fin, afin;   // afin: the alpha frame (W = 0: none)
+    std::vector<uint8_t> icc;
+    int orientation = 1;
+    ingest_ctx *ictx = nullptr;
+    ingest_batch ib;
+    memset(&ib, 0, sizeof ib);
+    uint8_t *dplanes = nullptr, *dconv = nullptr, *dxf = nullptr;
+    auto t0 = std::chrono::steady_clock::now();
+    // a JPEG is decoded in a thread while the encoder initialises: setting up nvJPEG's hardware decoder (~70 ms on an
+    // L4) overlaps the table uploads and kernel-module loads of GpEncoder::init
+    std::thread ingestT;
+    int ir = 0;
+    char eb[256] = {0};
+    if (kind == GP_FILE_JPEG) {
+        ingest_config ic;
+        ingest_default_config(&ic);
+        ic.n_workers = 1;
+        ic.max_wait_ms = 0;
+        ic.activity = 0;
+        ic.pinned_bytes = gp_ingest_pinned_bytes(decMaxMp);   // D round 2: > 6000 px sides go to the CPU route (coefficients staged in this arena)
+        ic.out_444 = cfg.yuv444;
+        ic.max_mp = decMaxMp;
+        ic.lazy_arena = 1;   // baseline JPEGs (the hardware decoder) never touch it: 24 ms of pinning saved
+        if (getenv("GP_INGEST_DECODER")) ic.decoder = atoi(getenv("GP_INGEST_DECODER"));   // 1: CPU entropy decode + GPU IDCT
+        ingestT = std::thread([&, ic]() {
+            ictx = ingest_create(&ic, eb, sizeof eb);
+            if (!ictx) return;
+            const char *paths[1] = {o.in.c_str()};
+            ingest_submit(ictx, paths, 1);
+            ingest_finish_submit(ictx);
+            ir = ingest_next_batch(ictx, &ib, -1);
+        });
+    }
+    int initRc = enc.init(cfg, err);
+    // the small-image preset's encoder is set up only for a small image: its options are checked now, as batch mode
+    // does by setting up both
+    if (!initRc && cfg.smallMp > 0 && !cfg.lossless && gp_check_partitions(cfg.Psmall, err)) {
+        err += " (--small-preset)";
+        initRc = -1;
+    }
+    if (ingestT.joinable()) ingestT.join();
+    if (initRc) {
+        fprintf(stderr, "init: %s\n", err.c_str());
+        if (ictx) ingest_destroy(ictx);
+        return 1;
+    }
+    if (kind == GP_FILE_JPEG) {
+        if (!ictx) { fprintf(stderr, "ingest_create: %s\n", eb); return 1; }
+        if (ir != 1) {
+            ingest_fallback fb;
+            int nf = ingest_get_fallbacks(ictx, &fb, 1);
+            fprintf(stderr, "%s: %s\n", o.in.c_str(), !nf ? "decode failed" : fb.reason == INGEST_FB_GIANT ? gp_source_refusal(fb.width, fb.height, decMaxMp, &cfg.xform, decMaxMp > encMaxMp).c_str() : gp_fallback_reason(fb.reason));
+            ingest_destroy(ictx);
+            return 3;
+        }
+        const ingest_image &im = ib.images[0];
+        fin.W = im.width; fin.H = im.height; fin.mono = im.mono; fin.yuv444 = im.chroma_full;
+        fin.jpegChroma = !im.mono && !im.chroma_full && im.src_sub == INGEST_SUB_420;
+        fin.aw = im.aw; fin.ah = im.ah;
+        fin.dsrc[0] = ib.pool + im.y_off; fin.spitch[0] = im.y_pitch;
+        if (!im.mono) {
+            fin.dsrc[1] = ib.pool + im.cb_off; fin.dsrc[2] = ib.pool + im.cr_off;
+            fin.spitch[1] = fin.spitch[2] = im.c_pitch;
+        }
+        if (im.icc_size > 0) icc.assign(im.icc, im.icc + im.icc_size);
+        if (!im.oriented) orientation = im.orientation;
+    } else {
+        GpHostPlanes hp;
+        int matrix = -1;
+        std::string note;
+        if (cfg.lossless) {
+            if (!gp_decode_lossless(o.in, hp, cfg.ycgcoRe, &matrix, note, err, cfg.alpha != 0)) { fprintf(stderr, "%s: %s\n", o.in.c_str(), err.c_str()); return 3; }
+        } else if (!gp_decode_cpu(o.in, hp, err, cfg.yuv444, cfg.depth, cfg.alpha != 0, &note)) {
+            fprintf(stderr, "decode %s: %s\n", o.in.c_str(), err.c_str());
+            return 3;
+        }
+        if (!note.empty()) fprintf(stderr, "%s: %s\n", o.in.c_str(), note.c_str());
+        if (decMaxMp > 0 && (double)hp.W * hp.H > decMaxMp * 1e6) { fprintf(stderr, "%s: %s\n", o.in.c_str(), gp_source_refusal(hp.W, hp.H, decMaxMp, &cfg.xform, decMaxMp > encMaxMp).c_str()); return 3; }
+        const size_t ys = hp.bytes(0), cs = hp.bytes(1), as = hp.abytes();   // bytes (10-bit: uint16_t samples)
+        if (cudaMalloc(&dplanes, ys + 2 * cs + as) != cudaSuccess) { fprintf(stderr, "cudaMalloc failed\n"); return 1; }
+        cudaMemcpy(dplanes, hp.data(0), ys, cudaMemcpyHostToDevice);
+        cudaMemcpy(dplanes + ys, hp.data(1), cs, cudaMemcpyHostToDevice);
+        cudaMemcpy(dplanes + ys + cs, hp.data(2), cs, cudaMemcpyHostToDevice);
+        if (as) cudaMemcpy(dplanes + ys + 2 * cs, hp.adata(), as, cudaMemcpyHostToDevice);
+        fin.W = hp.W; fin.H = hp.H; fin.mono = hp.mono; fin.aw = hp.aw; fin.ah = hp.ah; fin.yuv444 = hp.yuv444; fin.bitDepth = hp.bitDepth;
+        fin.colorMatrix = matrix;
+        fin.dsrc[0] = dplanes; fin.spitch[0] = hp.aw;
+        fin.dsrc[1] = dplanes + ys; fin.dsrc[2] = dplanes + ys + cs;
+        fin.spitch[1] = fin.spitch[2] = hp.cw();
+        if (as) {   // alpha frame: monochrome, the colour's size and bit depth, unspecified colour description
+            afin.W = hp.W; afin.H = hp.H; afin.aw = hp.aw; afin.ah = hp.ah; afin.mono = 1; afin.bitDepth = hp.bitDepth;
+            afin.colorMatrix = -2;
+            afin.dsrc[0] = dplanes + ys + 2 * cs;
+            afin.spitch[0] = hp.aw;
+        }
+    }
+    if (cfg.xform.active() || cfg.trim.on || cfg.tone.on()) {
+        // crop / shrink, straight to 10 bits with --depth 10; the alpha frame the same way and the colour with alpha-weighted
+        // taps.  An EXIF orientation that swaps the sides turns the box (the box is what is displayed)
+        GpXform x = cfg.xform;
+        if (orientation >= 5) x.turn();
+        int ow, oh;
+        if (cfg.trim.on && gp_xform_size(x, fin.W, fin.H, &ow, &oh)) {   // --trim: the kept crop replaces x's
+            std::vector<GpXform> tx = {x};
+            std::vector<int> verdict;
+            const std::vector<GpFrameIn> al = {afin};
+            if (gp_frames_trim({fin}, tx, cfg.trim, 0, verdict, err, &al)) { fprintf(stderr, "trim: %s\n", err.c_str()); return 1; }
+            if (verdict[0] == GP_TRIM_BLANK) {
+                fprintf(stderr, "%s: blank (--trim would remove more than %g%% of its width or height, --skip-blank)\n", o.in.c_str(),
+                        cfg.trim.blankPct);
+                return 3;
+            }
+            x = tx[0];
+        }
+        if (!gp_xform_size(x, fin.W, fin.H, &ow, &oh)) {
+            fprintf(stderr, "%s: the crop %s is outside the %dx%d image\n", o.in.c_str(), gp_crop_str(x).c_str(), fin.W, fin.H);
+            return 3;
+        }
+        const std::string why = gp_size_refusal(ow, oh, encMaxMp, !gp_xform_runs(x, fin.W, fin.H, ow, oh) ? ""
+                                                : cfg.trim.on ? " after trim / resize" : " after crop / resize");
+        if (!why.empty()) { fprintf(stderr, "%s: %s\n", o.in.c_str(), why.c_str()); return 3; }   // (before any more GPU work)
+        if (cfg.tone.on()) {   // --auto-level / --level / --gamma / --negate: in place, before the resize
+            std::vector<GpFrameIn> v = {fin};
+            if (gp_frames_tone(v, {x}, cfg.tone, 0, err)) { fprintf(stderr, "tone: %s\n", err.c_str()); return 1; }
+        }
+        std::vector<GpFrameIn> v = {fin}, al = {afin};
+        if (afin.W > 0) v.push_back(afin);
+        if (gp_frames_transform(v, std::vector<GpXform>(v.size(), x), cfg.depth, 0, &dxf, err, &al) || cudaDeviceSynchronize() != cudaSuccess) {
+            fprintf(stderr, "crop / resize: %s\n", err.c_str());
+            return 1;
+        }
+        fin = v[0];
+        if (afin.W > 0) afin = v[1];
+    }
+    if (cfg.gray) {   // --grayscale: in place, after the resize
+        std::vector<GpFrameIn> v = {fin};
+        gp_frames_gray(v, cfg.gray, 0);
+        if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr, "grayscale: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
+        fin = v[0];
+    }
+    const std::string tooBig = gp_size_refusal(fin.W, fin.H, encMaxMp);
+    if (!tooBig.empty()) { fprintf(stderr, "%s: %s\n", o.in.c_str(), tooBig.c_str()); return 3; }
+    if (kind == GP_FILE_JPEG && cfg.depth == 10 && !cfg.lossless) {   // 8-bit JPEG samples -> 10-bit planes (libavif's full-range rescaling)
+        std::vector<GpFrameIn> v = {fin};
+        if (gp_frames_to_10bit(v, 0, &dconv, err) || cudaDeviceSynchronize() != cudaSuccess) {
+            fprintf(stderr, "10-bit conversion: %s\n", err.c_str());
+            return 1;
+        }
+        fin = v[0];
+    }
+    const bool hasAlpha = afin.W > 0;
+    if (!o.dumpSource.empty()) {   // debug: the visible input planes as the encoder sees them (Y, then U, V, then alpha; 10-bit: 16-bit LE)
+        std::vector<uint8_t> yuv;
+        const int B = fin.bitDepth == 10 ? 2 : 1;
+        for (int p = 0; p < (fin.mono ? 1 : 3) + hasAlpha; p++) {
+            const bool a = p == (fin.mono ? 1 : 3);
+            const int s = (p && !a && !fin.yuv444) ? 1 : 0, w = (fin.W + s) >> s, h = (fin.H + s) >> s;
+            const size_t at = yuv.size();
+            yuv.resize(at + (size_t)w * h * B);
+            cudaMemcpy2D(yuv.data() + at, (size_t)w * B, a ? afin.dsrc[0] : fin.dsrc[p], (size_t)(a ? afin.spitch[0] : fin.spitch[p]) * B,
+                         (size_t)w * B, h, cudaMemcpyDeviceToHost);
+        }
+        if (!gp_write_file(o.dumpSource, yuv.data(), yuv.size())) { fprintf(stderr, "write %s failed\n", o.dumpSource.c_str()); return 1; }
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    GpEncoder encS;
+    GpEncoder *E = &enc;
+    if (cfg.smallMp > 0 && (double)fin.W * fin.H < cfg.smallMp * 1e6) {
+        GpConfig cs = cfg;
+        cs.P = cfg.Psmall;
+        cs.an = cfg.anSmall;
+        if (encS.init(cs, err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+        E = &encS;
+    }
+    GpEncoder encA;   // alpha frame: gp_alpha_config (lossless or lossy at the alpha quality; the main preset, as batch mode)
+    if (hasAlpha && encA.init(gp_alpha_config(cfg), err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+    std::vector<GpFrameOut> outs, aouts;
+    GpTimes tm, tma;
+    GpDevRecords devRec, devRecA;
+    if (o.devEntropy || o.checkEntropy) {
+        // device-resident records -> stream-ordered GPU entropy (batch-mode path)
+        std::vector<GpFrameOut> o2;
+        GpTimes t2;
+        if (E->encode({fin}, o2, t2, err, 0, &devRec) || (hasAlpha && encA.encode({afin}, o2, t2, err, 0, &devRecA))) {
+            fprintf(stderr, "encode(dev): %s\n", err.c_str());
+            return 1;
+        }
+    }
+    auto failed = [&](const char *what) {   // the error, and with --lossless an out-of-memory hint
+        const std::string h = gp_lossless_oom_hint(cfg, err, 0);
+        fprintf(stderr, "%s: %s\n%s%s", what, err.c_str(), h.c_str(), h.empty() ? "" : "\n");
+        return 1;
+    };
+    if (E->encode({fin}, outs, tm, err)) return failed("encode");
+    if (hasAlpha && encA.encode({afin}, aouts, tma, err)) return failed("encode (alpha)");
+    const uint32_t dpRepaired = tm.dpRepaired + tma.dpRepaired;
+    if (dpRepaired) gp_warn_dp_net(o.in.c_str(), dpRepaired);
+#ifdef _WIN32
+    if (ictx) { ingest_release_batch(ictx, ib.batch_id, nullptr); ingest_destroy(ictx); }
+#else
+    // Linux: the ingest is not torn down; the process ends after this image (main: _exit), and the kernel frees its
+    // memory faster than nvJPEG's teardown (the destroy took 77 ms on an L4, 35 ms of it freeing the preallocated decoder)
+#endif
+    if (dplanes) cudaFree(dplanes);
+    if (dconv) cudaFree(dconv);
+    if (dxf) cudaFree(dxf);
+    auto t2 = std::chrono::steady_clock::now();
+    GpFrameOut &f = outs[0];
+    GpFrameOut *fa = hasAlpha ? &aouts[0] : nullptr;
+    f.orientation = orientation;
+    std::vector<uint8_t> obu, aobu, avif;
+    double entMs = 0;
+    // device entropy of the dev records (colour, alpha) -> OBUs with a temporal delimiter
+    auto devObus = [&](GpDevRecords &R, std::vector<uint8_t> &out, double *ms) -> int {
+        std::vector<std::vector<std::vector<uint8_t>>> tb;
+        GpEntScratch es;
+        const int erc = gp_entropy_dev(R, 0, es, tb, ms, err);
+        gp_ent_scratch_free(es, 0);
+        return erc || gp_assemble_obus(&R.fp[0], tb[0], true, out, err);
+    };
+    if (o.gpuEntropy) {
+        std::vector<GpFrameOut *> fr = {&f}, al = {fa};
+        std::vector<const std::vector<uint8_t> *> ic = {&icc};
+        std::vector<std::vector<uint8_t>> ob, av, aob;
+        if (gp_entropy_gpu(fr, ic, ob, av, &entMs, err, &al, &aob, o.videoObu)) return failed("entropy");
+        obu = ob[0];
+        aobu = aob[0];
+        avif = av[0];
+    } else if (o.devEntropy) {
+        double msA = 0;
+        if (devObus(devRec, obu, &entMs) || (hasAlpha && devObus(devRecA, aobu, &msA))) {
+            fprintf(stderr, "entropy(dev): %s\n", err.c_str());
+            return 1;
+        }
+        entMs += msA;
+        std::vector<uint8_t> o2, a2;
+        if (gp_entropy_cpu(f, icc, o2, a2, err, fa)) { fprintf(stderr, "entropy: %s\n", err.c_str()); return 1; }
+        avif = a2;  // same OBUs (checked with --check-entropy); mux from the CPU path for brevity
+    } else if (gp_entropy_cpu(f, icc, obu, avif, err, fa, &aobu)) {
+        fprintf(stderr, "entropy: %s\n", err.c_str());
+        return 1;
+    }
+    if (o.checkEntropy) {
+        std::vector<uint8_t> dobu, cobu, cavif, daobu, caobu;
+        double ms2 = 0, ms3 = 0;
+        if (devObus(devRec, dobu, &ms2) || (hasAlpha && devObus(devRecA, daobu, &ms3)) || gp_entropy_cpu(f, icc, cobu, cavif, err, fa, &caobu)) {
+            fprintf(stderr, "check-entropy: %s\n", err.c_str());
+            return 6;
+        }
+        if (dobu != cobu) { fprintf(stderr, "check-entropy: MISMATCH dev %zu bytes vs cpu %zu bytes\n", dobu.size(), cobu.size()); return 6; }
+        if (daobu != caobu) { fprintf(stderr, "check-entropy: alpha MISMATCH dev %zu bytes vs cpu %zu bytes\n", daobu.size(), caobu.size()); return 6; }
+        fprintf(stderr, "check-entropy: device entropy == CPU writer (%zu bytes, %.1f ms GPU)\n", dobu.size(), ms2);
+        if (hasAlpha) fprintf(stderr, "check-entropy: alpha: device entropy == CPU writer (%zu bytes, %.1f ms GPU)\n", daobu.size(), ms3);
+    }
+    if (devRec.pool) gp_dev_records_free(devRec, 0);
+    if (devRecA.pool) gp_dev_records_free(devRecA, 0);
+    auto t3 = std::chrono::steady_clock::now();
+    if (!gp_write_file(o.out, o.videoObu ? obu.data() : avif.data(), o.videoObu ? obu.size() : avif.size()) ||
+        (o.debugOutputs && !gp_write_file(o.out + ".obu", obu.data(), obu.size())) ||
+        (o.debugOutputs && fa && !gp_write_file(o.out + ".alpha.obu", aobu.data(), aobu.size()))) {
+        fprintf(stderr, "write failed\n");
+        return 1;
+    }
+    if (o.debugOutputs) {
+        for (GpFrameOut *x : {&f, fa}) {
+            if (!x) continue;
+            std::vector<uint8_t> yuv;
+            for (int p = 0; p < (x->fp.monochrome ? 1 : 3); p++) yuv.insert(yuv.end(), x->recon[p].begin(), x->recon[p].end());
+            if (!gp_write_file(o.out + (x == fa ? ".alpha" : "") + ".recon.yuv", yuv.data(), yuv.size())) { fprintf(stderr, "write failed\n"); return 1; }
+        }
+    }
+    int rc = 0;
+    if (o.check) {
+        for (GpFrameOut *x : {&f, fa}) {
+            if (!x || rc) continue;
+            const char *what = x == fa ? "alpha " : "";
+            av1g_decision_record r = x->record();
+            av1g_encode_opts eo;
+            eo.flags = 0;
+            eo.seq_level_idx = -1;
+            av1g_output ao;
+            memset(&ao, 0, sizeof ao);
+            if (av1g_encode(&r, &eo, &ao) != AV1G_OK) {
+                fprintf(stderr, "check: %sav1g_encode failed: %s\n", what, ao.error);
+                rc = 4;
+            } else {
+                const bool hbd = x->fp.bit_depth == 10;   // 10-bit: uint16_t samples in both
+                for (int p = 0; p < (x->fp.monochrome ? 1 : 3); p++) {
+                    const int w = ao.recon_w[p], h = ao.recon_h[p];
+                    auto at = [&](const uint8_t *b, size_t i) { return hbd ? (int)((const uint16_t *)b)[i] : (int)b[i]; };
+                    for (int y = 0; y < h && !rc; y++)
+                        for (int xx = 0; xx < w; xx++)
+                            if (at(ao.recon[p], (size_t)y * w + xx) != at(x->recon[p].data(), (size_t)y * w + xx)) {
+                                fprintf(stderr, "check: %sMISMATCH plane %d at (%d,%d): av1core %d, gpu %d\n", what, p, xx, y,
+                                        at(ao.recon[p], (size_t)y * w + xx), at(x->recon[p].data(), (size_t)y * w + xx));
+                                rc = 5;
+                                break;
+                            }
+                    if (rc) break;
+                }
+                if (!rc) fprintf(stderr, "check: %srecon identical to av1core (%zu bytes obu)\n", what, x == fa ? aobu.size() : obu.size());
+            }
+            av1g_output_free(&ao);
+        }
+    }
+    if (cfg.P.profile) {
+        const char *nm[9] = {"luma setup", "luma pass1", "luma pass2", "luma final", "chroma edges+CfL", "chroma SATD",
+                             "chroma RD", "chroma final", "maps+record"};
+        double tot = 0;
+        for (int k = 0; k < 9; k++) tot += (double)tm.prof[k];
+        for (int k = 0; k < 9; k++) fprintf(stderr, "prof %-18s %5.1f %%\n", nm[k], 100.0 * tm.prof[k] / std::max(1.0, tot));
+    }
+    if (o.stats) {
+        auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        printf("{\"file\":\"%s\",\"w\":%d,\"h\":%d,\"q\":%d,\"bytes\":%zu,\"load_ms\":%.2f,\"gpu_total_ms\":%.2f,"
+               "\"analysis_ms\":%.2f,\"dp_ms\":%.2f,\"recon_ms\":%.2f,\"pack_ms\":%.2f,\"postfilter_ms\":%.2f,\"download_ms\":%.2f,"
+               "\"entropy_ms\":%.2f,\"wall_encode_ms\":%.2f,\"steps\":%u,\"blocks\":%u,\"skip\":%u,\"cfl\":%u,\"fixes\":%u,\"txsplit\":%u,"
+               "\"dp_repaired\":%u,\"dev_mb\":%.1f%s}\n",
+               o.in.c_str(), f.fp.width, f.fp.height, (int)f.fp.base_q_idx, o.videoObu ? obu.size() : avif.size(), ms(t0, t1), tm.total, tm.analysis, tm.dp,
+               tm.recon, tm.pack, tm.postfilter, tm.download, o.gpuEntropy ? entMs : ms(t2, t3), ms(t1, t2), tm.steps, tm.blocks,
+               tm.skipBlocks, tm.cflBlocks, tm.rangeFixes, tm.txSplit, dpRepaired, tm.deviceBytes / 1048576.0,
+               !fa ? "" : (",\"alpha_q\":" + std::to_string((int)fa->fp.base_q_idx) + ",\"alpha_obu_bytes\":" + std::to_string(aobu.size() > 2 ? aobu.size() - 2 : 0) +
+                           ",\"alpha_gpu_total_ms\":" + std::to_string(tma.total)).c_str());
+    }
+    return rc;
+}
+
+int run_batch_mode(const GpConfig &cfg, const std::string &list, const std::string &outdir, bool gpuEntropy, bool stats,
+                   const std::string &suffix);
+long gp_batch_input_count(const std::string &list);   // batch.cpp
+// A run with little GPU work to overlap: single-file mode, or a --batch of at most kShortBatch encodes (inputs times
+// --qindex values), such as one upload and its thumbnail.  Counted before CUDA starts (run_batch_mode reads the list
+// again).
+static bool gp_short_run(const Opts &o) {
+    const long kShortBatch = 8;
+    if (o.batch.empty()) return true;
+    const long n = gp_batch_input_count(o.batch);   // -1 (unreadable): run_batch_mode reports it
+    return n * std::max<long>(1, (long)o.qlist.size()) <= kShortBatch;
+}
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);   // UTF-8 file names in messages (the manifest makes argv and file APIs UTF-8)
+    timeBeginPeriod(1);          // 1 ms timer: the pipeline's short sleeps and timed waits would otherwise last 15.6 ms
+#endif
+    GpConfig cfg;
+    Opts o;
+    if (!parse(argc, argv, cfg, o)) { usage(); return 2; }
+    if (o.videoObu && (!o.batch.empty() || !o.gpuEntropy || o.devEntropy || o.checkEntropy)) {
+        fprintf(stderr, "--video-obu needs single-image mode with --gpu-entropy\n");
+        return 2;
+    }
+#ifdef _WIN32
+    // nvJPEG is delay-loaded (--help works without it): a missing DLL would otherwise end the process on first use
+    if (!LoadLibraryA(AV1GPU_NVJPEG_DLL)) {
+        fprintf(stderr, "cannot load %s: it belongs beside av1gpu.exe (it is in the release zip, and in the CUDA "
+                        "toolkit's bin folder)\n", AV1GPU_NVJPEG_DLL);
+        return 1;
+    }
+#endif
+    // blocking sync: host threads sleep while waiting for the GPU (CPU budget <= 4 cores)
+    // hardware work queues: long batches use 32, more than the default 8: ingest (nvJPEG + per-worker streams), encoders
+    // (main + high-priority wavefront stream) and entropy threads use > 20 streams; aliased queues serialise unrelated
+    // work (nsys 2026-10-02: next batch's analysis queued behind entropy).  But every queue is set up with the context
+    // and torn down at exit: on an L4, 32 queues made each process 0.5 s slower than 1 (a 320 x 213 JPEG: 1.10 s against
+    // 0.59 s).  A single image or a short list has little work to overlap, so it gets one queue.
+    const char *conns = getenv("GP_MAX_CONNECTIONS");
+    if (!conns) conns = gp_short_run(o) ? "1" : "32";
+    setenv("CUDA_DEVICE_MAX_CONNECTIONS", conns, 0);
+    // batch mode: every kernel module loaded with the context, not on first use.  A lazy load mid-run waited for
+    // the GPU to drain while every thread's CUDA calls blocked (nsys, L4: 0.33-0.47 s at the first batch's post-filter
+    // launch); eager loading moves that before the batch starts (unless CUDA_MODULE_LOADING is set)
+    if (!o.batch.empty()) setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    if (cudaSetDevice(0) != cudaSuccess) { fprintf(stderr, "no CUDA device\n"); return 1; }
+#ifdef _WIN32
+    // CUDA's stream-ordered allocator (cudaMallocAsync), used throughout, does not exist in TCC mode on Windows (the
+    // default of data-centre GPUs); WDDM mode (GeForce and RTX cards) has it
+    int pools = 0, tcc = 0;
+    cudaDeviceGetAttribute(&pools, cudaDevAttrMemoryPoolsSupported, 0);
+    cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, 0);
+    if (!pools) {
+        if (tcc)
+            fprintf(stderr, "the GPU runs in TCC mode, which has no CUDA memory pools (cudaMallocAsync); av1gpu needs WDDM "
+                            "mode (nvidia-smi -dm 0, then restart, where the GPU supports it)\n");
+        else
+            fprintf(stderr, "this driver has no CUDA memory pools (cudaMallocAsync), which av1gpu needs\n");
+        return 1;
+    }
+#endif
+    if (!o.batch.empty()) {
+        if (o.debugOutputs) setenv("GP_WANT_RECON", "1", 1);
+        // one process for every q point (CUDA context, tables and the process start are paid once)
+        int rc = 0;
+        for (int q : o.qlist) {
+            GpConfig c = cfg;
+            c.qindex = q;
+            const std::string suffix = (o.qlist.size() > 1 || o.nameQ) ? ".q" + std::to_string(q) : "";
+            rc |= run_batch_mode(c, o.batch, o.outdir, o.gpuEntropy, o.stats, suffix);
+        }
+        return rc;
+    }
+    const int rc = run_single(cfg, o);
+#ifndef _WIN32
+    // single image, Linux: end without the orderly CUDA / nvJPEG teardown (run_single closed every output file; the kernel
+    // releases the GPU context and memory as the process exits): 40 ms less per process on an L4
+    fflush(stdout);
+    fflush(stderr);
+    _exit(rc);
+#endif
+    return rc;
+}
