@@ -33,6 +33,15 @@ struct Settings {
     int refs = 1;            // number of reference frames searched (1 or 2)
 };
 
+// In-loop filter parameters chosen for a P frame (the reconstruction already includes them).
+struct FilterParams {
+    int lf[4] = {0, 0, 0, 0};   // Y vertical, Y horizontal, U, V
+    int sharpness = 0;
+    bool cdef = false;
+    int damping = 3;             // CdefDamping (3..6)
+    int yPri = 0, ySec = 0, uvPri = 0, uvSec = 0;   // secondary strengths 0, 1, 2, 4
+};
+
 // Reference frames are tightly packed 8-bit YUV420 (W x H luma, then (W/2) x (H/2) U and V).
 class Analyzer {
 public:
@@ -43,6 +52,11 @@ public:
     int analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
                 const Settings &s, uint8_t *recon, std::vector<BlockInfo> &info, std::vector<int16_t> &levels,
                 char *err, int errLen);
+    // Deblocking and CDEF of the last analyzed frame's reconstruction (in place), choosing levels by SSE.
+    int filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
+               bool search, FilterParams &out, char *err, int errLen);
+    // Forget the temporal motion field (after a keyframe).
+    void resetTemporal();
     int width() const { return w; }
     int height() const { return h; }
     int alignedWidth() const { return aw; }

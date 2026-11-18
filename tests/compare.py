@@ -62,8 +62,13 @@ def bd_rate(r1, q1, r2, q2):
     return (math.exp((i2 - i1) / (hi - lo)) - 1) * 100
 
 
-def run(name, cmd, source, frames, stdin=True):
+def run(name, cmd, source, frames, stdin=True, cache=False):
     out = OUT / f"{name}.ivf"
+    cached = OUT / f"{name}_{frames}.row"
+    if cache and cached.exists() and out.exists():
+        row = json.loads(cached.read_text())
+        print(json.dumps(row), flush=True)
+        return row
     start = time.time()
     with open(source, "rb") as f:
         subprocess.run(cmd(out), stdin=f if stdin else None, check=True,
@@ -76,6 +81,7 @@ def run(name, cmd, source, frames, stdin=True):
     row = {"name": name, "bytes": size, "kbps": round(kbps, 1), "psnr": round(q, 3),
            "fps": round(frames / seconds, 2)}
     print(json.dumps(row), flush=True)
+    cached.write_text(json.dumps(row))
     return row
 
 
@@ -104,13 +110,13 @@ def main():
             curves.setdefault("svt", []).append(run(
                 f"svt_crf{crf}", lambda o: ["ffmpeg", "-v", "error", "-y", *rawin, "-c:v", "libsvtav1",
                                             "-preset", "8", "-crf", str(crf), "-color_range", "pc", str(o)],
-                src, args.frames, stdin=False))
+                src, args.frames, stdin=False, cache=True))
         if "aom" in refs:
             curves.setdefault("aom", []).append(run(
                 f"aom_crf{crf}", lambda o: ["ffmpeg", "-v", "error", "-y", *rawin, "-c:v", "libaom-av1",
                                             "-cpu-used", "8", "-row-mt", "1", "-crf", str(crf), "-b:v", "0",
                                             "-color_range", "pc", str(o)],
-                src, args.frames, stdin=False))
+                src, args.frames, stdin=False, cache=True))
     ours = curves[args.tag]
     for ref in refs:
         c = curves[ref]

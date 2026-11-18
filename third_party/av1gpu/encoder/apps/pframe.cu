@@ -5,7 +5,9 @@
 #include "dev_tx.cuh"
 #include "rc_inv.cuh"
 #include "inter_tables.h"
+#include "av1g/gpu_postfilter.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -508,6 +510,45 @@ __global__ void commit(CommitArgs a) {
     a.out[off] = bi.skip ? a.pred[s][off] : a.recon[s][off];
 }
 
+// ------------------------------------------------------------------------------------------------
+// In-loop filter maps (spec Skips, LoopfilterTxSizes, cdef_idx) from the decision grid. Every transform equals
+// its block, so all transform edges are block edges and the intra-frame filter rules apply unchanged.
+__global__ void buildFilterMaps(const BlockInfo *grid, int gcols, av1g_pf_frame f) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+    if (c >= f.MiCols || r >= f.MiRows) return;
+    const BlockInfo bi = grid[(r >> 1) * gcols + (c >> 1)];
+    const size_t k = size_t(r) * f.MiCols + c;
+    f.skip[k] = bi.skip;
+    f.lfTx[0][k] = (uint8_t)(bi.log2 - 2);
+    if (!(r & 1) && !(c & 1)) {
+        const int cc = f.MiCols >> 1;
+        const size_t kc = size_t(r >> 1) * cc + (c >> 1);
+        f.lfTx[1][kc] = f.lfTx[2][kc] = (uint8_t)(bi.log2 - 3);
+    }
+}
+__global__ void buildCdefIdx(const BlockInfo *grid, int gcols, int grows, av1g_pf_frame f) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= f.sbCols * f.sbRows) return;
+    const int sx = i % f.sbCols, sy = i / f.sbCols;
+    int coded = 0;
+    for (int y = sy * 8; y < min(sy * 8 + 8, grows); y++)
+        for (int x = sx * 8; x < min(sx * 8 + 8, gcols); x++) {
+            const BlockInfo bi = grid[y * gcols + x];
+            if (bi.log2 && !bi.skip && x * 8 < f.W && y * 8 < f.H) coded = 1;
+        }
+    f.cdefIdx[i] = coded ? 0 : -1;
+}
+__global__ void planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int w, int h, unsigned long long *out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = 0;
+    if (x < w && y < h) {
+        d = (int)src[y * pitch + x] - (int)buf[y * w + x];
+        d *= d;
+    }
+    for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+    if ((threadIdx.x & 31) == 0 && d) atomicAdd(out, (unsigned long long)d);
+}
+
 struct State {
     uint8_t *ds[1 + kMaxRefs] = {};
     Mv *coarse[kMaxRefs] = {};
@@ -520,6 +561,9 @@ struct State {
     int cols[kSizes] = {}, rows[kSizes] = {};
     int gcols = 0, grows = 0;
     bool tablesReady = false;
+    void *pfScratch = nullptr;
+    uint8_t *work = nullptr, *cdefOut = nullptr;
+    unsigned long long *sse = nullptr;
 };
 
 }  // namespace
@@ -536,6 +580,10 @@ Analyzer::~Analyzer() {
     cudaFree(s->outLevels);
     cudaFree(s->grid);
     cudaFree(s->prevGrid);
+    cudaFree(s->pfScratch);
+    cudaFree(s->work);
+    cudaFree(s->cdefOut);
+    cudaFree(s->sse);
     delete s;
 }
 
@@ -572,6 +620,14 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
     s->gcols = aw / 8; s->grows = ah / 8;
     alloc(&s->grid, sizeof(BlockInfo) * s->gcols * s->grows);
     alloc(&s->prevGrid, sizeof(BlockInfo) * s->gcols * s->grows);
+    {
+        av1g_frame_params fp{};
+        fp.width = w; fp.height = h; fp.chroma_format = AV1G_CHROMA_420; fp.bit_depth = 8; fp.enable_cdef = 1;
+        alloc((uint8_t **)&s->pfScratch, av1g_gpu_pf_scratch_size(&fp));
+        alloc(&s->work, frame);
+        alloc(&s->cdefOut, frame);
+        alloc(&s->sse, sizeof(unsigned long long) * 64);
+    }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame allocation: %s", cudaGetErrorString(e));
@@ -661,6 +717,102 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     }
     s->havePrev = true;
     elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return 0;
+}
+
+void Analyzer::resetTemporal() {
+    if (state) static_cast<State *>(state)->havePrev = false;
+}
+
+int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
+                     bool search, FilterParams &out, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    av1g_frame_params fp{};
+    fp.width = w; fp.height = h; fp.chroma_format = AV1G_CHROMA_420; fp.bit_depth = 8;
+    fp.enable_cdef = cdefAllowed;
+    av1g_pf_frame f;
+    av1g_gpu_pf_attach(&fp, s->pfScratch, &f);
+    const dim3 t16(16, 16);
+    buildFilterMaps<<<dim3((f.MiCols + 15) / 16, (f.MiRows + 15) / 16), t16>>>(s->grid, s->gcols, f);
+    buildCdefIdx<<<(f.sbCols * f.sbRows + 63) / 64, 64>>>(s->grid, s->gcols, s->grows, f);
+    const int cw = w / 2, ch = h / 2;
+    const size_t ysz = size_t(w) * h, csz = size_t(cw) * ch, frame = ysz + 2 * csz;
+    uint8_t *planesOf[2][3] = {{recon, recon + ysz, recon + ysz + csz},
+                               {s->work, s->work + ysz, s->work + ysz + csz}};
+    const int pw[3] = {w, cw, cw}, ph[3] = {h, ch, ch};
+    cudaError_t e = cudaSuccess;
+    auto sseOf = [&](uint8_t *const planes[3], unsigned long long res[3]) {
+        cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3);
+        for (int p = 0; p < 3; p++)
+            planeSse<<<dim3((pw[p] + 31) / 32, (ph[p] + 7) / 8), dim3(32, 8)>>>(src[p], pitch[p], planes[p], pw[p], ph[p],
+                                                                               s->sse + p);
+        e = cudaMemcpy(res, s->sse, sizeof(unsigned long long) * 3, cudaMemcpyDeviceToHost);
+    };
+    // deblocking level: libaom's inter-frame estimate, optionally refined per plane by SSE
+    const int acq = av1g_ac_q(qindex);
+    const int guess = std::max(0, std::min(63, (int)(((long)acq * 20723 + 1015158 + (1 << 17)) >> 18)));
+    int best[3] = {guess, guess, guess};
+    if (search) {
+        unsigned long long bestSse[3] = {~0ull, ~0ull, ~0ull};
+        const int deltas[] = {-12, -6, 0, 6, 12};
+        for (int d : deltas) {
+            const int L = std::max(0, std::min(63, guess + d));
+            if (d && L == std::max(0, std::min(63, guess + d - (d > 0 ? 6 : -6)))) continue;
+            e = cudaMemcpyAsync(s->work, recon, frame, cudaMemcpyDeviceToDevice);
+            for (int p = 0; p < 3; p++) { f.plane[p] = planesOf[1][p]; f.stride[p] = pw[p]; }
+            for (int k = 0; k < 4; k++) f.lfLevel[k] = L;
+            if (L) av1g_gpu_deblock(&f, 0);
+            unsigned long long r[3];
+            sseOf(planesOf[1], r);
+            for (int p = 0; p < 3; p++)
+                if (r[p] < bestSse[p]) { bestSse[p] = r[p]; best[p] = L; }
+        }
+    }
+    out.lf[0] = out.lf[1] = best[0];
+    out.lf[2] = best[0] ? best[1] : 0;
+    out.lf[3] = best[0] ? best[2] : 0;
+    out.sharpness = 0;
+    for (int p = 0; p < 3; p++) { f.plane[p] = planesOf[0][p]; f.stride[p] = pw[p]; }
+    for (int k = 0; k < 4; k++) f.lfLevel[k] = out.lf[k];
+    f.sharpness = 0;
+    if (out.lf[0] || out.lf[1]) av1g_gpu_deblock(&f, 0);
+    out.cdef = cdefAllowed;
+    if (cdefAllowed) {
+        out.damping = 3 + std::min(3, qindex >> 6);
+        f.enableCdef = 1;
+        f.cdefDamping = out.damping;
+        av1g_gpu_cdef_dir(&f, 0);
+        uint8_t *dst[3] = {s->cdefOut, s->cdefOut + ysz, s->cdefOut + ysz + csz};
+        const int strides[3] = {w, cw, cw};
+        struct Str { int pri, sec; };
+        const Str cands[] = {{0, 0}, {1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}, {8, 2}, {10, 4}, {12, 4}};
+        int by = 0, buv = 0;
+        if (search) {
+            unsigned long long bY = ~0ull, bUV = ~0ull;
+            for (int k = 0; k < (int)(sizeof cands / sizeof cands[0]); k++) {
+                f.cdefYPri[0] = cands[k].pri; f.cdefYSec[0] = cands[k].sec;
+                f.cdefUVPri[0] = cands[k].pri; f.cdefUVSec[0] = cands[k].sec;
+                av1g_gpu_cdef(&f, dst, strides, 0);
+                unsigned long long r[3];
+                sseOf(dst, r);
+                if (r[0] < bY) { bY = r[0]; by = k; }
+                if (r[1] + r[2] < bUV) { bUV = r[1] + r[2]; buv = k; }
+            }
+        } else {
+            by = buv = std::min(8, qindex / 32);
+        }
+        out.yPri = cands[by].pri; out.ySec = cands[by].sec;
+        out.uvPri = cands[buv].pri; out.uvSec = cands[buv].sec;
+        f.cdefYPri[0] = out.yPri; f.cdefYSec[0] = out.ySec;
+        f.cdefUVPri[0] = out.uvPri; f.cdefUVSec[0] = out.uvSec;
+        av1g_gpu_cdef(&f, dst, strides, 0);
+        e = cudaMemcpy(recon, s->cdefOut, frame, cudaMemcpyDeviceToDevice);
+    }
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "P-frame filters: %s", cudaGetErrorString(e));
+        return -1;
+    }
     return 0;
 }
 

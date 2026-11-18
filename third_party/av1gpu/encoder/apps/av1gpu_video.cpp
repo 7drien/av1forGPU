@@ -75,7 +75,8 @@ int main(int argc, char **argv) {
     bool interRdoq = false;
     bool usePframes = false;
     pf::Settings pfSettings;
-    int pfQindex = 0;
+    int pfQindex = 0, pfQoffset = 0;
+    bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
     unsigned anchorInterval = 0;
@@ -152,6 +153,14 @@ int main(int argc, char **argv) {
                 return 2;
             }
             pfQindex = static_cast<int>(value);
+        } else if (!strcmp(argv[i], "--pf-qoffset") && i + 1 < argc) {
+            pfQoffset = atoi(argv[++i]);
+            if (pfQoffset < -100 || pfQoffset > 100) {
+                fprintf(stderr, "P-frame qindex offset must be in -100..100\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--pf-no-filters")) {
+            pfFilters = false;
         } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
             pfSettings.lambdaMul = strtof(argv[++i], nullptr);
             if (!(pfSettings.lambdaMul > 0.f && pfSettings.lambdaMul < 100.f)) {
@@ -334,12 +343,18 @@ int main(int argc, char **argv) {
     cfg.wantRecon = false;
     GpEncoder encoder;
     std::string err;
+    if (usePframes && pfFilters) {
+        // keyframes: deblocking and CDEF searches; enable_cdef = 1 in the sequence header lets P frames use CDEF
+        cfg.fLf = 2;
+        cfg.fCdef = 2;
+        pfCdef = true;
+    }
     if (encoder.init(cfg, err)) { fprintf(stderr, "encoder init: %s\n", err.c_str()); return 1; }
     if (usePframes) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
         pfWriter.reset(new pfw::Writer(w, h, pfAnalyzer.alignedWidth(), pfAnalyzer.alignedHeight()));
-        pfSettings.qindex = pfQindex ? pfQindex : cfg.qindex;
+        pfSettings.qindex = pfQindex ? pfQindex : std::min(255, std::max(1, cfg.qindex + pfQoffset));
     }
 
     std::vector<uint8_t> src, padded[3];
@@ -377,7 +392,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
             pfMs += pfAnalyzer.lastMs();
+            pf::FilterParams flt;
+            if (pfFilters && pfAnalyzer.filter(inputs[0].dsrc, pitches, nextReference, pfSettings.qindex, pfCdef, true,
+                                               flt, perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
             pfw::FrameParams fp;
+            for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];
+            fp.lfSharpness = flt.sharpness;
+            fp.cdef = pfCdef;
+            fp.cdefDamping = flt.damping;
+            fp.cdefY = flt.yPri; fp.cdefYSec = flt.ySec; fp.cdefUV = flt.uvPri; fp.cdefUVSec = flt.uvSec;
             fp.qindex = pfSettings.qindex;
             fp.refreshFlags = 1;
             fp.persistent = persistentCdf;
@@ -520,6 +546,7 @@ int main(int argc, char **argv) {
             if (usePframes) {
                 lastWritten = lastKey = frameCount;
                 pfEntropy.ready = false;
+                pfAnalyzer.resetTemporal();
                 if (reconDump) {
                     std::vector<uint8_t> host(ySize * 3 / 2);
                     cudaMemcpy(host.data(), reference, host.size(), cudaMemcpyDeviceToHost);

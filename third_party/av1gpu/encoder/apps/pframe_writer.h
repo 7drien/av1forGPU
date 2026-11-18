@@ -218,12 +218,12 @@ private:
         b.put(fp.lfSharpness, 3);
         b.bit(0);   // loop_filter_delta_enabled
         if (fp.cdef) {
-            b.put(fp.cdefDamping, 2);
+            b.put(fp.cdefDamping - 3, 2);
             b.put(0, 2);   // cdef_bits
             b.put(fp.cdefY, 4);
-            b.put(fp.cdefYSec, 2);
+            b.put(fp.cdefYSec == 4 ? 3 : fp.cdefYSec, 2);
             b.put(fp.cdefUV, 4);
-            b.put(fp.cdefUVSec, 2);
+            b.put(fp.cdefUVSec == 4 ? 3 : fp.cdefUVSec, 2);
         }
         b.bit(0);   // tx_mode_select = 0: TX_MODE_LARGEST
         b.bit(0);   // reference_select
