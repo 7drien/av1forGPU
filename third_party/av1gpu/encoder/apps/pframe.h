@@ -14,6 +14,9 @@ namespace pf {
 struct Mv {
     int16_t row, col;   // 1/8 luma sample units; always even (allow_high_precision_mv = 0)
 };
+#ifdef __CUDACC__
+__host__ __device__
+#endif
 inline bool operator==(Mv a, Mv b) { return a.row == b.row && a.col == b.col; }
 
 // Decision for each 8x8 luma unit (raster order, ceil(W/8) x ceil(H/8)).

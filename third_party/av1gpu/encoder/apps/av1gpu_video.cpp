@@ -296,7 +296,7 @@ int main(int argc, char **argv) {
     pfw::EntropyState pfEntropy;
     std::vector<pf::BlockInfo> pfInfo;
     std::vector<int16_t> pfLevels;
-    double pfMs = 0;
+    double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0;
     uint64_t pfModes[4] = {};
     if (usePframes) {
         if (!reference && cudaMalloc(&reference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
@@ -392,6 +392,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             pfMs += pfAnalyzer.lastMs();
+            const auto tf0 = std::chrono::steady_clock::now();
             pf::FilterParams flt;
             if (pfFilters && pfAnalyzer.filter(inputs[0].dsrc, pitches, nextReference, pfSettings.qindex, pfCdef, true,
                                                flt, perr, sizeof perr)) {
@@ -409,9 +410,12 @@ int main(int argc, char **argv) {
             fp.persistent = persistentCdf;
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
+            const auto tw0 = std::chrono::steady_clock::now();
+            pfFilterMs += std::chrono::duration<double, std::milli>(tw0 - tf0).count();
             std::vector<uint8_t> obu;
             try {
                 obu = pfWriter->frame(fp, pfInfo, pfLevels, pfEntropy);
+                pfWriteMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
             } catch (const std::exception &ex) {
                 fprintf(stderr, "P-frame syntax: %s\n", ex.what());
                 return 1;
@@ -576,6 +580,7 @@ int main(int argc, char **argv) {
     if(temporal) fprintf(stderr,"inter frames %llu, keyframes %llu\n",(unsigned long long)predicted,
                          (unsigned long long)(frameCount-predicted));
     if (usePframes)
+        fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms\n", pfFilterMs, pfWriteMs),
         fprintf(stderr, "P-frame analysis %.1f ms; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
                 (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],
                 (unsigned long long)pfModes[3]);

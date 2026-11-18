@@ -21,6 +21,7 @@ namespace {
 constexpr int kSizes = 4;       // 8, 16, 32, 64
 constexpr int kMaxRefs = 2;
 constexpr float kInf = 3.0e38f;
+constexpr int kFullPelPasses = 6;
 
 __constant__ int16_t c_filter[6][16][8];
 
@@ -93,33 +94,6 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
     __syncwarp();
 }
 
-// SAD of a full-pel displacement (lanes over pixels). Out-of-frame reference samples are clamped.
-template <int N>
-__device__ int warpSadFull(const uint8_t *src, int pitch, const uint8_t *ref, int w, int h, int x0, int y0, int dx,
-                           int dy) {
-    const int lane = threadIdx.x & 31;
-    int s = 0;
-    for (int i = lane; i < N * N; i += 32) {
-        const int r = i / N, c = i - r * N;
-        const int x = x0 + c, y = y0 + r;
-        if (x >= w || y >= h) continue;
-        const int rx = min(max(x + dx, 0), w - 1), ry = min(max(y + dy, 0), h - 1);
-        s += abs((int)src[y * pitch + x] - (int)ref[ry * w + rx]);
-    }
-    return warp_sumi(s);
-}
-
-__device__ int warpSadPred(const uint8_t *src, int pitch, const uint8_t *pred, int n, int w, int h, int x0, int y0) {
-    const int lane = threadIdx.x & 31;
-    int s = 0;
-    for (int i = lane; i < n * n; i += 32) {
-        const int r = i / n, c = i - r * n;
-        if (x0 + c >= w || y0 + r >= h) continue;
-        s += abs((int)src[(y0 + r) * pitch + x0 + c] - (int)pred[i]);
-    }
-    return warp_sumi(s);
-}
-
 // ------------------------------------------------------------------------------------------------
 __global__ void downsample4(const uint8_t *src, int pitch, int w, int h, uint8_t *dst, int dw, int dh) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -171,21 +145,69 @@ __global__ void coarseSearch(const uint8_t *cur, const uint8_t *ref, int dw, int
     }
 }
 
+// Quarter-sample phase planes of a reference luma plane: phase (fy / 4) * 4 + fx / 4 holds the exact AV1 prediction
+// sample at every integer position (two-stage filter with the spec's intermediate rounding and edge clamping).
+__global__ void horizontalPhases(const uint8_t *ref, int w, int h, int16_t *out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int fx = blockIdx.z;
+    if (x >= w || y >= h) return;
+    const uint8_t *row = ref + size_t(y) * w;
+    int s = 0;
+#pragma unroll
+    for (int t = 0; t < 8; t++) s += c_filter[0][fx * 4][t] * row[min(max(x + t - 3, 0), w - 1)];
+    out[(size_t(fx) * h + y) * w + x] = (int16_t)round2(s, 3);
+}
+__global__ void verticalPhases(const int16_t *hp, int w, int h, uint8_t *out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int phase = blockIdx.z, fy = phase >> 2, fx = phase & 3;
+    if (x >= w || y >= h) return;
+    const int16_t *col = hp + size_t(fx) * h * w + x;
+    int s = 0;
+#pragma unroll
+    for (int t = 0; t < 8; t++) s += c_filter[0][fy * 4][t] * col[size_t(min(max(y + t - 3, 0), h - 1)) * w];
+    out[(size_t(phase) * h + y) * w + x] = (uint8_t)min(max(round2(s, 11), 0), 255);
+}
+
+template <int N>
+__device__ __forceinline__ int warpSadPlane(const uint8_t *src, int pitch, const uint8_t *plane, int w, int h, int x0,
+                                            int y0, int dx, int dy) {
+    constexpr int L = N == 8 ? 3 : N == 16 ? 4 : N == 32 ? 5 : 6;
+    const int lane = threadIdx.x & 31;
+    int s = 0;
+    const bool inside = x0 + dx >= 0 && y0 + dy >= 0 && x0 + dx + N <= w && y0 + dy + N <= h && x0 + N <= w && y0 + N <= h;
+    if (inside) {
+        const uint8_t *p = plane + size_t(y0 + dy) * w + x0 + dx;
+        const uint8_t *q = src + size_t(y0) * pitch + x0;
+#pragma unroll 4
+        for (int i = lane; i < N * N; i += 32) {
+            const int r = i >> L, c = i & (N - 1);
+            s += abs((int)q[r * pitch + c] - (int)p[r * w + c]);
+        }
+    } else {
+        for (int i = lane; i < N * N; i += 32) {
+            const int r = i >> L, c = i & (N - 1);
+            const int x = x0 + c, y = y0 + r;
+            if (x >= w || y >= h) continue;
+            const int rx = min(max(x + dx, 0), w - 1), ry = min(max(y + dy, 0), h - 1);
+            s += abs((int)src[y * pitch + x] - (int)plane[size_t(ry) * w + rx]);
+        }
+    }
+    return warp_sumi(s);
+}
+
 // Per-size motion refinement from coarse, parent, temporal and zero candidates: full-pel search, then half
-// and quarter sample steps with the exact interpolation filter. ref r > 0 replaces a candidate only if cheaper.
+// and quarter sample steps on the phase planes. ref r > 0 replaces a candidate only if cheaper.
 template <int N>
 struct RefineCfg {
-    static constexpr int warps = N >= 64 ? 1 : N >= 32 ? 2 : 4;
-    static constexpr int tmp = (N + 7) * N;
+    static constexpr int warps = N >= 64 ? 2 : N >= 32 ? 4 : 8;
 };
 template <int N>
-__global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int refIdx, const Mv *coarse, int ccols,
-                                                                  int crows, const Cand *parent, int pcols,
+__global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int refIdx, const uint8_t *phases,
+                                                                  const Mv *coarse, int ccols, int crows,
+                                                                  const Cand *parent, int pcols,
                                                                   const BlockInfo *temporal, int tcols, Cand *out,
                                                                   int cols, int rows, float lambda) {
     constexpr int W = RefineCfg<N>::warps;
-    __shared__ int16_t tmpS[W][RefineCfg<N>::tmp];
-    __shared__ uint8_t predS[W][N * N];
     const int warp = threadIdx.x >> 5;
     const int b = blockIdx.x * W + warp;
     if (b >= cols * rows) return;
@@ -195,10 +217,9 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
         if (refIdx == 0 && (threadIdx.x & 31) == 0) { o = Cand{}; o.searchCost = kInf; }
         return;
     }
-    const uint8_t *ref = f.ref[refIdx];
     const uint8_t *src = f.src[0];
     const int pitch = f.pitch[0];
-    // candidates (full-pel)
+    const size_t planeSize = size_t(f.w) * f.h;
     int cand[12][2], n = 0;
     auto add = [&](Mv m) {
         cand[n][0] = (m.row + (m.row >= 0 ? 4 : -4)) / 8;
@@ -220,35 +241,29 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
         pred = p.mv;
     }
     if (temporal) add(temporal[(y0 / 8) * tcols + x0 / 8].mv);
-    float best = kInf;
-    int bdx = 0, bdy = 0;
-    auto evalFull = [&](int dx, int dy) {
-        const int s = warpSadFull<N>(src, pitch, ref, f.w, f.h, x0, y0, dx, dy);
-        const float c = (float)s + lambda * mvBits(Mv{(int16_t)(dy * 8), (int16_t)(dx * 8)}, pred);
-        if (c < best) { best = c; bdx = dx; bdy = dy; }
+    auto costOf = [&](Mv m) {
+        const int ph = (((2 * m.row) & 15) >> 2) * 4 + (((2 * m.col) & 15) >> 2);
+        const int s = warpSadPlane<N>(src, pitch, phases + ph * planeSize, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
+        return (float)s + lambda * mvBits(m, pred);
     };
-    for (int i = 0; i < n; i++) evalFull(cand[i][1], cand[i][0]);
-    for (int pass = 0; pass < 2; pass++) {
-        const int cdx = bdx, cdy = bdy;
-        for (int dy = -2; dy <= 2; dy++)
-            for (int dx = -2; dx <= 2; dx++)
-                if (dx || dy) evalFull(cdx + dx, cdy + dy);
-        if (bdx == cdx && bdy == cdy) break;
+    Mv bm{0, 0};
+    float bc = kInf;
+    auto tryMv = [&](Mv m) {
+        if (abs(m.row) >= (1 << 14) - 8 || abs(m.col) >= (1 << 14) - 8) return;
+        const float c = costOf(m);
+        if (c < bc) { bc = c; bm = m; }
+    };
+    for (int i = 0; i < n; i++) tryMv(Mv{(int16_t)(cand[i][0] * 8), (int16_t)(cand[i][1] * 8)});
+    for (int pass = 0; pass < kFullPelPasses; pass++) {
+        const Mv c0 = bm;
+        for (int k = 0; k < 9; k++)
+            if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * 8), (int16_t)(c0.col + (k % 3 - 1) * 8)});
+        if (bm == c0) break;
     }
-    // sub-sample refinement (1/8 units: half = 4, quarter = 2)
-    Mv bm{(int16_t)(bdy * 8), (int16_t)(bdx * 8)};
-    float bc = best;
     for (int step = 4; step >= 2; step >>= 1) {
         const Mv c0 = bm;
-        for (int k = 0; k < 9; k++) {
-            if (k == 4) continue;
-            const Mv m{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)};
-            if (abs(m.row) >= (1 << 14) - 8 || abs(m.col) >= (1 << 14) - 8) continue;
-            warpPredict(ref, f.w, f.h, x0, y0, N, N, m, 0, tmpS[warp], predS[warp]);
-            const int s = warpSadPred(src, pitch, predS[warp], N, f.w, f.h, x0, y0);
-            const float c = (float)s + lambda * mvBits(m, pred);
-            if (c < bc) { bc = c; bm = m; }
-        }
+        for (int k = 0; k < 9; k++)
+            if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)});
     }
     if ((threadIdx.x & 31) == 0) {
         if (refIdx == 0 || bc + lambda * 1.5f < o.searchCost) {
@@ -328,12 +343,13 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; }
         return;
     }
-    const uint8_t *ref = f.ref[c.ref];
+    const uint8_t *ref = c.ref ? f.ref[1] : f.ref[0];
     const int cw = f.w >> 1, chh = f.h >> 1;
     const size_t ysz = size_t(f.w) * f.h, csz = size_t(cw) * chh;
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     float dSkip = 0.f, dCoded = 0.f, bits = 0.f;
     bool nz = false;
+#pragma unroll
     for (int p = 0; p < 3; p++) {
         const int sub = p > 0, n = p ? NC : N;
         const int pw = p ? cw : f.w, ph = p ? chh : f.h;
@@ -423,61 +439,66 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Bottom-up partition choice per 64x64 superblock (one thread each).
+// Bottom-up partition choice: level s combines the four level s-1 results (parallel over blocks), then every 8x8
+// unit walks down from 64x64 to the block that covers it.
 struct DecideArgs {
     const Cand *cand[kSizes];
     int cols[kSizes];
+    float *best[kSizes];      // best cost of the subtree rooted at each block
+    uint8_t *mode[kSizes];    // 0: split, 1: none + skip, 2: none + coded
     int w, h;
-    int gcols;            // 8x8 grid columns (aligned width / 8)
+    int gcols, grows;
     BlockInfo *grid;
     float lambda;
     float partBits[kSizes][2];   // [size][0: none, 1: split]
 };
 
-__device__ float decideNode(const DecideArgs &a, int x, int y, int s, bool write) {
-    const int n = 8 << s;
-    if (x >= a.w || y >= a.h) return 0.f;
+__global__ void decideLevel(DecideArgs a, int s, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int cols = a.cols[s];
+    if (i >= cols * rows) return;
+    const int n = 8 << s, x = (i % cols) * n, y = (i / cols) * n;
+    if (x >= a.w || y >= a.h) { a.best[s][i] = 0.f; a.mode[s][i] = 0; return; }
     const bool hasRows = y + n / 2 < a.h, hasCols = x + n / 2 < a.w;
-    const bool canNone = (hasRows && hasCols) || s == 0;
     float none = kInf;
-    int noneSkip = 1;
-    const Cand *c = nullptr;
-    if (canNone) {
-        c = &a.cand[s][(y / n) * a.cols[s] + x / n];
-        const float coded = c->nz ? c->costCoded : kInf;
-        noneSkip = !(coded < c->costSkip);
-        none = (noneSkip ? c->costSkip : coded) + a.lambda * a.partBits[s][0];
+    int noneMode = 1;
+    if ((hasRows && hasCols) || s == 0) {
+        const Cand &c = a.cand[s][i];
+        const float coded = c.nz ? c.costCoded : kInf;
+        noneMode = coded < c.costSkip ? 2 : 1;
+        none = (noneMode == 2 ? coded : c.costSkip) + a.lambda * a.partBits[s][0];
     }
     float split = kInf;
     if (s > 0) {
         split = a.lambda * a.partBits[s][1];
-        for (int k = 0; k < 4; k++) split += decideNode(a, x + (k & 1) * n / 2, y + (k >> 1) * n / 2, s - 1, false);
+        const int cc = a.cols[s - 1], cx = 2 * (i % cols), cy = 2 * (i / cols);
+        for (int k = 0; k < 4; k++) split += a.best[s - 1][(cy + (k >> 1)) * cc + cx + (k & 1)];
     }
     const bool useNone = none <= split;
-    if (write) {
-        if (useNone) {
-            BlockInfo bi{};
-            bi.mv = c->mv;
-            bi.log2 = (uint8_t)(3 + s);
-            bi.skip = (uint8_t)noneSkip;
-            bi.ref = c->ref;
-            for (int yy = y / 8; yy < (y + n) / 8; yy++)
-                for (int xx = x / 8; xx < (x + n) / 8; xx++) a.grid[yy * a.gcols + xx] = bi;
-        } else {
-            for (int k = 0; k < 4; k++) decideNode(a, x + (k & 1) * n / 2, y + (k >> 1) * n / 2, s - 1, true);
-        }
-    }
-    return useNone ? none : split;
+    a.best[s][i] = useNone ? none : split;
+    a.mode[s][i] = useNone ? (uint8_t)noneMode : 0;
 }
 
-__global__ void decide(DecideArgs a, int sbCols, int sbRows) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= sbCols * sbRows) return;
-    const int x = (i % sbCols) * 64, y = (i / sbCols) * 64;
-    // clear the superblock (units outside every coded block keep log2 = 0)
-    for (int yy = y / 8; yy < y / 8 + 8; yy++)
-        for (int xx = x / 8; xx < x / 8 + 8; xx++) a.grid[yy * a.gcols + xx] = BlockInfo{};
-    decideNode(a, x, y, 3, true);
+__global__ void decideGrid(DecideArgs a) {
+    const int gx = blockIdx.x * blockDim.x + threadIdx.x, gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= a.gcols || gy >= a.grows) return;
+    BlockInfo bi{};
+    if (gx * 8 < a.w && gy * 8 < a.h) {
+#pragma unroll
+        for (int s = kSizes - 1; s >= 0; s--) {
+            const int sh = s, idx = (gy >> sh) * a.cols[s] + (gx >> sh);
+            const int m = a.mode[s][idx];
+            if (m || s == 0) {
+                const Cand &c = a.cand[s][idx];
+                bi.mv = c.mv;
+                bi.log2 = (uint8_t)(3 + s);
+                bi.skip = (uint8_t)(m != 2);
+                bi.ref = c.ref;
+                break;
+            }
+        }
+    }
+    a.grid[gy * a.gcols + gx] = bi;
 }
 
 // Gather the chosen reconstruction and levels.
@@ -489,25 +510,30 @@ struct CommitArgs {
     uint8_t *out;
     int16_t *outLevels;
 };
+template <class T>
+__device__ __forceinline__ T pick4(int s, T a0, T a1, T a2, T a3) { return s == 0 ? a0 : s == 1 ? a1 : s == 2 ? a2 : a3; }
 __global__ void commit(CommitArgs a) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     const int p = blockIdx.z, sub = p > 0;
     const int apw = a.aw >> sub, aph = a.ah >> sub;
     if (x >= apw || y >= aph) return;
-    const BlockInfo bi = a.grid[((y << sub) / 8) * a.gcols + ((x << sub) / 8)];
+    const BlockInfo bi = a.grid[((y << sub) >> 3) * a.gcols + ((x << sub) >> 3)];
     const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
+    const int s = bi.log2 - 3;
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
-        const int s = bi.log2 - 3, t = (8 << s) >> sub;
-        const int tx = x / t, ty = y / t;
-        level = a.levels[s][lbase + (size_t(ty) * (apw / t) + tx) * t * t + (y - ty * t) * t + (x - tx * t)];
+        const int lt = bi.log2 - sub, t = 1 << lt;
+        const int tx = x >> lt, ty = y >> lt;
+        const int16_t *lv = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[2]);
+        level = lv[lbase + ((size_t(ty) * (apw >> lt) + tx) << (2 * lt)) + ((y - (ty << lt)) << lt) + (x - (tx << lt))];
     }
     a.outLevels[lbase + size_t(y) * apw + x] = level;
     const int pw = a.w >> sub, ph = a.h >> sub;
     if (x >= pw || y >= ph) return;
     const size_t off = (p ? size_t(a.w) * a.h + size_t(p - 1) * pw * ph : 0) + size_t(y) * pw + x;
-    const int s = bi.log2 - 3;
-    a.out[off] = bi.skip ? a.pred[s][off] : a.recon[s][off];
+    const uint8_t *srcBuf = bi.skip ? pick4(s, a.pred[0], a.pred[1], a.pred[2], a.pred[3])
+                                    : pick4(s, a.recon[0], a.recon[1], a.recon[2], a.recon[2]);
+    a.out[off] = srcBuf[off];
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -564,6 +590,14 @@ struct State {
     void *pfScratch = nullptr;
     uint8_t *work = nullptr, *cdefOut = nullptr;
     unsigned long long *sse = nullptr;
+    float *best[kSizes] = {};
+    uint8_t *mode[kSizes] = {};
+    int16_t *hphase = nullptr;
+    uint8_t *phases = nullptr;
+    bool profile = false;
+    cudaEvent_t ev[8] = {};
+    double stageMs[8] = {};
+    int frames = 0;
 };
 
 }  // namespace
@@ -584,6 +618,15 @@ Analyzer::~Analyzer() {
     cudaFree(s->work);
     cudaFree(s->cdefOut);
     cudaFree(s->sse);
+    cudaFree(s->hphase);
+    for (auto *p : s->best) cudaFree(p);
+    for (auto *p : s->mode) cudaFree(p);
+    cudaFree(s->phases);
+    if (s->profile && s->frames) {
+        const char *names[] = {"downsample+coarse", "refine", "evaluate", "decide", "commit", "download"};
+        for (int i = 0; i < 6; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
+    }
+    for (auto &e : s->ev) if (e) cudaEventDestroy(e);
     delete s;
 }
 
@@ -610,6 +653,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         const int n = 8 << k;
         s->cols[k] = aw / n; s->rows[k] = ah / n;
         alloc(&s->cand[k], sizeof(Cand) * s->cols[k] * s->rows[k]);
+        alloc(&s->best[k], sizeof(float) * s->cols[k] * s->rows[k]);
+        alloc(&s->mode[k], s->cols[k] * s->rows[k]);
         alloc(&s->pred[k], frame);
         if (k < 3) {
             alloc(&s->recon[k], frame);
@@ -627,12 +672,17 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->work, frame);
         alloc(&s->cdefOut, frame);
         alloc(&s->sse, sizeof(unsigned long long) * 64);
+        alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
+        alloc(&s->phases, 16 * size_t(w) * h);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame allocation: %s", cudaGetErrorString(e));
         return -1;
     }
+    s->profile = getenv("AV1GPU_PF_PROFILE") != nullptr;
+    if (s->profile)
+        for (auto &ev : s->ev) cudaEventCreate(&ev);
     if (gp_upload_tables_pframe(gp_host_tables())) {
         snprintf(err, errLen, "P-frame table upload failed");
         return -1;
@@ -654,6 +704,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     const float lambdaSad = sqrtf(lambda);
     const dim3 t16(16, 16);
     const dim3 gds((s->dw + 15) / 16, (s->dh + 15) / 16);
+    auto mark = [&](int i) { if (s->profile) cudaEventRecord(s->ev[i]); };
+    mark(0);
     downsample4<<<gds, t16>>>(src[0], pitch[0], w, h, s->ds[0], s->dw, s->dh);
     const int R = std::min(kCoarseMaxR, std::max(2, st.searchRange / 4));
     const int nCoarse = s->ccols * s->crows;
@@ -662,11 +714,14 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps>>>(
             s->ds[0], s->ds[1 + r], s->dw, s->dh, R, s->ccols, s->crows, lambdaSad * 0.5f, s->coarse[r]);
     }
+    mark(1);
     const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
     for (int r = 0; r < refCount; r++) {
+        horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8)>>>(refs[r], w, h, s->hphase);
+        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases);
 #define PF_REFINE(K, N)                                                                                         \
     refine<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                      \
-                32 * RefineCfg<N>::warps>>>(f, r, s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
+                32 * RefineCfg<N>::warps>>>(f, r, s->phases, s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
                                             K == 3 ? 0 : s->cols[K + 1], temporal, s->gcols, s->cand[K], s->cols[K],  \
                                             s->rows[K], lambdaSad)
         PF_REFINE(3, 64);
@@ -675,6 +730,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         PF_REFINE(0, 8);
 #undef PF_REFINE
     }
+    mark(2);
     EvalArgs ea{};
     ea.f = f;
     ea.qindex = st.qindex;
@@ -690,14 +746,19 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     PF_EVAL(2, 32);
     PF_EVAL(3, 64);
 #undef PF_EVAL
+    mark(3);
     DecideArgs da{};
-    for (int k = 0; k < kSizes; k++) { da.cand[k] = s->cand[k]; da.cols[k] = s->cols[k]; }
-    da.w = w; da.h = h; da.gcols = s->gcols; da.grid = s->grid; da.lambda = lambda;
+    for (int k = 0; k < kSizes; k++) {
+        da.cand[k] = s->cand[k]; da.cols[k] = s->cols[k]; da.best[k] = s->best[k]; da.mode[k] = s->mode[k];
+    }
+    da.w = w; da.h = h; da.gcols = s->gcols; da.grows = s->grows; da.grid = s->grid; da.lambda = lambda;
     // approximate partition symbol costs (bits)
     const float part[kSizes][2] = {{1.0f, 0.f}, {1.0f, 2.5f}, {1.0f, 2.5f}, {1.0f, 2.0f}};
     memcpy(da.partBits, part, sizeof part);
-    const int sbCols = aw / 64, sbRows = ah / 64;
-    decide<<<(sbCols * sbRows + 63) / 64, 64>>>(da, sbCols, sbRows);
+    for (int k = 0; k < kSizes; k++)
+        decideLevel<<<(s->cols[k] * s->rows[k] + 127) / 128, 128>>>(da, k, s->rows[k]);
+    decideGrid<<<dim3((s->gcols + 15) / 16, (s->grows + 15) / 16), t16>>>(da);
+    mark(4);
     CommitArgs ca{};
     ca.grid = s->grid; ca.gcols = s->gcols; ca.w = w; ca.h = h; ca.aw = aw; ca.ah = ah;
     for (int k = 0; k < kSizes; k++) ca.pred[k] = s->pred[k];
@@ -705,6 +766,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ca.out = recon;
     ca.outLevels = s->outLevels;
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);
+    mark(5);
     cudaError_t e = cudaGetLastError();
     info.resize(size_t(s->gcols) * s->grows);
     levels.resize(size_t(aw) * ah * 3 / 2);
@@ -716,6 +778,16 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         return -1;
     }
     s->havePrev = true;
+    if (s->profile) {
+        mark(6);
+        cudaEventSynchronize(s->ev[6]);
+        for (int i = 0; i < 6; i++) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, s->ev[i], s->ev[i + 1]);
+            s->stageMs[i] += ms;
+        }
+        s->frames++;
+    }
     elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return 0;
 }
