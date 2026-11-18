@@ -1,0 +1,667 @@
+// CUDA P-frame analysis (see pframe.h).
+#include "pframe.h"
+
+#include "dev_common.cuh"
+#include "dev_tx.cuh"
+#include "rc_inv.cuh"
+#include "inter_tables.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+GP_DEFINE_TABLE_UPLOAD(gp_upload_tables_pframe)
+const GpHostTables *gp_host_tables();
+
+namespace pf {
+namespace {
+
+constexpr int kSizes = 4;       // 8, 16, 32, 64
+constexpr int kMaxRefs = 2;
+constexpr float kInf = 3.0e38f;
+
+__constant__ int16_t c_filter[6][16][8];
+
+struct Cand {
+    Mv mv;
+    uint8_t ref;
+    uint8_t nz;           // coded option has nonzero levels
+    float searchCost;     // SAD + motion cost of the selected vector
+    float costSkip, costCoded;
+};
+
+struct Frame {
+    const uint8_t *src[3];
+    int pitch[3];
+    const uint8_t *ref[kMaxRefs];
+    int w, h, aw, ah;
+};
+
+__device__ __forceinline__ int round2(int x, int n) { return (x + (1 << (n - 1))) >> n; }
+
+// Motion cost of one vector difference in bits (rough model of the AV1 MV class coding).
+__device__ __forceinline__ float mvCompBits(int d) {
+    if (!d) return 0.f;
+    const float a = fabsf((float)d) * 0.125f;   // pixels
+    return 2.5f + 2.0f * __log2f(1.f + 2.f * a);
+}
+__device__ __forceinline__ float mvBits(Mv mv, Mv pred) {
+    const int dr = mv.row - pred.row, dc = mv.col - pred.col;
+    if (!dr && !dc) return 1.0f;
+    return 3.0f + mvCompBits(dr) + mvCompBits(dc);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Exact AV1 single-reference inter prediction (spec 7.11.3.3 / 7.11.3.4, unscaled reference, regular
+// eight-tap filter; blocks of width or height 4 use the four-tap variant). One warp predicts a w x h block.
+// tmp holds (h + 7) * w intermediate values.
+__device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, int w, int h, Mv mv, int sub,
+                            int16_t *tmp, uint8_t *out) {
+    const int lane = threadIdx.x & 31;
+    const int X = (x0 << 4) + ((2 * mv.col) >> sub);
+    const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
+    const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
+    const int fh = w <= 4 ? 4 : 0, fv = h <= 4 ? 4 : 0;
+    const int lastX = pw - 1, lastY = ph - 1;
+    if (!fx && !fy) {
+        for (int i = lane; i < w * h; i += 32) {
+            const int r = i / w, c = i - r * w;
+            out[i] = ref[min(max(iy + r, 0), lastY) * pw + min(max(ix + c, 0), lastX)];
+        }
+        __syncwarp();
+        return;
+    }
+    const int ih = h + 7;
+    for (int i = lane; i < ih * w; i += 32) {
+        const int r = i / w, c = i - r * w;
+        const uint8_t *row = ref + min(max(iy + r - 3, 0), lastY) * pw;
+        int s = 0;
+#pragma unroll
+        for (int t = 0; t < 8; t++) s += c_filter[fh][fx][t] * row[min(max(ix + c + t - 3, 0), lastX)];
+        tmp[i] = (int16_t)round2(s, 3);
+    }
+    __syncwarp();
+    for (int i = lane; i < w * h; i += 32) {
+        const int r = i / w, c = i - r * w;
+        int s = 0;
+#pragma unroll
+        for (int t = 0; t < 8; t++) s += c_filter[fv][fy][t] * tmp[(r + t) * w + c];
+        out[i] = (uint8_t)min(max(round2(s, 11), 0), 255);
+    }
+    __syncwarp();
+}
+
+// SAD of a full-pel displacement (lanes over pixels). Out-of-frame reference samples are clamped.
+template <int N>
+__device__ int warpSadFull(const uint8_t *src, int pitch, const uint8_t *ref, int w, int h, int x0, int y0, int dx,
+                           int dy) {
+    const int lane = threadIdx.x & 31;
+    int s = 0;
+    for (int i = lane; i < N * N; i += 32) {
+        const int r = i / N, c = i - r * N;
+        const int x = x0 + c, y = y0 + r;
+        if (x >= w || y >= h) continue;
+        const int rx = min(max(x + dx, 0), w - 1), ry = min(max(y + dy, 0), h - 1);
+        s += abs((int)src[y * pitch + x] - (int)ref[ry * w + rx]);
+    }
+    return warp_sumi(s);
+}
+
+__device__ int warpSadPred(const uint8_t *src, int pitch, const uint8_t *pred, int n, int w, int h, int x0, int y0) {
+    const int lane = threadIdx.x & 31;
+    int s = 0;
+    for (int i = lane; i < n * n; i += 32) {
+        const int r = i / n, c = i - r * n;
+        if (x0 + c >= w || y0 + r >= h) continue;
+        s += abs((int)src[(y0 + r) * pitch + x0 + c] - (int)pred[i]);
+    }
+    return warp_sumi(s);
+}
+
+// ------------------------------------------------------------------------------------------------
+__global__ void downsample4(const uint8_t *src, int pitch, int w, int h, uint8_t *dst, int dw, int dh) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    int s = 0;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) s += src[min(4 * y + r, h - 1) * pitch + min(4 * x + c, w - 1)];
+    dst[y * dw + x] = (uint8_t)((s + 8) >> 4);
+}
+
+// Exhaustive search of 8x8 blocks on the quarter-resolution luma (32x32 full-resolution areas).
+constexpr int kCoarseWarps = 4;
+constexpr int kCoarseMaxR = 24;
+__global__ void coarseSearch(const uint8_t *cur, const uint8_t *ref, int dw, int dh, int R, int cols, int rows,
+                             float lambda, Mv *out) {
+    __shared__ uint8_t win[kCoarseWarps][(8 + 2 * kCoarseMaxR) * (8 + 2 * kCoarseMaxR)];
+    __shared__ uint8_t blk[kCoarseWarps][64];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int b = blockIdx.x * kCoarseWarps + warp;
+    if (b >= cols * rows) return;
+    const int bx = b % cols, by = b / cols, x0 = bx * 8, y0 = by * 8;
+    const int ws = 8 + 2 * R;
+    for (int i = lane; i < 64; i += 32)
+        blk[warp][i] = cur[min(y0 + i / 8, dh - 1) * dw + min(x0 + i % 8, dw - 1)];
+    for (int i = lane; i < ws * ws; i += 32) {
+        const int r = i / ws, c = i - r * ws;
+        win[warp][i] = ref[min(max(y0 - R + r, 0), dh - 1) * dw + min(max(x0 - R + c, 0), dw - 1)];
+    }
+    __syncwarp();
+    const int side = 2 * R + 1;
+    float best = kInf;
+    int bestIdx = R * side + R;
+    for (int k = lane; k < side * side; k += 32) {
+        const int dy = k / side, dx = k - dy * side;
+        int s = 0;
+        for (int r = 0; r < 8; r++)
+            for (int c = 0; c < 8; c++) s += abs((int)blk[warp][r * 8 + c] - (int)win[warp][(dy + r) * ws + dx + c]);
+        const float cost = (float)s + lambda * (float)(abs(dx - R) + abs(dy - R));
+        if (cost < best || (cost == best && k < bestIdx)) { best = cost; bestIdx = k; }
+    }
+    for (int o = 16; o; o >>= 1) {
+        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bestIdx, o);
+        if (ob < best || (ob == best && oi < bestIdx)) { best = ob; bestIdx = oi; }
+    }
+    if (!lane) {
+        const int dy = bestIdx / side - R, dx = bestIdx % side - R;
+        out[b] = Mv{(int16_t)(dy * 4 * 8), (int16_t)(dx * 4 * 8)};
+    }
+}
+
+// Per-size motion refinement from coarse, parent, temporal and zero candidates: full-pel search, then half
+// and quarter sample steps with the exact interpolation filter. ref r > 0 replaces a candidate only if cheaper.
+template <int N>
+struct RefineCfg {
+    static constexpr int warps = N >= 64 ? 1 : N >= 32 ? 2 : 4;
+    static constexpr int tmp = (N + 7) * N;
+};
+template <int N>
+__global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int refIdx, const Mv *coarse, int ccols,
+                                                                  int crows, const Cand *parent, int pcols,
+                                                                  const BlockInfo *temporal, int tcols, Cand *out,
+                                                                  int cols, int rows, float lambda) {
+    constexpr int W = RefineCfg<N>::warps;
+    __shared__ int16_t tmpS[W][RefineCfg<N>::tmp];
+    __shared__ uint8_t predS[W][N * N];
+    const int warp = threadIdx.x >> 5;
+    const int b = blockIdx.x * W + warp;
+    if (b >= cols * rows) return;
+    const int bx = b % cols, by = b / cols, x0 = bx * N, y0 = by * N;
+    Cand &o = out[b];
+    if (x0 >= f.w || y0 >= f.h) {
+        if (refIdx == 0 && (threadIdx.x & 31) == 0) { o = Cand{}; o.searchCost = kInf; }
+        return;
+    }
+    const uint8_t *ref = f.ref[refIdx];
+    const uint8_t *src = f.src[0];
+    const int pitch = f.pitch[0];
+    // candidates (full-pel)
+    int cand[12][2], n = 0;
+    auto add = [&](Mv m) {
+        cand[n][0] = (m.row + (m.row >= 0 ? 4 : -4)) / 8;
+        cand[n][1] = (m.col + (m.col >= 0 ? 4 : -4)) / 8;
+        n++;
+    };
+    const int cx = min((x0 + N / 2) / 32, ccols - 1), cy = min((y0 + N / 2) / 32, crows - 1);
+    const Mv center = coarse[cy * ccols + cx];
+    add(center);
+    add(Mv{0, 0});
+    if (cx > 0) add(coarse[cy * ccols + cx - 1]);
+    if (cx + 1 < ccols) add(coarse[cy * ccols + cx + 1]);
+    if (cy > 0) add(coarse[(cy - 1) * ccols + cx]);
+    if (cy + 1 < crows) add(coarse[(cy + 1) * ccols + cx]);
+    Mv pred = center;
+    if (parent) {
+        const Cand &p = parent[(y0 / (2 * N)) * pcols + x0 / (2 * N)];
+        add(p.mv);
+        pred = p.mv;
+    }
+    if (temporal) add(temporal[(y0 / 8) * tcols + x0 / 8].mv);
+    float best = kInf;
+    int bdx = 0, bdy = 0;
+    auto evalFull = [&](int dx, int dy) {
+        const int s = warpSadFull<N>(src, pitch, ref, f.w, f.h, x0, y0, dx, dy);
+        const float c = (float)s + lambda * mvBits(Mv{(int16_t)(dy * 8), (int16_t)(dx * 8)}, pred);
+        if (c < best) { best = c; bdx = dx; bdy = dy; }
+    };
+    for (int i = 0; i < n; i++) evalFull(cand[i][1], cand[i][0]);
+    for (int pass = 0; pass < 2; pass++) {
+        const int cdx = bdx, cdy = bdy;
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++)
+                if (dx || dy) evalFull(cdx + dx, cdy + dy);
+        if (bdx == cdx && bdy == cdy) break;
+    }
+    // sub-sample refinement (1/8 units: half = 4, quarter = 2)
+    Mv bm{(int16_t)(bdy * 8), (int16_t)(bdx * 8)};
+    float bc = best;
+    for (int step = 4; step >= 2; step >>= 1) {
+        const Mv c0 = bm;
+        for (int k = 0; k < 9; k++) {
+            if (k == 4) continue;
+            const Mv m{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)};
+            if (abs(m.row) >= (1 << 14) - 8 || abs(m.col) >= (1 << 14) - 8) continue;
+            warpPredict(ref, f.w, f.h, x0, y0, N, N, m, 0, tmpS[warp], predS[warp]);
+            const int s = warpSadPred(src, pitch, predS[warp], N, f.w, f.h, x0, y0);
+            const float c = (float)s + lambda * mvBits(m, pred);
+            if (c < bc) { bc = c; bm = m; }
+        }
+    }
+    if ((threadIdx.x & 31) == 0) {
+        if (refIdx == 0 || bc + lambda * 1.5f < o.searchCost) {
+            o.mv = bm;
+            o.ref = (uint8_t)refIdx;
+            o.searchCost = bc + (refIdx ? lambda * 1.5f : 0.f);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Exact inverse transform + add (DCT_DCT, square N <= 32), warp-cooperative. Halves the levels while the
+// coefficients violate the conformance ranges. recon = Clip1(pred + residual).
+template <int LN>
+__device__ void warpInverseAdd(int16_t *q, int txSz, int dcQ, int acQ, int16_t *res, const uint8_t *pred, uint8_t *recon) {
+    constexpr int N = 1 << LN;
+    const int lane = threadIdx.x & 31;
+    const int den = av1g_dq_denom(txSz);
+    const int rk = av1g_row_kind(AV1G_DCT_DCT), ck = av1g_col_kind(AV1G_DCT_DCT);
+    const int rowShift = AV1G_T(Transform_Row_Shift)[txSz];
+    for (;;) {
+        int any = 0;
+        for (int i = lane; i < N * N; i += 32) any |= q[i];
+        if (!__any_sync(0xffffffffu, any)) {
+            for (int i = lane; i < N * N; i += 32) recon[i] = pred[i];
+            __syncwarp();
+            return;
+        }
+        uint32_t err = 0;
+        for (int i = lane; i < N; i += 32) err |= rci::row<LN, 8>(i, N, N, q, dcQ, acQ, nullptr, den, false, rk, rowShift, res);
+        __syncwarp();
+        for (int j = lane; j < N; j += 32) err |= rci::col<LN>(j, N, ck, res);
+        __syncwarp();
+        if (!__any_sync(0xffffffffu, err != 0)) break;
+        for (int i = lane; i < N * N; i += 32) q[i] = (int16_t)(q[i] / 2);
+        __syncwarp();
+    }
+    for (int i = lane; i < N * N; i += 32) recon[i] = (uint8_t)min(max((int)pred[i] + res[i], 0), 255);
+    __syncwarp();
+}
+
+template <int N>
+struct EvalCfg {
+    static constexpr int warps = N >= 64 ? 1 : N >= 32 ? 1 : N >= 16 ? 2 : 4;
+};
+
+struct EvalArgs {
+    Frame f;
+    Cand *cand;
+    int cols, rows;
+    uint8_t *pred, *recon;   // per-size frame-sized buffers (tight YUV420)
+    int16_t *levels;          // per-size tile-layout levels (aligned planes)
+    int qindex, qctx;
+    float lambda, rnd, zbin;
+};
+
+// Evaluate skip and coded options of every block of size N.
+template <int N>
+__global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
+    constexpr int W = EvalCfg<N>::warps;
+    constexpr int NC = N / 2;
+    constexpr bool coded = N <= 32;
+    constexpr int TN = coded ? N : 1, TC = coded ? NC : 1;
+    __shared__ int16_t interp[W][(N + 7) * N];
+    __shared__ uint8_t predS[W][N * N + 2 * NC * NC];
+    __shared__ uint8_t recS[W][coded ? N * N : 1];
+    __shared__ int16_t resS[W][TN * TN];
+    __shared__ float tmpS[W][TN * (TN + 1)];
+    __shared__ int16_t qS[W][TN * TN];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int b = blockIdx.x * W + warp;
+    if (b >= a.cols * a.rows) return;
+    Cand &c = a.cand[b];
+    const int bx = b % a.cols, by = b / a.cols, x0 = bx * N, y0 = by * N;
+    const Frame &f = a.f;
+    if (x0 >= f.w || y0 >= f.h) {
+        if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; }
+        return;
+    }
+    const uint8_t *ref = f.ref[c.ref];
+    const int cw = f.w >> 1, chh = f.h >> 1;
+    const size_t ysz = size_t(f.w) * f.h, csz = size_t(cw) * chh;
+    const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
+    float dSkip = 0.f, dCoded = 0.f, bits = 0.f;
+    bool nz = false;
+    for (int p = 0; p < 3; p++) {
+        const int sub = p > 0, n = p ? NC : N;
+        const int pw = p ? cw : f.w, ph = p ? chh : f.h;
+        const int px = x0 >> sub, py = y0 >> sub;
+        uint8_t *pred = predS[warp] + (p ? N * N + (p - 1) * NC * NC : 0);
+        const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
+        warpPredict(refP, pw, ph, px, py, n, n, c.mv, sub, interp[warp], pred);
+        const uint8_t *src = f.src[p];
+        const int pitch = f.pitch[p];
+        int sse = 0;
+        for (int i = lane; i < n * n; i += 32) {
+            const int r = i / n, col = i - r * n;
+            if (px + col >= pw || py + r >= ph) continue;
+            const int d = (int)src[(py + r) * pitch + px + col] - pred[i];
+            sse += d * d;
+        }
+        sse = warp_sumi(sse);
+        dSkip += (float)sse;
+        // store the prediction (skip reconstruction)
+        uint8_t *outPred = a.pred + (p ? ysz + (p - 1) * csz : 0);
+        for (int i = lane; i < n * n; i += 32) {
+            const int r = i / n, col = i - r * n;
+            if (px + col < pw && py + r < ph) outPred[(py + r) * pw + px + col] = pred[i];
+        }
+        if constexpr (coded) {
+            const int tn = n;
+            int16_t *res = resS[warp];
+            float energy = 0.f;
+            for (int i = lane; i < tn * tn; i += 32) {
+                const int r = i / tn, col = i - r * tn;
+                int d = 0;
+                if (px + col < pw && py + r < ph) d = (int)src[(py + r) * pitch + px + col] - pred[i];
+                res[i] = (int16_t)d;
+                energy += (float)(d * d);
+            }
+            __syncwarp();
+            const int txSz = tn == 4 ? AV1G_TX_4X4 : tn == 8 ? AV1G_TX_8X8 : tn == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
+            EvalIn e{};
+            e.txSz = txSz; e.txType = AV1G_DCT_DCT; e.plane = p;
+            e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
+            e.rnd = a.rnd; e.zbin = a.zbin;
+            e.skipCtx = p ? 7 : 0; e.dcCtx = 0; e.intraDir = 0; e.reduced = 1;
+            e.C = g_cost[a.qctx];
+            e.resEnergy = warp_sum(energy);
+            e.qmDist = 0; e.qmRnd = 0;
+            EvalOut o;
+            int16_t *q = qS[warp];
+            warp_fwd_rt(res, tmpS[warp], tn, tn, txSz, AV1G_DCT_DCT);
+            warp_quant_rate_rt<8>(tmpS[warp], q, e, o, tn, tn);
+            bits += o.R;
+            uint8_t *rec = recS[warp];
+            switch (tn) {
+            case 4: warpInverseAdd<2>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            case 8: warpInverseAdd<3>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            case 16: warpInverseAdd<4>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            default: warpInverseAdd<5>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            }
+            int any = 0;
+            for (int i = lane; i < tn * tn; i += 32) any |= q[i];
+            nz = nz || __any_sync(0xffffffffu, any);
+            int sseC = 0;
+            uint8_t *outRec = a.recon + (p ? ysz + (p - 1) * csz : 0);
+            for (int i = lane; i < tn * tn; i += 32) {
+                const int r = i / tn, col = i - r * tn;
+                if (px + col >= pw || py + r >= ph) continue;
+                const int d = (int)src[(py + r) * pitch + px + col] - rec[i];
+                sseC += d * d;
+                outRec[(py + r) * pw + px + col] = rec[i];
+            }
+            dCoded += (float)warp_sumi(sseC);
+            // levels, tile layout of the aligned plane
+            const int apw = p ? f.aw / 2 : f.aw;
+            const size_t base = p ? size_t(f.aw) * f.ah + size_t(p - 1) * (f.aw / 2) * (f.ah / 2) : 0;
+            int16_t *dst = a.levels + base + (size_t(py / tn) * (apw / tn) + px / tn) * tn * tn;
+            for (int i = lane; i < tn * tn; i += 32) dst[i] = q[i];
+            __syncwarp();
+        }
+    }
+    if (!lane) {
+        // mode + vector bits: the search cost already holds lambda_sad * mv bits; approximate in bits here
+        const float modeBits = 4.f;
+        const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
+        c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
+        c.costCoded = coded ? dCoded + a.lambda * (modeBits + skipFlag0 + bits) : kInf;
+        c.nz = nz;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Bottom-up partition choice per 64x64 superblock (one thread each).
+struct DecideArgs {
+    const Cand *cand[kSizes];
+    int cols[kSizes];
+    int w, h;
+    int gcols;            // 8x8 grid columns (aligned width / 8)
+    BlockInfo *grid;
+    float lambda;
+    float partBits[kSizes][2];   // [size][0: none, 1: split]
+};
+
+__device__ float decideNode(const DecideArgs &a, int x, int y, int s, bool write) {
+    const int n = 8 << s;
+    if (x >= a.w || y >= a.h) return 0.f;
+    const bool hasRows = y + n / 2 < a.h, hasCols = x + n / 2 < a.w;
+    const bool canNone = (hasRows && hasCols) || s == 0;
+    float none = kInf;
+    int noneSkip = 1;
+    const Cand *c = nullptr;
+    if (canNone) {
+        c = &a.cand[s][(y / n) * a.cols[s] + x / n];
+        const float coded = c->nz ? c->costCoded : kInf;
+        noneSkip = !(coded < c->costSkip);
+        none = (noneSkip ? c->costSkip : coded) + a.lambda * a.partBits[s][0];
+    }
+    float split = kInf;
+    if (s > 0) {
+        split = a.lambda * a.partBits[s][1];
+        for (int k = 0; k < 4; k++) split += decideNode(a, x + (k & 1) * n / 2, y + (k >> 1) * n / 2, s - 1, false);
+    }
+    const bool useNone = none <= split;
+    if (write) {
+        if (useNone) {
+            BlockInfo bi{};
+            bi.mv = c->mv;
+            bi.log2 = (uint8_t)(3 + s);
+            bi.skip = (uint8_t)noneSkip;
+            bi.ref = c->ref;
+            for (int yy = y / 8; yy < (y + n) / 8; yy++)
+                for (int xx = x / 8; xx < (x + n) / 8; xx++) a.grid[yy * a.gcols + xx] = bi;
+        } else {
+            for (int k = 0; k < 4; k++) decideNode(a, x + (k & 1) * n / 2, y + (k >> 1) * n / 2, s - 1, true);
+        }
+    }
+    return useNone ? none : split;
+}
+
+__global__ void decide(DecideArgs a, int sbCols, int sbRows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= sbCols * sbRows) return;
+    const int x = (i % sbCols) * 64, y = (i / sbCols) * 64;
+    // clear the superblock (units outside every coded block keep log2 = 0)
+    for (int yy = y / 8; yy < y / 8 + 8; yy++)
+        for (int xx = x / 8; xx < x / 8 + 8; xx++) a.grid[yy * a.gcols + xx] = BlockInfo{};
+    decideNode(a, x, y, 3, true);
+}
+
+// Gather the chosen reconstruction and levels.
+struct CommitArgs {
+    const BlockInfo *grid;
+    int gcols, w, h, aw, ah;
+    const uint8_t *pred[kSizes], *recon[3];
+    const int16_t *levels[3];
+    uint8_t *out;
+    int16_t *outLevels;
+};
+__global__ void commit(CommitArgs a) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int p = blockIdx.z, sub = p > 0;
+    const int apw = a.aw >> sub, aph = a.ah >> sub;
+    if (x >= apw || y >= aph) return;
+    const BlockInfo bi = a.grid[((y << sub) / 8) * a.gcols + ((x << sub) / 8)];
+    const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
+    int16_t level = 0;
+    if (bi.log2 && !bi.skip) {
+        const int s = bi.log2 - 3, t = (8 << s) >> sub;
+        const int tx = x / t, ty = y / t;
+        level = a.levels[s][lbase + (size_t(ty) * (apw / t) + tx) * t * t + (y - ty * t) * t + (x - tx * t)];
+    }
+    a.outLevels[lbase + size_t(y) * apw + x] = level;
+    const int pw = a.w >> sub, ph = a.h >> sub;
+    if (x >= pw || y >= ph) return;
+    const size_t off = (p ? size_t(a.w) * a.h + size_t(p - 1) * pw * ph : 0) + size_t(y) * pw + x;
+    const int s = bi.log2 - 3;
+    a.out[off] = bi.skip ? a.pred[s][off] : a.recon[s][off];
+}
+
+struct State {
+    uint8_t *ds[1 + kMaxRefs] = {};
+    Mv *coarse[kMaxRefs] = {};
+    Cand *cand[kSizes] = {};
+    uint8_t *pred[kSizes] = {}, *recon[3] = {};
+    int16_t *levels[3] = {}, *outLevels = nullptr;
+    BlockInfo *grid = nullptr, *prevGrid = nullptr;
+    bool havePrev = false;
+    int dw = 0, dh = 0, ccols = 0, crows = 0;
+    int cols[kSizes] = {}, rows[kSizes] = {};
+    int gcols = 0, grows = 0;
+    bool tablesReady = false;
+};
+
+}  // namespace
+
+Analyzer::~Analyzer() {
+    auto *s = static_cast<State *>(state);
+    if (!s) return;
+    for (auto *p : s->ds) cudaFree(p);
+    for (auto *p : s->coarse) cudaFree(p);
+    for (auto *p : s->cand) cudaFree(p);
+    for (auto *p : s->pred) cudaFree(p);
+    for (auto *p : s->recon) cudaFree(p);
+    for (auto *p : s->levels) cudaFree(p);
+    cudaFree(s->outLevels);
+    cudaFree(s->grid);
+    cudaFree(s->prevGrid);
+    delete s;
+}
+
+int Analyzer::init(int width, int height, char *err, int errLen) {
+    if (width < 16 || height < 16 || width % 8 || height % 8) {
+        snprintf(err, errLen, "P-frame analysis requires dimensions that are multiples of 8 and at least 16");
+        return -1;
+    }
+    w = width; h = height;
+    aw = (w + 63) & ~63; ah = (h + 63) & ~63;
+    auto *s = new State;
+    state = s;
+    cudaError_t e = cudaSuccess;
+    auto alloc = [&](auto **p, size_t bytes) {
+        if (e == cudaSuccess) e = cudaMalloc((void **)p, bytes);
+        if (e == cudaSuccess) e = cudaMemset(*p, 0, bytes);
+    };
+    s->dw = (w + 3) / 4; s->dh = (h + 3) / 4;
+    for (auto *&p : s->ds) alloc(&p, size_t(s->dw) * s->dh);
+    s->ccols = (s->dw + 7) / 8; s->crows = (s->dh + 7) / 8;
+    for (auto *&p : s->coarse) alloc(&p, sizeof(Mv) * s->ccols * s->crows);
+    const size_t frame = size_t(w) * h * 3 / 2, aframe = size_t(aw) * ah * 3 / 2;
+    for (int k = 0; k < kSizes; k++) {
+        const int n = 8 << k;
+        s->cols[k] = aw / n; s->rows[k] = ah / n;
+        alloc(&s->cand[k], sizeof(Cand) * s->cols[k] * s->rows[k]);
+        alloc(&s->pred[k], frame);
+        if (k < 3) {
+            alloc(&s->recon[k], frame);
+            alloc(&s->levels[k], aframe * sizeof(int16_t));
+        }
+    }
+    alloc(&s->outLevels, aframe * sizeof(int16_t));
+    s->gcols = aw / 8; s->grows = ah / 8;
+    alloc(&s->grid, sizeof(BlockInfo) * s->gcols * s->grows);
+    alloc(&s->prevGrid, sizeof(BlockInfo) * s->gcols * s->grows);
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "P-frame allocation: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    if (gp_upload_tables_pframe(gp_host_tables())) {
+        snprintf(err, errLen, "P-frame table upload failed");
+        return -1;
+    }
+    return 0;
+}
+
+int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
+                      const Settings &st, uint8_t *recon, std::vector<BlockInfo> &info, std::vector<int16_t> &levels,
+                      char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    const auto t0 = std::chrono::steady_clock::now();
+    refCount = refCount < 1 ? 1 : refCount > kMaxRefs ? kMaxRefs : refCount;
+    Frame f{};
+    for (int p = 0; p < 3; p++) { f.src[p] = src[p]; f.pitch[p] = pitch[p]; }
+    for (int r = 0; r < refCount; r++) f.ref[r] = refs[r];
+    f.w = w; f.h = h; f.aw = aw; f.ah = ah;
+    const float lambda = gp_lambda<8>(st.qindex, st.lambdaMul);
+    const float lambdaSad = sqrtf(lambda);
+    const dim3 t16(16, 16);
+    const dim3 gds((s->dw + 15) / 16, (s->dh + 15) / 16);
+    downsample4<<<gds, t16>>>(src[0], pitch[0], w, h, s->ds[0], s->dw, s->dh);
+    const int R = std::min(kCoarseMaxR, std::max(2, st.searchRange / 4));
+    const int nCoarse = s->ccols * s->crows;
+    for (int r = 0; r < refCount; r++) {
+        downsample4<<<gds, t16>>>(refs[r], w, w, h, s->ds[1 + r], s->dw, s->dh);
+        coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps>>>(
+            s->ds[0], s->ds[1 + r], s->dw, s->dh, R, s->ccols, s->crows, lambdaSad * 0.5f, s->coarse[r]);
+    }
+    const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
+    for (int r = 0; r < refCount; r++) {
+#define PF_REFINE(K, N)                                                                                         \
+    refine<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                      \
+                32 * RefineCfg<N>::warps>>>(f, r, s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
+                                            K == 3 ? 0 : s->cols[K + 1], temporal, s->gcols, s->cand[K], s->cols[K],  \
+                                            s->rows[K], lambdaSad)
+        PF_REFINE(3, 64);
+        PF_REFINE(2, 32);
+        PF_REFINE(1, 16);
+        PF_REFINE(0, 8);
+#undef PF_REFINE
+    }
+    EvalArgs ea{};
+    ea.f = f;
+    ea.qindex = st.qindex;
+    ea.qctx = av1g_coeff_cdf_q_ctx(st.qindex);
+    ea.lambda = lambda;
+    ea.rnd = st.rnd; ea.zbin = st.zbin;
+#define PF_EVAL(K, N)                                                                                           \
+    ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
+    ea.pred = s->pred[K]; ea.recon = K < 3 ? s->recon[K] : nullptr; ea.levels = K < 3 ? s->levels[K] : nullptr; \
+    evaluate<N><<<(s->cols[K] * s->rows[K] + EvalCfg<N>::warps - 1) / EvalCfg<N>::warps, 32 * EvalCfg<N>::warps>>>(ea)
+    PF_EVAL(0, 8);
+    PF_EVAL(1, 16);
+    PF_EVAL(2, 32);
+    PF_EVAL(3, 64);
+#undef PF_EVAL
+    DecideArgs da{};
+    for (int k = 0; k < kSizes; k++) { da.cand[k] = s->cand[k]; da.cols[k] = s->cols[k]; }
+    da.w = w; da.h = h; da.gcols = s->gcols; da.grid = s->grid; da.lambda = lambda;
+    // approximate partition symbol costs (bits)
+    const float part[kSizes][2] = {{1.0f, 0.f}, {1.0f, 2.5f}, {1.0f, 2.5f}, {1.0f, 2.0f}};
+    memcpy(da.partBits, part, sizeof part);
+    const int sbCols = aw / 64, sbRows = ah / 64;
+    decide<<<(sbCols * sbRows + 63) / 64, 64>>>(da, sbCols, sbRows);
+    CommitArgs ca{};
+    ca.grid = s->grid; ca.gcols = s->gcols; ca.w = w; ca.h = h; ca.aw = aw; ca.ah = ah;
+    for (int k = 0; k < kSizes; k++) ca.pred[k] = s->pred[k];
+    for (int k = 0; k < 3; k++) { ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k]; }
+    ca.out = recon;
+    ca.outLevels = s->outLevels;
+    commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);
+    cudaError_t e = cudaGetLastError();
+    info.resize(size_t(s->gcols) * s->grows);
+    levels.resize(size_t(aw) * ah * 3 / 2);
+    if (e == cudaSuccess) e = cudaMemcpy(info.data(), s->grid, info.size() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) e = cudaMemcpy(levels.data(), s->outLevels, levels.size() * sizeof(int16_t), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) e = cudaMemcpy(s->prevGrid, s->grid, info.size() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "P-frame analysis: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    s->havePrev = true;
+    elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return 0;
+}
+
+}  // namespace pf

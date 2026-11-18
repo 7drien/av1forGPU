@@ -2,6 +2,7 @@
 // all AV1 decisions, reconstruction, filters, and entropy coding use the CUDA backend.
 #include "presets.h"
 #include "inter_packet.h"
+#include "pframe_writer.h"
 
 #include <cuda_runtime.h>
 
@@ -58,7 +59,7 @@ static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--pf-qindex N] [--pf-lambda X]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -72,6 +73,9 @@ int main(int argc, char **argv) {
     bool rolling = false, useResiduals = false, luma8 = false, adaptiveTx = false;
     bool autoMotionStep = false, persistentCdf = false;
     bool interRdoq = false;
+    bool usePframes = false;
+    pf::Settings pfSettings;
+    int pfQindex = 0;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
     unsigned anchorInterval = 0;
@@ -138,6 +142,22 @@ int main(int argc, char **argv) {
             modeCount = MotionModes;
         } else if (!strcmp(argv[i], "--auto-motion-step")) {
             autoMotionStep = true;
+        } else if (!strcmp(argv[i], "--pframes")) {
+            usePframes = temporal = true;
+        } else if (!strcmp(argv[i], "--pf-qindex") && i + 1 < argc) {
+            char *end;
+            long value = strtol(argv[++i], &end, 10);
+            if (*end || value < 1 || value > 255) {
+                fprintf(stderr, "P-frame qindex must be an integer from 1 to 255\n");
+                return 2;
+            }
+            pfQindex = static_cast<int>(value);
+        } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
+            pfSettings.lambdaMul = strtof(argv[++i], nullptr);
+            if (!(pfSettings.lambdaMul > 0.f && pfSettings.lambdaMul < 100.f)) {
+                fprintf(stderr, "P-frame lambda multiplier must be in (0, 100)\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--persistent-cdf")) {
             persistentCdf = true;
         } else if (!strcmp(argv[i], "--motion-block") && i + 1 < argc) {
@@ -222,8 +242,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "smaller motion blocks require --inter-qindex and --rolling-reference\n");
         return 2;
     }
-    if (persistentCdf && (!interQindex || !rolling || adaptiveFps)) {
+    if (persistentCdf && !usePframes && (!interQindex || !rolling || adaptiveFps)) {
         fprintf(stderr, "--persistent-cdf requires quantized inter frames and a rolling reference\n");
+        return 2;
+    }
+    if (usePframes && (w % 8 || h % 8 || w < 16 || h < 16 || adaptiveFps || useResiduals || rolling || useAnchor)) {
+        fprintf(stderr, "--pframes requires dimensions divisible by eight, fixed frame timing, and no other inter mode\n");
         return 2;
     }
     if (autoMotionStep && (!canPredict || adaptiveFps)) {
@@ -256,6 +280,18 @@ int main(int argc, char **argv) {
     if (rolling && cudaMalloc(&nextReference, ySize*3/2) != cudaSuccess) {
         fprintf(stderr, "cannot allocate rolling reference\n");
         return 1;
+    }
+    FILE *reconDump = getenv("AV1GPU_DUMP_RECON") ? fopen(getenv("AV1GPU_DUMP_RECON"), "wb") : nullptr;
+    pf::Analyzer pfAnalyzer;
+    std::unique_ptr<pfw::Writer> pfWriter;
+    pfw::EntropyState pfEntropy;
+    std::vector<pf::BlockInfo> pfInfo;
+    std::vector<int16_t> pfLevels;
+    double pfMs = 0;
+    uint64_t pfModes[4] = {};
+    if (usePframes) {
+        if (!reference && cudaMalloc(&reference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
+        if (!nextReference && cudaMalloc(&nextReference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
     }
     if (useAnchor && cudaMalloc(&anchor, ySize*3/2) != cudaSuccess) {
         fprintf(stderr, "anchor reference allocation failed\n");
@@ -299,6 +335,12 @@ int main(int argc, char **argv) {
     GpEncoder encoder;
     std::string err;
     if (encoder.init(cfg, err)) { fprintf(stderr, "encoder init: %s\n", err.c_str()); return 1; }
+    if (usePframes) {
+        char perr[256];
+        if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+        pfWriter.reset(new pfw::Writer(w, h, pfAnalyzer.alignedWidth(), pfAnalyzer.alignedHeight()));
+        pfSettings.qindex = pfQindex ? pfQindex : cfg.qindex;
+    }
 
     std::vector<uint8_t> src, padded[3];
     uint64_t frameCount = 0;
@@ -325,6 +367,41 @@ int main(int argc, char **argv) {
             inputs.push_back(in);
         }
         if (inputs.empty()) break;
+        if (usePframes && frameCount && frameCount - lastKey < keyInterval) {
+            const uint8_t *refs[1] = {reference};
+            const int pitches[3] = {aw, acw, acw};
+            char perr[256];
+            if (pfAnalyzer.analyze(inputs[0].dsrc, pitches, refs, 1, pfSettings, nextReference, pfInfo, pfLevels,
+                                   perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
+            pfMs += pfAnalyzer.lastMs();
+            pfw::FrameParams fp;
+            fp.qindex = pfSettings.qindex;
+            fp.refreshFlags = 1;
+            fp.persistent = persistentCdf;
+            fp.grain = grain;
+            fp.grainSeed = uint16_t(7391 + frameCount * 31847);
+            std::vector<uint8_t> obu;
+            try {
+                obu = pfWriter->frame(fp, pfInfo, pfLevels, pfEntropy);
+            } catch (const std::exception &ex) {
+                fprintf(stderr, "P-frame syntax: %s\n", ex.what());
+                return 1;
+            }
+            for (int k = 0; k < 4; ++k) pfModes[k] += pfWriter->modeCount[k];
+            if (!write_ivf_frame(outFile, obu, frameCount)) return 1;
+            std::swap(reference, nextReference);
+            if (reconDump) {
+                std::vector<uint8_t> host(ySize * 3 / 2);
+                cudaMemcpy(host.data(), reference, host.size(), cudaMemcpyDeviceToHost);
+                fwrite(host.data(), 1, host.size(), reconDump);
+            }
+            lastWritten = frameCount;
+            ++predicted; ++frameCount;
+            continue;
+        }
         if (canPredict && frameCount && frameCount-lastKey < keyInterval) {
             if (autoMotionStep) {
                 auto status = chooseMotionStep(inputs[0].dsrc[0], reference, anchor, w, h, aw,
@@ -440,6 +517,15 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "write frame: %s\n", err.c_str());
                 return 1;
             }
+            if (usePframes) {
+                lastWritten = lastKey = frameCount;
+                pfEntropy.ready = false;
+                if (reconDump) {
+                    std::vector<uint8_t> host(ySize * 3 / 2);
+                    cudaMemcpy(host.data(), reference, host.size(), cudaMemcpyDeviceToHost);
+                    fwrite(host.data(), 1, host.size(), reconDump);
+                }
+            }
             if(canPredict) {
                 if (useAnchor && cudaMemcpy(anchor, reference, ySize*3/2, cudaMemcpyDeviceToDevice) != cudaSuccess) {
                     fprintf(stderr, "anchor reference copy failed\n");
@@ -462,6 +548,10 @@ int main(int argc, char **argv) {
     if (sceneCutRms) fprintf(stderr, "scene cut keyframes %llu\n", (unsigned long long)sceneCuts);
     if(temporal) fprintf(stderr,"inter frames %llu, keyframes %llu\n",(unsigned long long)predicted,
                          (unsigned long long)(frameCount-predicted));
+    if (usePframes)
+        fprintf(stderr, "P-frame analysis %.1f ms; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
+                (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],
+                (unsigned long long)pfModes[3]);
     if (adaptiveTx)
         fprintf(stderr, "8x8 luma candidates selected %llu of %llu inter blocks\n",
                 (unsigned long long)largerTransforms,
