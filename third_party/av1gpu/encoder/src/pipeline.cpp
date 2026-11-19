@@ -218,6 +218,19 @@ int gp_check_partitions(const GpParams &P, std::string &err) {
     return -1;
 }
 
+int GpEncoder::setQindex(int qindex, std::string &err) {
+    if (qindex < 1 || qindex > 255) { err = "qindex out of range"; return -1; }
+    if (qindex == cfg_.qindex) return 0;
+    cfg_.qindex = qindex;
+    if (cfg_.vb && vbLuts_) {
+        if (gp_vb_lut_row(vbLuts_, cfg_.qindex, cfg_.vbStrength, 8, 0) || cudaDeviceSynchronize() != cudaSuccess) {
+            err = "variance-boost LUT update failed";
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int GpEncoder::init(const GpConfig &cfg, std::string &err) {
     cfg_ = cfg;
     // candidate counts clamped as av1gpu's parser does (K <= 0 from a library caller left every record without a

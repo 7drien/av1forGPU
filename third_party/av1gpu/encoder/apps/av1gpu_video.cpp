@@ -78,6 +78,7 @@ int main(int argc, char **argv) {
     bool usePframes = false;
     pf::Settings pfSettings;
     int pfQindex = 0, pfQoffset = 60, pfGop = 16, pfAltrefBoost = 100, pfLeafOffset = 0;
+    double targetKbps = 0, rcBufferSeconds = 2.0;
     bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
@@ -170,6 +171,12 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--pf-leaf-offset") && i + 1 < argc) {
             pfLeafOffset = atoi(argv[++i]);
             if (pfLeafOffset < 0 || pfLeafOffset > 100) { fprintf(stderr, "--pf-leaf-offset must be 0..100\n"); return 2; }
+        } else if (!strcmp(argv[i], "--bitrate") && i + 1 < argc) {
+            targetKbps = atof(argv[++i]);
+            if (!(targetKbps >= 1 && targetKbps <= 1e6)) { fprintf(stderr, "--bitrate must be 1..1000000 kbit/s\n"); return 2; }
+        } else if (!strcmp(argv[i], "--rc-buffer") && i + 1 < argc) {
+            rcBufferSeconds = atof(argv[++i]);
+            if (!(rcBufferSeconds >= 0.1 && rcBufferSeconds <= 60)) { fprintf(stderr, "--rc-buffer must be 0.1..60 seconds\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-no-filters")) {
             pfFilters = false;
         } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
@@ -266,6 +273,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--persistent-cdf requires quantized inter frames and a rolling reference\n");
         return 2;
     }
+    if (targetKbps > 0 && !usePframes) {
+        fprintf(stderr, "--bitrate requires --pframes\n");
+        return 2;
+    }
     if (usePframes && (w % 8 || h % 8 || w < 16 || h < 16 || adaptiveFps || useResiduals || rolling || useAnchor)) {
         fprintf(stderr, "--pframes requires dimensions divisible by eight, fixed frame timing, and no other inter mode\n");
         return 2;
@@ -307,6 +318,7 @@ int main(int argc, char **argv) {
     std::vector<pf::BlockInfo> pfInfo;
     std::vector<int16_t> pfLevels;
     double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0;
+    uint64_t rcPeriods = 0;
     uint64_t pfModes[4] = {}, pfCompound = 0;
     if (usePframes) {
         if (!reference && cudaMalloc(&reference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
@@ -470,9 +482,55 @@ int main(int argc, char **argv) {
         };
         int lastShown = 0;
         uint64_t lastKeyIndex = 0;
+        // ---- rate control: one base quantizer per keyframe or mini-GOP period ----
+        // Keyframes use baseQ, P frames baseQ + offset with the pyramid boosts. After each period the base moves by
+        // ln(actual / desired) / slope, where desired corrects the accumulated error over the buffer duration.
+        const double fps = double(fpsNum) / fpsDen;
+        const double frameBits = targetKbps * 1000.0 / fps;
+        double baseQ = cfg.qindex, slope = 0.0146, bufferErr = 0;
+        if (targetKbps > 0) {
+            const double bpp = frameBits / (double(w) * h);
+            baseQ = std::min(230.0, std::max(20.0, 120.0 + std::log(0.0077 / bpp) / slope));
+        }
+        long periodStart = ftell(outFile);
+        uint64_t periodFrames = 0;
+        double lastQ = baseQ, lastBpf = 0;
+        auto applyQ = [&]() -> int {
+            if (targetKbps <= 0) return 0;
+            const int kq = std::max(1, std::min(255, (int)std::lround(baseQ)));
+            if (encoder.setQindex(kq, err)) { fprintf(stderr, "rate control: %s\n", err.c_str()); return 1; }
+            pfSettings.qindex = std::max(1, std::min(255, kq + pfQoffset));
+            return 0;
+        };
+        auto endPeriod = [&](uint64_t frames) {
+            if (targetKbps <= 0 || !frames) return;
+            const long now = ftell(outFile);
+            const double bits = double(now - periodStart) * 8.0;
+            periodStart = now;
+            bufferErr += bits - frameBits * frames;
+            const double bpf = bits / frames;
+            // refine the bits-vs-q slope from consecutive periods at different quantizers
+            if (lastBpf > 0 && std::fabs(baseQ - lastQ) >= 4) {
+                const double k = std::log(lastBpf / bpf) / (baseQ - lastQ);
+                if (k > 0.004 && k < 0.05) slope = 0.7 * slope + 0.3 * k;
+            }
+            lastQ = baseQ;
+            lastBpf = bpf;
+            const double buffer = frameBits * fps * rcBufferSeconds;
+            const double desired = frameBits * std::min(1.6, std::max(0.4, 1.0 - bufferErr / buffer));
+            const double step = std::log(bpf / desired) / slope;
+            baseQ = std::min(255.0, std::max(1.0, baseQ + std::max(-32.0, std::min(32.0, step))));
+            rcPeriods++;
+        };
+        (void)periodFrames;
+        bool keyPending = false;
+        uint64_t keyPeriodBegin = 0;
         for (;;) {
             readMore(1);
             if (pending.empty()) break;
+            if (!keyPending && applyQ()) return 1;
+            const uint64_t periodBegin = keyPending ? keyPeriodBegin : frameCount;
+            keyPending = false;
             if (frameCount == 0 || frameCount - lastKeyIndex >= keyInterval) {
                 // keyframe
                 std::vector<uint8_t> raw = std::move(pending.front());
@@ -508,6 +566,8 @@ int main(int argc, char **argv) {
                 dump(slotBuf[0]);
                 lastShown = 0;
                 lastKeyIndex = frameCount;
+                keyPending = true;
+                keyPeriodBegin = frameCount;
                 ++frameCount;
                 continue;
             }
@@ -525,6 +585,7 @@ int main(int argc, char **argv) {
                 lastShown = 0;
                 ++predicted; ++frameCount;
                 pending.erase(pending.begin());
+                endPeriod(frameCount - periodBegin);
                 continue;
             }
             // Mini-GOP pyramid: the last frame is coded first as a hidden ALTREF; each interval (lo, hi) codes its middle
@@ -610,6 +671,7 @@ int main(int argc, char **argv) {
             }
             lastShown = hiSlot;
             pending.erase(pending.begin(), pending.begin() + n);
+            endPeriod(frameCount - periodBegin);
         }
         for (auto &fb : inBuf)
             for (auto *p : fb) cudaFree(p);
@@ -778,6 +840,8 @@ int main(int argc, char **argv) {
     if (sceneCutRms) fprintf(stderr, "scene cut keyframes %llu\n", (unsigned long long)sceneCuts);
     if(temporal) fprintf(stderr,"inter frames %llu, keyframes %llu\n",(unsigned long long)predicted,
                          (unsigned long long)(frameCount-predicted));
+    if (targetKbps > 0 && frameCount)
+        fprintf(stderr, "rate control: target %.1f kbit/s over %llu periods\n", targetKbps, (unsigned long long)rcPeriods);
     if (usePframes)
         fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
                 pfWriter->bits[0], pfWriter->bits[1], pfWriter->bits[2], pfWriter->bits[3]),

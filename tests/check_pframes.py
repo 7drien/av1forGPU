@@ -72,3 +72,4 @@ if __name__ == "__main__":
         run(b, 200, 136, 11, ["--qindex", "60", "--pf-gop", "4"])
         run(b, 448, 256, 20, ["--persistent-cdf", "--pf-gop", "8", "--keyint", "9"])
         run(b, 320, 192, 18, ["--persistent-cdf", "--pf-gop", "16", "--qindex", "140"])
+        run(b, 320, 192, 40, ["--persistent-cdf", "--bitrate", "400"])

@@ -202,6 +202,8 @@ public:
     int encode(const std::vector<GpFrameIn> &in, std::vector<GpFrameOut> &out, GpTimes &t, std::string &err,
                cudaStream_t st = 0, GpDevRecords *dev = nullptr);
     const GpConfig &config() const { return cfg_; }
+    // Change the base quantizer of later encode() calls (rate control). Returns 0 on success.
+    int setQindex(int qindex, std::string &err);
 
 private:
     GpConfig cfg_;
