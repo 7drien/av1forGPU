@@ -60,6 +60,7 @@ struct EntropyIn {
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1
     int tileColsLog2 = 0, tileRowsLog2 = 0;
     int contextTile = 0;        // tile whose final CDFs are the frame-end CDFs
+    bool recordsOnly = false;   // GPU: model the symbols only (fetch with entropyFetchRecords, code on the host)
 };
 struct EntropyOut {
     std::vector<std::vector<uint8_t>> tiles;
@@ -76,6 +77,9 @@ public:
     int init(int width, int height, char *err, int errLen);
     // grid / levels: host copies of the decisions and levels of the frame (Analyzer::analyze downloads).
     int code(const EntropyIn &in, const BlockInfo *grid, const int16_t *levels, EntropyOut &out, char *err, int errLen);
+    // Range-code symbol records modeled on the GPU (in.primarySlot / saveSlot refer to this object's slots).
+    int codeRecords(const EntropyIn &in, const std::vector<uint32_t> &tileCounts, const std::vector<uint8_t> &records,
+                    EntropyOut &out, char *err, int errLen);
 private:
     int w = 0, h = 0, aw = 0, ah = 0;
     void *state = nullptr;
@@ -104,8 +108,16 @@ public:
     // neighbouring padded frames; out receives the filtered padded planes. strength scales the blending weights.
     int temporalFilter(const uint8_t *const center[3], const uint8_t *const *const neighbors[3], int count, int qindex,
                        float strength, uint8_t *const out[3], char *err, int errLen);
-    // Code the tiles of the last analyzed frame on the GPU.
+    // Code the tiles of the last analyzed frame on the GPU (blocking).
     int entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen);
+    // Asynchronous form: launch into entropy slot k (0 .. kEntropySlots-1) on the entropy stream, fetch later (any
+    // thread). Launches must be issued in coding order.
+    static constexpr int kEntropySlots = 3;
+    int entropyLaunch(const EntropyIn &in, int k, char *err, int errLen);
+    int entropyFetch(int k, EntropyOut &out, char *err, int errLen);
+    // Records-only launches: per-tile record counts and the records (pf::HostEntropy::codeRecords codes them).
+    int entropyFetchRecords(int k, std::vector<uint32_t> &tileCounts, std::vector<uint8_t> &records, char *err,
+                            int errLen);
     int width() const { return w; }
     int height() const { return h; }
     int alignedWidth() const { return aw; }

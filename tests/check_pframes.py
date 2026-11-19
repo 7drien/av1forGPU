@@ -77,5 +77,6 @@ if __name__ == "__main__":
         run(b, 712, 392, 18, ["--persistent-cdf", "--pf-tiles", "2", "2", "--qindex", "70"])
         run(b, 712, 392, 10, ["--pf-tiles", "3", "0", "--pf-gop", "1"])
         run(b, 712, 392, 18, ["--persistent-cdf", "--pf-gpu-entropy", "--qindex", "70"])
-        run(b, 448, 256, 12, ["--persistent-cdf", "--pf-gpu-entropy", "--pf-tiles", "0", "0"])
+        run(b, 448, 256, 12, ["--persistent-cdf", "--pf-cpu-entropy"])
+        run(b, 712, 392, 18, ["--persistent-cdf", "--pf-cpu-entropy", "--pf-tiles", "1", "1"])
         run(b, 256, 128, 70, ["--persistent-cdf", "--pf-gop", "32", "--keyint", "200"])

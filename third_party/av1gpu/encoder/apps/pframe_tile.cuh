@@ -50,8 +50,39 @@ struct MiInfo {
     uint8_t skip, isInter, mode;
     int8_t ref[2];
     pf::Mv mv[2];
-    uint8_t written;
+    uint8_t refIdx;    // RefMvIdx of the chosen mode
     uint8_t txW, txH;  // log2 of the luma transform width and height (InterTxSizes)
+    uint32_t order;    // decode order: superblock index << 8 | block index in the superblock
+};
+
+// One recorded symbol (phase 3), replayed by the range coder in decode order.
+//   type 0: adaptive symbol, cdf = uint16 offset in EntropyState; 1: equiprobable bit;
+//   2: split_or_horz / split_or_vert from the partition cdf at `cdf` (sym = vertical flag), always 1;
+//   3: n equiprobable bits, first bit in the most significant of the n low bits of sym.
+struct SymRec {
+    uint16_t cdf;
+    uint8_t sym;
+    uint8_t kind;   // n | type << 5
+};
+AV1G_HDI void codeRecord(av1g_ec *ec, uint16_t *base, SymRec r) {
+    const int type = r.kind >> 5, n = r.kind & 31;
+    if (type == 0) av1g_ec_symbol(ec, r.sym, base + r.cdf, n);
+    else if (type == 1) av1g_ec_bool(ec, r.sym);
+    else if (type == 3) {
+        for (int i = n - 1; i >= 0; i--) av1g_ec_bool(ec, (r.sym >> i) & 1);
+    } else {
+        uint16_t t[2] = {uint16_t(32768 - av1g_split_or_psum(base + r.cdf, r.sym)), 32768};
+        av1g_ec_encode_cdf(ec, 1, t, 2);
+    }
+}
+
+// A block in decode order with the partition nodes whose symbols precede it (phase 1 output).
+struct PartNode { int16_t r, c; uint8_t size, part; };
+struct BlockEntry {
+    int16_t r, c;
+    uint8_t lw, lh, nNodes, pad;
+    uint32_t order;
+    PartNode nodes[4];
 };
 
 struct TileStats {
@@ -83,12 +114,29 @@ AV1G_HDI bool mvEq(pf::Mv a, pf::Mv b) { return a.row == b.row && a.col == b.col
 
 // Coefficient syntax shared with the keyframe coder (cdf ids are offsets in av1g_cdfs).
 struct CoeffSinkT {
-    av1g_ec *coder;
-    av1g_cdfs *tables;
+    SymRec *recs;
+    uint32_t *n;
+    uint32_t cap;
+    int *run;   // bits in the open literal run (the last record), 0 when closed
     AV1G_HDI void sym(uint32_t id, int symbol, int count) {
-        av1g_ec_symbol(coder, symbol, reinterpret_cast<uint16_t *>(tables) + id, count);
+        if (recs && *n < cap) recs[*n] = SymRec{(uint16_t)id, (uint8_t)symbol, (uint8_t)count};
+        ++*n;
+        *run = 0;
     }
-    AV1G_HDI void bit(int value) { av1g_ec_bool(coder, value); }
+    AV1G_HDI void bit(int value) {
+        if (*run > 0 && *run < 8) {   // append to the open run
+            if (recs && *n - 1 < cap) {
+                SymRec &r = recs[*n - 1];
+                r.sym = (uint8_t)((r.sym << 1) | value);
+                r.kind = (uint8_t)((3 << 5) | (*run + 1));
+            }
+            ++*run;
+            return;
+        }
+        if (recs && *n < cap) recs[*n] = SymRec{0, (uint8_t)value, (uint8_t)((3 << 5) | 1)};
+        ++*n;
+        *run = 1;
+    }
 };
 
 struct TileCoder {
@@ -99,22 +147,39 @@ struct TileCoder {
     MiInfo *mi;              // frame-sized mode info (this tile writes its own area)
     // tile
     int rowStart, rowEnd, colStart, colEnd;   // mode-info units
+    // CDFs at the start of the frame: symbol cdf ids are offsets in this state, and the mode choice uses its costs
     av1g_cdfs *cdf;
     InterCdfs *ic;
-    av1g_ec ec;
-    uint8_t *aboveLevel[3], *aboveDc[3], *leftLevel[3], *leftDc[3];   // absolute 4x4 indices
+    const uint16_t *base;    // the EntropyState holding cdf / ic
+    uint8_t *ctxLevel[3], *ctxDc[3];   // per plane 4x4 maps: culLevel / dcCategory of the covering transform
+    int ctxStride[3];
+    int16_t *qv;             // scratch: 1024 levels of one transform block
+    int phase;               // 1: fill mode info and context maps, 2: choose modes, 3: emit symbols
+    SymRec *recs;            // phase 3: output (null: count only)
+    uint32_t nrec, recCap;   // records written, capacity of recs
+    int run;                 // open literal run length (see CoeffSinkT)
+    uint32_t sbOrder, blockIndex, curOrder;
+    BlockEntry *entries;     // phase 1: decode-order block list of the superblock (up to 64)
+    uint32_t nEntries;
+    PartNode pending[4];
+    int nPending;
     TileStats st;
 
-    AV1G_HDI float tell() const {
-#ifdef __CUDA_ARCH__
-        return ec.offs * 8.f + ec.cnt + 16.f - log2f((float)ec.rng);
-#else
-        return ec.offs * 8.f + ec.cnt + 16.f - std::log2((float)ec.rng);
-#endif
-    }
+    AV1G_HDI float tell() const { return 0.f; }
     AV1G_HDI MiInfo &at(int r, int c) { return mi[r * fs->miCols + c]; }
     AV1G_HDI bool inside(int r, int c) const { return r >= rowStart && c >= colStart && r < rowEnd && c < colEnd; }
-    AV1G_HDI void sym(uint16_t *c, int s, int n) { av1g_ec_symbol(&ec, s, c, n); }
+    AV1G_HDI void sym(const uint16_t *c, int s, int n) {
+        if (phase != 3) return;
+        if (recs && nrec < recCap) recs[nrec] = SymRec{(uint16_t)(c - base), (uint8_t)s, (uint8_t)n};
+        ++nrec;
+        run = 0;
+    }
+    AV1G_HDI void symSplitOr(const uint16_t *c, int vertical) {
+        if (phase != 3) return;
+        if (recs && nrec < recCap) recs[nrec] = SymRec{(uint16_t)(c - base), (uint8_t)vertical, (uint8_t)(2 << 5)};
+        ++nrec;
+        run = 0;
+    }
 
     // ---- motion vector prediction ----
     struct Stack {
@@ -209,7 +274,7 @@ struct TileCoder {
     }
     AV1G_HDI void scanPoint(Stack &s, int miRow, int miCol, int deltaRow, int deltaCol, const RefPair &rp) {
         const int r = miRow + deltaRow, c = miCol + deltaCol;
-        if (inside(r, c) && at(r, c).written) addRefMv(s, r, c, rp, 4);
+        if (inside(r, c) && at(r, c).order < curOrder) addRefMv(s, r, c, rp, 4);
     }
     AV1G_HDI static void sortStack(Stack &s, int start, int end) {
         while (end > start) {
@@ -544,13 +609,80 @@ struct TileCoder {
     }
 
     // ---- residual ----
-    AV1G_HDI void coeffs(int plane, int x4, int y4, int txSz, int bwPix, int bhPix, const int16_t *qv) {
+    // Coefficient context of plane 4x4 position (x, y): the transform covering it, 0 outside the tile (the decoder
+    // clears the above context at the tile start and the left context at each superblock row of the tile).
+    AV1G_HDI int ctxAt(const uint8_t *map, int plane, int x, int y) const {
+        const int sub = plane > 0;
+        if (x < (colStart >> sub) || y < (rowStart >> sub)) return 0;
+        return map[y * ctxStride[plane] + x];
+    }
+    AV1G_HDI static int txSizeOfLog2(int lw, int lh) {
+        for (int t = 0; t < 19; t++)
+            if (AV1G_T(Tx_Width_Log2)[t] == lw && AV1G_T(Tx_Height_Log2)[t] == lh) return t;
+        return 0;
+    }
+    // Load the stored levels of a transform (tqh x tqw, row-major) at plane sample position (px, py).
+    AV1G_HDI void loadLevels(int plane, int px, int py, int tqw, int tqh) {
+        const int pw = plane ? fs->aw / 2 : fs->aw;
+        const size_t base0 = plane ? size_t(fs->aw) * fs->ah + size_t(plane - 1) * (fs->aw / 2) * (fs->ah / 2) : 0;
+        for (int r = 0; r < tqh; ++r)
+            for (int c = 0; c < tqw; ++c) qv[r * tqw + c] = levels[base0 + size_t(py + r) * pw + px + c];
+    }
+    // Phase 1: record the transform's culLevel / dcCategory in the context maps.
+    AV1G_HDI void txContext(int plane, int x4, int y4, int txSz) {
+        const int tw = AV1G_T(Tx_Width)[txSz], th = AV1G_T(Tx_Height)[txSz];
+        const int n = imin(tw, 32) * imin(th, 32);
+        int cul = 0;
+        for (int i = 0; i < n; ++i) cul += iabs(qv[i]);
+        cul = imin(63, cul);
+        const int dc = qv[0] ? (qv[0] < 0 ? 1 : 2) : 0;
+        for (int r = 0; r < (th >> 2); ++r)
+            for (int c = 0; c < (tw >> 2); ++c) {
+                ctxLevel[plane][(y4 + r) * ctxStride[plane] + x4 + c] = (uint8_t)cul;
+                ctxDc[plane][(y4 + r) * ctxStride[plane] + x4 + c] = (uint8_t)dc;
+            }
+    }
+    // Phase 4: culLevel / dcCategory of the transform at plane sample position (px, py), read from the levels.
+    AV1G_HDI void txContextDirect(int plane, int px, int py, int txSz) {
+        const int tw = AV1G_T(Tx_Width)[txSz], th = AV1G_T(Tx_Height)[txSz];
+        const int tqw = imin(tw, 32), tqh = imin(th, 32);
+        const int pw = plane ? fs->aw / 2 : fs->aw;
+        const int16_t *lv = levels + (plane ? size_t(fs->aw) * fs->ah + size_t(plane - 1) * (fs->aw / 2) * (fs->ah / 2) : 0)
+                          + size_t(py) * pw + px;
+        int cul = 0;
+        for (int r = 0; r < tqh && cul < 63; ++r)
+            for (int c = 0; c < tqw; ++c) cul += iabs(lv[size_t(r) * pw + c]);
+        cul = imin(63, cul);
+        const int dc = lv[0] ? (lv[0] < 0 ? 1 : 2) : 0;
+        const int x4 = px >> 2, y4 = py >> 2;
+        for (int r = 0; r < (th >> 2); ++r)
+            for (int c = 0; c < (tw >> 2); ++c) {
+                ctxLevel[plane][(y4 + r) * ctxStride[plane] + x4 + c] = (uint8_t)cul;
+                ctxDc[plane][(y4 + r) * ctxStride[plane] + x4 + c] = (uint8_t)dc;
+            }
+    }
+    template <class F>
+    AV1G_HDI void forTransformAreas(int miRow, int miCol, int lw, int lh, bool split, F f) {
+        if (split) {
+            const int t = 1 << (lw - 1), txSz = txSizeOfLog2(lw - 1, lw - 1);
+            for (int k = 0; k < 4; ++k) {
+                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                f(0, px, py, txSz);
+            }
+        }
+        for (int p = split ? 1 : 0; p < 3; ++p) {
+            const int sub = p > 0;
+            f(p, (miCol * 4) >> sub, (miRow * 4) >> sub, txSizeOfLog2(imin(lw, 6) - sub, imin(lh, 6) - sub));
+        }
+    }
+    // Phase 3: coeffs() syntax of one transform.
+    AV1G_HDI void coeffs(int plane, int x4, int y4, int txSz, int bwPix, int bhPix) {
         const int sub = plane > 0;
         const int tw = AV1G_T(Tx_Width)[txSz], th = AV1G_T(Tx_Height)[txSz];
         const int w4 = tw >> 2, h4 = th >> 2;
         const int maxX4 = fs->miCols >> sub, maxY4 = fs->miRows >> sub;
-        uint8_t *aL = aboveLevel[plane], *aD = aboveDc[plane];
-        uint8_t *lL = leftLevel[plane], *lD = leftDc[plane];
+        const uint8_t *L = ctxLevel[plane], *D = ctxDc[plane];
         const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
         int ctx;
         if (plane == 0) {
@@ -558,8 +690,8 @@ struct TileCoder {
                 ctx = 0;   // the transform covers the whole block
             } else {
                 int top = 0, left = 0;
-                for (int k = 0; k < w4; k++) if (x4 + k < maxX4 && aL[x4 + k] > top) top = aL[x4 + k];
-                for (int k = 0; k < h4; k++) if (y4 + k < maxY4 && lL[y4 + k] > left) left = lL[y4 + k];
+                for (int k = 0; k < w4; k++) if (x4 + k < maxX4) top = imax(top, ctxAt(L, plane, x4 + k, y4 - 1));
+                for (int k = 0; k < h4; k++) if (y4 + k < maxY4) left = imax(left, ctxAt(L, plane, x4 - 1, y4 + k));
                 const int mx = imax(top, left), mn = imin(top, left);
                 if (!top && !left) ctx = 1;
                 else if (!top || !left) ctx = 2 + (mx > 3);
@@ -569,8 +701,10 @@ struct TileCoder {
             }
         } else {
             int above = 0, left = 0;
-            for (int i = 0; i < w4; i++) if (x4 + i < maxX4) above |= aL[x4 + i] | aD[x4 + i];
-            for (int i = 0; i < h4; i++) if (y4 + i < maxY4) left |= lL[y4 + i] | lD[y4 + i];
+            for (int i = 0; i < w4; i++)
+                if (x4 + i < maxX4) above |= ctxAt(L, plane, x4 + i, y4 - 1) | ctxAt(D, plane, x4 + i, y4 - 1);
+            for (int i = 0; i < h4; i++)
+                if (y4 + i < maxY4) left |= ctxAt(L, plane, x4 - 1, y4 + i) | ctxAt(D, plane, x4 - 1, y4 + i);
             ctx = (above != 0) + (left != 0) + 7;
             if ((bwPix >> sub) * (bhPix >> sub) > tw * th) ctx += 3;
         }
@@ -579,36 +713,116 @@ struct TileCoder {
         int eob = n;
         while (eob && !qv[scan[eob - 1]]) --eob;
         sym(cdf->txb_skip[txSzCtx][ctx], eob == 0, 2);
-        int culLevel = 0, dcCategory = 0;
-        if (eob) {
-            // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
-            if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64)
-                sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
-            int dcSign = 0;
-            for (int k = 0; k < w4; k++)
-                if (x4 + k < maxX4) dcSign += aD[x4 + k] == 1 ? -1 : aD[x4 + k] == 2 ? 1 : 0;
-            for (int k = 0; k < h4; k++)
-                if (y4 + k < maxY4) dcSign += lD[y4 + k] == 1 ? -1 : lD[y4 + k] == 2 ? 1 : 0;
-            CoeffSinkT sink{&ec, cdf};
-            emitCoeffPayload(sink, qv, eob, txSz, AV1G_DCT_DCT, txSzCtx, plane > 0, dcSign);
-            for (int i = 0; i < n; ++i) culLevel += iabs(qv[i]);
-            culLevel = imin(63, culLevel);
-            if (qv[0]) dcCategory = qv[0] < 0 ? 1 : 2;
+        if (!eob) return;
+        // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
+        if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64) sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
+        int dcSign = 0;
+        for (int k = 0; k < w4; k++)
+            if (x4 + k < maxX4) { const int v = ctxAt(D, plane, x4 + k, y4 - 1); dcSign += v == 1 ? -1 : v == 2 ? 1 : 0; }
+        for (int k = 0; k < h4; k++)
+            if (y4 + k < maxY4) { const int v = ctxAt(D, plane, x4 - 1, y4 + k); dcSign += v == 1 ? -1 : v == 2 ? 1 : 0; }
+        CoeffSinkT sink{recs, &nrec, recCap, &run};
+        emitCoeffPayload(sink, qv, eob, txSz, AV1G_DCT_DCT, txSzCtx, plane > 0, dcSign);
+    }
+    // Walk the transforms of a coded block: f(plane, x4, y4, txSz) with the levels loaded into qv.
+    template <class F>
+    AV1G_HDI void forTransforms(int miRow, int miCol, int lw, int lh, bool split, F f) {
+        if (split) {
+            const int t = 1 << (lw - 1), txSz = txSizeOfLog2(lw - 1, lw - 1);
+            for (int k = 0; k < 4; ++k) {
+                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                loadLevels(0, px, py, t, t);
+                f(0, px >> 2, py >> 2, txSz);
+            }
         }
-        for (int i = 0; i < w4; i++) { aL[x4 + i] = (uint8_t)culLevel; aD[x4 + i] = (uint8_t)dcCategory; }
-        for (int i = 0; i < h4; i++) { lL[y4 + i] = (uint8_t)culLevel; lD[y4 + i] = (uint8_t)dcCategory; }
+        for (int p = split ? 1 : 0; p < 3; ++p) {
+            const int sub = p > 0;
+            const int tlw = imin(lw, 6) - sub, tlh = imin(lh, 6) - sub;
+            const int txSz = txSizeOfLog2(tlw, tlh);
+            const int px = (miCol * 4) >> sub, py = (miRow * 4) >> sub;
+            loadLevels(p, px, py, imin(1 << tlw, 32), imin(1 << tlh, 32));
+            f(p, px >> 2, py >> 2, txSz);
+        }
     }
 
-    // ---- block / partition ----
+    // ---- block ----
     AV1G_HDI void block(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
         const int bw4 = 1 << (lw - 2), bh4 = 1 << (lh - 2);
         const int size = lw > lh ? lw : lh;   // log2 of the larger side
+        const int skip = bi.skip;
+        const bool compound = bi.ref == 2;
+        const bool split = !skip && bi.txSplit;
+        RefPair rp{fs->refName[bi.ref == 1 ? 1 : 0], compound ? fs->refName[1] : -1, compound};
+        if (phase == 1) {   // block list only
+            curOrder = sbOrder | blockIndex++;
+            BlockEntry &e = entries[nEntries++];
+            e.r = (int16_t)miRow; e.c = (int16_t)miCol; e.lw = (uint8_t)lw; e.lh = (uint8_t)lh;
+            e.order = curOrder;
+            e.nNodes = (uint8_t)nPending;
+            for (int k = 0; k < nPending; k++) e.nodes[k] = pending[k];
+            nPending = 0;
+            return;
+        }
+        if (phase == 4) {   // mode info and coefficient context maps
+            for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
+                for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
+                    MiInfo &m = at(r, c);
+                    m.wLog2 = (uint8_t)lw;
+                    m.hLog2 = (uint8_t)lh;
+                    m.skip = (uint8_t)skip;
+                    m.isInter = 1;
+                    m.mode = 0;
+                    m.refIdx = 0;
+                    m.ref[0] = (int8_t)rp.r0;
+                    m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
+                    m.mv[0] = bi.mv;
+                    m.mv[1] = compound ? bi.mv2 : pf::Mv{0, 0};
+                    m.txW = (uint8_t)(imin(lw, 6) - split);
+                    m.txH = (uint8_t)(imin(lh, 6) - split);
+                    m.order = curOrder;
+                }
+            if (!skip) forTransformAreas(miRow, miCol, lw, lh, split, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
+            return;
+        }
+        const pf::Mv target[2] = {bi.mv, bi.mv2};
+        Stack s;
+        findMvStack(s, miRow, miCol, bw4, bh4, rp);
+        if (phase == 2) {
+            // Mode choice from the frame-start CDFs, with the NEWMV context of a neighbourhood without NEWMV blocks:
+            // it then depends only on decisions known before any mode is chosen, so blocks choose in parallel.
+            Stack sc = s;
+            sc.newMvCtx = sc.closeMatches == 0 ? imin(sc.totalMatches, 1) : sc.closeMatches == 1 ? 3 : 5;
+            float best = 1e30f;
+            int bestMode = -1, bestIdx = 0;
+            pf::Mv pred[2];
+            const int first = compound ? NEAREST_NEARESTMV : NEARESTMV, last = compound ? NEW_NEWMV : NEWMV;
+            for (int mode = first; mode <= last; ++mode) {
+                int k0 = 0, k1 = 0;
+                if (isNewType(mode)) { k0 = 0; k1 = 2; }
+                else if (hasNearmv(mode)) { k0 = 1; k1 = 3; }
+                for (int k = k0; k <= k1; ++k) {
+                    if (k > k0 && sc.num <= k) break;
+                    const float c = modeCost(sc, compound, mode, k, target, pred);
+                    if (c >= 0.f && c < best) { best = c; bestMode = mode; bestIdx = k; }
+                }
+            }
+            if (bestMode < 0) { st.error = 2; return; }
+            for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
+                for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
+                    at(r, c).mode = (uint8_t)bestMode;
+                    at(r, c).refIdx = (uint8_t)bestIdx;
+                }
+            const int m0 = modeOfList(bestMode, 0);
+            st.modeCount[m0 == NEARESTMV ? 0 : m0 == NEARMV ? 1 : m0 == GLOBALMV ? 2 : 3]++;
+            st.compound += compound;
+            return;
+        }
+        // phase 3: symbols
         const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
         const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
         const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
         const int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
-        const int skip = bi.skip;
-        float t0 = tell();
         sym(cdf->skip[skipCtx], skip, 2);
         const bool aboveIntra = availU && !above->isInter, leftIntra = availL && !left->isInter;
         int interCtx;
@@ -616,40 +830,22 @@ struct TileCoder {
         else if (availU || availL) interCtx = 2 * (availU ? aboveIntra : leftIntra);
         else interCtx = 0;
         sym(ic->isInter[interCtx], 1, 2);
-        const bool compound = bi.ref == 2;
-        RefPair rp{fs->refName[bi.ref == 1 ? 1 : 0], compound ? fs->refName[1] : -1, compound};
         if (fs->referenceSelect) sym(ic->compMode[compModeCtx(availU, availL, above, left)], compound, 2);
+#define PF_CNT2(f) countRefs(f, availU, availL, above, left)
         if (compound) {
             if (rp.r0 != LAST_FRAME || rp.r1 != ALTREF_FRAME) { st.error = 1; return; }
             sym(ic->compRefType[compRefTypeCtx(availU, availL, above, left)], 1, 2);   // BIDIR_COMP_REFERENCE
-            sym(ic->compRef[refCountCtx(PF_CNT(LAST_FRAME) + PF_CNT(LAST2_FRAME), PF_CNT(LAST3_FRAME) + PF_CNT(GOLDEN_FRAME))][0], 0, 2);
-            sym(ic->compRef[refCountCtx(PF_CNT(LAST_FRAME), PF_CNT(LAST2_FRAME))][1], 0, 2);   // LAST_FRAME
-            sym(ic->compBwdRef[refCountCtx(PF_CNT(BWDREF_FRAME) + PF_CNT(ALTREF2_FRAME), PF_CNT(ALTREF_FRAME))][0], 1, 2);
+            sym(ic->compRef[refCountCtx(PF_CNT2(LAST_FRAME) + PF_CNT2(LAST2_FRAME), PF_CNT2(LAST3_FRAME) + PF_CNT2(GOLDEN_FRAME))][0], 0, 2);
+            sym(ic->compRef[refCountCtx(PF_CNT2(LAST_FRAME), PF_CNT2(LAST2_FRAME))][1], 0, 2);   // LAST_FRAME
+            sym(ic->compBwdRef[refCountCtx(PF_CNT2(BWDREF_FRAME) + PF_CNT2(ALTREF2_FRAME), PF_CNT2(ALTREF_FRAME))][0], 1, 2);
         } else {
             writeSingleRef(rp.r0, availU, availL, above, left);
         }
-#undef PF_CNT
-        Stack s;
-        findMvStack(s, miRow, miCol, bw4, bh4, rp);
-        const pf::Mv target[2] = {bi.mv, bi.mv2};
-        float best = 1e30f;
-        int bestMode = -1, bestIdx = 0;
-        pf::Mv bestPred[2] = {}, pred[2];
-        const int first = compound ? NEAREST_NEARESTMV : NEARESTMV, last = compound ? NEW_NEWMV : NEWMV;
-        for (int mode = first; mode <= last; ++mode) {
-            int k0 = 0, k1 = 0;
-            if (isNewType(mode)) { k0 = 0; k1 = 2; }
-            else if (hasNearmv(mode)) { k0 = 1; k1 = 3; }
-            for (int k = k0; k <= k1; ++k) {
-                if (k > k0 && s.num <= k) break;
-                const float c = modeCost(s, compound, mode, k, target, pred);
-                if (c >= 0.f && c < best) {
-                    best = c; bestMode = mode; bestIdx = k;
-                    bestPred[0] = pred[0]; bestPred[1] = pred[1];
-                }
-            }
-        }
-        if (bestMode < 0) { st.error = 2; return; }
+#undef PF_CNT2
+        const MiInfo &self = at(miRow, miCol);
+        const int bestMode = self.mode, bestIdx = self.refIdx;
+        pf::Mv bestPred[2];
+        if (modeCost(s, compound, bestMode, bestIdx, target, bestPred) < 0.f) { st.error = 8; return; }
         if (compound) {
             sym(ic->compoundMode[compoundModeCtx(s)], bestMode - NEAREST_NEARESTMV, 8);
         } else if (bestMode == NEWMV) {
@@ -678,34 +874,9 @@ struct TileCoder {
                     if (!d) break;
                 }
         }
-        float t1 = tell();
-        st.bits[0] += t1 - t0;
         for (int i = 0; i < 1 + compound; ++i)
             if (modeOfList(bestMode, i) == NEWMV) writeMv(target[i], bestPred[i]);
-        t0 = tell();
-        st.bits[1] += t0 - t1;
-        const int m0 = modeOfList(bestMode, 0);
-        st.modeCount[m0 == NEARESTMV ? 0 : m0 == NEARMV ? 1 : m0 == GLOBALMV ? 2 : 3]++;
-        st.compound += compound;
-        for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
-            for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
-                MiInfo &m = at(r, c);
-                m.wLog2 = (uint8_t)lw;
-                m.hLog2 = (uint8_t)lh;
-                m.skip = (uint8_t)skip;
-                m.isInter = 1;
-                m.mode = (uint8_t)bestMode;
-                m.ref[0] = (int8_t)rp.r0;
-                m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
-                m.mv[0] = target[0];
-                m.mv[1] = compound ? target[1] : pf::Mv{0, 0};
-                m.written = 1;
-                m.txW = (uint8_t)(imin(lw, 6) - (!skip && bi.txSplit));
-                m.txH = (uint8_t)(imin(lh, 6) - (!skip && bi.txSplit));
-            }
-        const bool split = !skip && bi.txSplit;
         if (fs->txModeSelect && !skip) {
-            const float tt = tell();
             const int maxTx = imin(size, 6) - 2;   // square find_tx_size(Min(64, Max(bw, bh)))
             auto txCtx = [&](int row, int col, int tw2, int th2) {
                 int aw2, lh2;
@@ -729,53 +900,38 @@ struct TileCoder {
                     sym(ic->txfmSplit[txCtx(r, c, size - 1, size - 1)], 0, 2);
                 }
             }
-            st.bits[0] += tell() - tt;
         }
-        if (skip) {
-            for (int p = 0; p < 3; ++p) {
-                const int sub = p > 0;
-                for (int i = miCol >> sub; i < ((miCol + bw4) >> sub); i++) aboveLevel[p][i] = aboveDc[p][i] = 0;
-                for (int i = miRow >> sub; i < ((miRow + bh4) >> sub); i++) leftLevel[p][i] = leftDc[p][i] = 0;
-            }
-            return;
-        }
-        const int bsize = 4 * bw4, bhsize = 4 * bh4;
-        if (split) {
-            // luma: four half-size transforms in raster order (transform_tree)
-            const int t = bsize >> 1;
-            const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
-            for (int k = 0; k < 4; ++k) {
-                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
-                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
-                int16_t qv[1024];
-                for (int r = 0; r < t; ++r)
-                    for (int c = 0; c < t; ++c) qv[r * t + c] = levels[size_t(py + r) * fs->aw + px + c];
-                const float c0 = tell();
-                coeffs(0, px >> 2, py >> 2, txSz, bsize, bhsize, qv);
-                st.bits[2] += tell() - c0;
-            }
-        }
-        for (int p = split ? 1 : 0; p < 3; ++p) {
-            const int sub = p > 0;
-            const int tlw = imin(lw, 6) - sub, tlh = imin(lh, 6) - sub;
-            int txSz = 0;
-            for (int t = 0; t < 19; t++)
-                if (AV1G_T(Tx_Width_Log2)[t] == tlw && AV1G_T(Tx_Height_Log2)[t] == tlh) txSz = t;
-            const int tqw = imin(1 << tlw, 32), tqh = imin(1 << tlh, 32);
-            const int px = (miCol * 4) >> sub, py = (miRow * 4) >> sub;
-            const int pw = p ? fs->aw / 2 : fs->aw;
-            const size_t base = p ? size_t(fs->aw) * fs->ah + size_t(p - 1) * (fs->aw / 2) * (fs->ah / 2) : 0;
-            int16_t qv[1024];
-            for (int r = 0; r < tqh; ++r)
-                for (int c = 0; c < tqw; ++c) qv[r * tqw + c] = levels[base + size_t(py + r) * pw + px + c];
-            const float c0 = tell();
-            coeffs(p, px >> 2, py >> 2, txSz, bsize, bhsize, qv);
-            st.bits[p ? 3 : 2] += tell() - c0;
-        }
+        if (skip) return;
+        forTransforms(miRow, miCol, lw, lh, split, [&](int p, int x4, int y4, int t) { coeffs(p, x4, y4, t, 4 * bw4, 4 * bh4); });
     }
 
-    // Recursive partition walk (no recursion on the device: explicit stack of quadrants).
-    AV1G_HDI void superblock(int sbRow, int sbCol) {
+    // Phase 3: the partition symbol of a node.
+    AV1G_HDI void emitNode(const PartNode &nd) {
+        const int miRow = nd.r, miCol = nd.c, size = nd.size, half = 1 << (size - 3);
+        const bool hasRows = miRow + half < fs->miRows, hasCols = miCol + half < fs->miCols;
+        const int ctxAbove = inside(miRow - 1, miCol) && at(miRow - 1, miCol).wLog2 < size;
+        const int ctxLeft = inside(miRow, miCol - 1) && at(miRow, miCol - 1).hLog2 < size;
+        const int pcx = ctxLeft * 2 + ctxAbove;
+        const uint16_t *pc = size == 6 ? cdf->partition_w64[pcx] : size == 5 ? cdf->partition_w32[pcx]
+                           : size == 4 ? cdf->partition_w16[pcx] : cdf->partition_w8[pcx];
+        if (hasRows && hasCols) sym(pc, nd.part, size == 3 ? 4 : 10);
+        else symSplitOr(pc, hasRows);
+    }
+    // Phases 2 and 3 for one block of the list (blocks are independent in these phases).
+    AV1G_HDI void runEntry(const BlockEntry &e) {
+        curOrder = e.order;
+        run = 0;
+        if (phase == 3)
+            for (int k = 0; k < e.nNodes; k++) emitNode(e.nodes[k]);
+        block(e.r, e.c, e.lw, e.lh, grid[(e.r >> 1) * fs->gcols + (e.c >> 1)]);
+        if (phase == 3 && recs && nrec > recCap) st.error = 9;   // record region overflow
+    }
+    // One superblock in decode order (explicit stack of quadrants; no recursion on the device).
+    AV1G_HDI void superblock(int sbRow, int sbCol, uint32_t sbIndex) {
+        sbOrder = sbIndex << 8;
+        blockIndex = 0;
+        nEntries = 0;
+        nPending = 0;
         struct Node { int r, c, size, k; };
         Node stack[8];
         int top = 0;
@@ -797,33 +953,17 @@ struct TileCoder {
             const bool split = bi.log2 < size;
             const int part = split ? AV1G_PARTITION_SPLIT : bi.part == 1 ? AV1G_PARTITION_HORZ
                            : bi.part == 2 ? AV1G_PARTITION_VERT : AV1G_PARTITION_NONE;
-            const float t0 = tell();
-            const int ctxAbove = inside(miRow - 1, miCol) && at(miRow - 1, miCol).wLog2 < size;
-            const int ctxLeft = inside(miRow, miCol - 1) && at(miRow, miCol - 1).hLog2 < size;
-            const int pcx = ctxLeft * 2 + ctxAbove;
-            uint16_t *pc = size == 6 ? cdf->partition_w64[pcx] : size == 5 ? cdf->partition_w32[pcx]
-                         : size == 4 ? cdf->partition_w16[pcx] : cdf->partition_w8[pcx];
-            if (hasRows && hasCols) {
-                sym(pc, part, size == 3 ? 4 : 10);
-            } else if (hasCols || hasRows) {
-                if (!split) { st.error = 3; return; }
-                uint16_t t[2] = {uint16_t(32768 - av1g_split_or_psum(pc, hasRows)), 32768};
-                av1g_ec_encode_cdf(&ec, 1, t, 2);
-            } else if (!split) {
-                st.error = 3;
-                return;
-            }
-            st.bits[0] += tell() - t0;
+            if (phase == 1 && (hasRows || hasCols) && nPending < 4)
+                pending[nPending++] = PartNode{(int16_t)miRow, (int16_t)miCol, (uint8_t)size, (uint8_t)part};
+            if (!(hasRows && hasCols) && !split) { st.error = 3; return; }
             if (split) {
                 if (size == 3) { st.error = 4; return; }
-                n.k = -1;
                 n.k = 0;
                 stack[top + 1] = Node{miRow, miCol, size - 1, -1};
                 ++top;
                 continue;
             }
             if (bi.log2 != size) { st.error = 5; return; }
-            if (part != AV1G_PARTITION_NONE && !(hasRows && hasCols)) { st.error = 7; return; }
             if (part == AV1G_PARTITION_HORZ) {
                 block(miRow, miCol, size, size - 1, bi);
                 if (!st.error) block(miRow + half, miCol, size, size - 1, grid[((miRow + half) >> 1) * fs->gcols + (miCol >> 1)]);
@@ -835,25 +975,6 @@ struct TileCoder {
             }
             if (st.error) return;
             --top;
-        }
-    }
-
-    AV1G_HDI void tile() {
-        for (int r = rowStart; r < rowEnd; ++r)
-            for (int c = colStart; c < colEnd; ++c) mi[r * fs->miCols + c] = MiInfo{};
-        for (int p = 0; p < 3; ++p) {
-            const int sub = p > 0;
-            for (int i = colStart >> sub; i < ((colEnd + sub) >> sub) + 16; ++i) aboveLevel[p][i] = aboveDc[p][i] = 0;
-        }
-        for (int sbr = rowStart; sbr < rowEnd; sbr += 16) {
-            for (int p = 0; p < 3; ++p) {
-                const int sub = p > 0;
-                for (int i = sbr >> sub; i < ((sbr + 16) >> sub) + 16; ++i) leftLevel[p][i] = leftDc[p][i] = 0;
-            }
-            for (int sbc = colStart; sbc < colEnd; sbc += 16) {
-                superblock(sbr, sbc);
-                if (st.error) return;
-            }
         }
     }
 };

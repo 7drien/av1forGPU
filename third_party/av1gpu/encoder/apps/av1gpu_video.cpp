@@ -67,7 +67,7 @@ static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-filters]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-filters]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
     int pfQindex = 0, pfQoffset = 60, pfGop = 32, pfAltrefBoost = 100, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
-    bool pfGpuEntropy = false;
+    int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
     int pfTfFrames = 0;
     float pfTfStrength = 1.0f;
     bool pfFilters = true, pfCdef = false;
@@ -207,7 +207,9 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--pf-rdoq")) {
             pfSettings.rdoq = true;
         } else if (!strcmp(argv[i], "--pf-gpu-entropy")) {
-            pfGpuEntropy = true;
+            pfEntropyMode = 2;
+        } else if (!strcmp(argv[i], "--pf-cpu-entropy")) {
+            pfEntropyMode = 0;
         } else if (!strcmp(argv[i], "--pf-no-filters")) {
             pfFilters = false;
         } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
@@ -405,15 +407,10 @@ int main(int argc, char **argv) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
         const int sbCols = (w + 63) / 64, sbRows = (h + 63) / 64;
-        // one tile compresses best; the GPU tile coder needs many tiles for throughput
-        if (pfTileCols < 0) {
-            pfTileCols = 0;
-            while (pfGpuEntropy && pfTileCols < 2 && (sbCols >> (pfTileCols + 1)) >= 4) ++pfTileCols;
-        }
-        if (pfTileRows < 0) {
-            pfTileRows = 0;
-            while (pfGpuEntropy && pfTileRows < 3 && (sbRows >> (pfTileRows + 1)) >= 4) ++pfTileRows;
-        }
+        // one tile compresses best; the tile coder runs off the critical path, overlapped with later analysis
+        (void)sbCols; (void)sbRows;
+        if (pfTileCols < 0) pfTileCols = 0;
+        if (pfTileRows < 0) pfTileRows = 0;
         pfSettings.qindex = pfQindex ? pfQindex : std::min(255, std::max(1, cfg.qindex + pfQoffset));
     }
 
@@ -467,7 +464,7 @@ int main(int argc, char **argv) {
         char perr[256];
         // ---- writer thread: CPU tile entropy coding, temporal units and IVF output, overlapped with the GPU ----
         struct Job {
-            enum Kind { Coded, Tiles, Raw, ShowExisting, Stop } kind = Coded;
+            enum Kind { Coded, Tiles, Records, Raw, ShowExisting, Stop } kind = Coded;
             pf::EntropyIn ein;
             pfw::FrameParams fp;
             int buf = -1, slot0 = 0, outSlot = 8, showSlot = 0;
@@ -492,6 +489,8 @@ int main(int argc, char **argv) {
         if (hostEntropy.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
         std::mutex mtx;
         std::condition_variable cv;
+        std::vector<int> freeEntropy;
+        for (int k = 0; k < pf::Analyzer::kEntropySlots; ++k) freeEntropy.push_back(k);
         std::deque<Job> jobs;
         bool writerBusy = false, writerFailed = false;
         std::string writerError;
@@ -520,7 +519,20 @@ int main(int argc, char **argv) {
                     obu = pfw::showExistingObu(job.showSlot, tu.empty());
                 } else {
                     pf::EntropyOut eout;
-                    if (job.kind == Job::Coded) {
+                    if (job.kind == Job::Records) {
+                        job.ein.primarySlot = persistentCdf && hostSlotValid[job.slot0] ? job.slot0 : -1;
+                        job.ein.saveSlot = persistentCdf && job.outSlot < 8 ? job.outSlot : -1;
+                        std::vector<uint32_t> counts;
+                        std::vector<uint8_t> recs;
+                        ok = !pfAnalyzer.entropyFetchRecords(job.buf, counts, recs, werr, sizeof werr);
+                        {
+                            std::lock_guard<std::mutex> lock(mtx);
+                            freeEntropy.push_back(job.buf);
+                        }
+                        cv.notify_all();
+                        if (ok) ok = !hostEntropy.codeRecords(job.ein, counts, recs, eout, werr, sizeof werr);
+                        if (job.outSlot < 8) hostSlotValid[job.outSlot] = persistentCdf;
+                    } else if (job.kind == Job::Coded) {
                         job.ein.primarySlot = persistentCdf && hostSlotValid[job.slot0] ? job.slot0 : -1;
                         job.ein.saveSlot = persistentCdf && job.outSlot < 8 ? job.outSlot : -1;
                         ok = !hostEntropy.code(job.ein, gridBuf[job.buf], levelBuf[job.buf], eout, werr, sizeof werr);
@@ -531,7 +543,12 @@ int main(int argc, char **argv) {
                         cv.notify_all();
                         if (job.outSlot < 8) hostSlotValid[job.outSlot] = persistentCdf;
                     } else {
-                        eout = std::move(job.tiles);
+                        ok = !pfAnalyzer.entropyFetch(job.buf, eout, werr, sizeof werr);
+                        {
+                            std::lock_guard<std::mutex> lock(mtx);
+                            freeEntropy.push_back(job.buf);
+                        }
+                        cv.notify_all();
                     }
                     if (ok) {
                         job.fp.primary = job.ein.primarySlot >= 0;
@@ -646,11 +663,33 @@ int main(int argc, char **argv) {
             fp.tileColsLog2 = pfTileCols;
             fp.tileRowsLog2 = pfTileRows;
             fp.contextTile = 0;
-            if (pfGpuEntropy) {
+            if (pfEntropyMode == 1) {
+                // GPU symbol modeling, host range coding (the writer decides the reference-slot CDFs)
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return !freeEntropy.empty() || writerFailed; });
+                    if (writerFailed) { fprintf(stderr, "%s\n", writerError.c_str()); return 1; }
+                    job.buf = freeEntropy.back();
+                    freeEntropy.pop_back();
+                }
+                ein.recordsOnly = true;
+                if (pfAnalyzer.entropyLaunch(ein, job.buf, perr, sizeof perr)) {
+                    fprintf(stderr, "%s\n", perr);
+                    return 1;
+                }
+                job.kind = Job::Records;
+            } else if (pfEntropyMode == 2) {
                 // GPU tile coding: reference-slot CDFs live on the device and are tracked here
                 ein.primarySlot = persistentCdf && slotValid[slot0] ? slot0 : -1;
                 ein.saveSlot = persistentCdf && outSlot < 8 ? outSlot : -1;
-                if (pfAnalyzer.entropy(ein, job.tiles, perr, sizeof perr)) {
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return !freeEntropy.empty() || writerFailed; });
+                    if (writerFailed) { fprintf(stderr, "%s\n", writerError.c_str()); return 1; }
+                    job.buf = freeEntropy.back();
+                    freeEntropy.pop_back();
+                }
+                if (pfAnalyzer.entropyLaunch(ein, job.buf, perr, sizeof perr)) {
                     fprintf(stderr, "%s\n", perr);
                     return 1;
                 }

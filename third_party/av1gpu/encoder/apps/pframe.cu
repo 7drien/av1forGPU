@@ -22,6 +22,7 @@ namespace pf {
 namespace {
 
 constexpr int kSizes = 4;       // 8, 16, 32, 64
+constexpr int kEntropySlots = Analyzer::kEntropySlots;
 constexpr int kMaxRefs = 2;
 constexpr float kInf = 3.0e38f;
 constexpr int kFullPelPasses = 6;
@@ -900,64 +901,201 @@ __global__ void planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int 
 
 // ------------------------------------------------------------------------------------------------
 // GPU tile entropy coding: one thread per AV1 tile.
+// Inter tile entropy coding in four stages (pframe_tile.cuh): three parallel phases over superblocks (mode info and
+// context maps, mode choice, symbol records), then one serial range coder per tile over the records.
 struct TileJob {
     pft2::FrameSyntax fs;
     const BlockInfo *grid;
     const int16_t *levels;
     pft2::MiInfo *mi;
-    const pft2::EntropyState *primary;   // null: default CDFs
-    const pft2::InterCdfs *defaultInter;
-    pft2::EntropyState *work;            // one per tile
+    pft2::EntropyState *frameInit;       // default CDFs: symbol cdf ids and mode-choice costs
+    pft2::EntropyState *coderInit;       // CDFs the range coder starts from (primary slot or defaults)
+    uint32_t *packOff, *tileCount;       // records-only mode: per-block destination, per-tile record counts
+    pft2::SymRec *packed;
     pft2::EntropyState *save;            // receives the frame-end CDFs of tile contextTile, or null
-    int contextTile, qindex;
+    int contextTile;
     int tileCols, tileRows;
     int colStart[65], rowStart[65];
-    uint8_t *ctx;
-    size_t ctxStride;
+    int sbCols, sbRows;
+    uint8_t *ctxLevel[3], *ctxDc[3];
+    int ctxStride[3];
+    uint32_t *sbCount, *sbOffset;   // per block-list slot (superblock * 64 + index): record count and offset
+    pft2::BlockEntry *entries;      // 64 per superblock
+    uint32_t *entryCount;           // per superblock
+    pft2::SymRec *recs;
+    uint32_t recCap;
+    int *error;
     uint16_t *ecBuf;
     size_t ecCapPerTile;
     uint8_t *out;
     int *sizes;
-    pft2::TileStats *stats;
 };
-__global__ void tileEntropy(TileJob j) {
-    const int t = blockIdx.x;
-    if (threadIdx.x || t >= j.tileCols * j.tileRows) return;
-    const int tc = t % j.tileCols, tr = t / j.tileCols;
-    pft2::EntropyState &es = j.work[t];
-    if (j.primary) {
-        es = *j.primary;
+__device__ __host__ inline void tileOfSb(const TileJob &j, int miRow, int miCol, int &tr, int &tc) {
+    tc = 0;
+    while (tc + 1 < j.tileCols && j.colStart[tc + 1] <= miCol) ++tc;
+    tr = 0;
+    while (tr + 1 < j.tileRows && j.rowStart[tr + 1] <= miRow) ++tr;
+}
+__global__ void initFrameCdfs(pft2::EntropyState *out, const pft2::EntropyState *primary, const pft2::InterCdfs *defaults,
+                              int qindex) {
+    if (threadIdx.x || blockIdx.x) return;
+    if (primary) {
+        *out = *primary;
     } else {
-        av1g_cdfs_init(&es.cdf, j.qindex);
-        es.inter = *j.defaultInter;
+        av1g_cdfs_init(&out->cdf, qindex);
+        out->inter = *defaults;
     }
-    pft2::TileCoder tcod;
-    tcod.fs = &j.fs;
-    tcod.grid = j.grid;
-    tcod.levels = j.levels;
-    tcod.mi = j.mi;
-    tcod.rowStart = j.rowStart[tr]; tcod.rowEnd = j.rowStart[tr + 1];
-    tcod.colStart = j.colStart[tc]; tcod.colEnd = j.colStart[tc + 1];
-    tcod.cdf = &es.cdf;
-    tcod.ic = &es.inter;
-    uint8_t *ctx = j.ctx + j.ctxStride * 12 * t;
-    for (int p = 0; p < 3; p++) {
-        tcod.aboveLevel[p] = ctx + j.ctxStride * (4 * p + 0);
-        tcod.aboveDc[p] = ctx + j.ctxStride * (4 * p + 1);
-        tcod.leftLevel[p] = ctx + j.ctxStride * (4 * p + 2);
-        tcod.leftDc[p] = ctx + j.ctxStride * (4 * p + 3);
+}
+__device__ __host__ inline void setupCoder(pft2::TileCoder &t, const TileJob &j, int sb, int16_t *qv) {
+    const int miRow = (sb / j.sbCols) * 16, miCol = (sb % j.sbCols) * 16;
+    int tr, tc;
+    tileOfSb(j, miRow, miCol, tr, tc);
+    t.fs = &j.fs;
+    t.grid = j.grid;
+    t.levels = j.levels;
+    t.mi = j.mi;
+    t.rowStart = j.rowStart[tr]; t.rowEnd = j.rowStart[tr + 1];
+    t.colStart = j.colStart[tc]; t.colEnd = j.colStart[tc + 1];
+    t.cdf = &j.frameInit->cdf;
+    t.ic = &j.frameInit->inter;
+    t.base = reinterpret_cast<const uint16_t *>(j.frameInit);
+    for (int p = 0; p < 3; p++) { t.ctxLevel[p] = j.ctxLevel[p]; t.ctxDc[p] = j.ctxDc[p]; t.ctxStride[p] = j.ctxStride[p]; }
+    t.qv = qv;
+    t.recs = nullptr;
+    t.nrec = 0;
+    t.recCap = 0xffffffffu;
+    t.entries = nullptr;
+    t.nEntries = 0;
+    t.st = pft2::TileStats{};
+}
+// Phase 1: one thread per superblock (mode info, context maps, decode-order block list).
+__global__ void tilePhase1(TileJob j) {
+    const int sb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= j.sbCols * j.sbRows) return;
+    int16_t qv[1024];
+    pft2::TileCoder t;
+    setupCoder(t, j, sb, qv);
+    t.phase = 1;
+    t.entries = j.entries + size_t(sb) * 64;
+    t.superblock((sb / j.sbCols) * 16, (sb % j.sbCols) * 16, (uint32_t)sb);
+    if (t.st.error) atomicMax(j.error, t.st.error);
+    j.entryCount[sb] = t.nEntries;
+}
+// Phases 2 and 3: one thread per block of the lists.
+__device__ __host__ inline uint32_t blockRecCap(const pft2::BlockEntry &e) {
+    return 96u + 24u * (1u << e.lw) * (1u << e.lh);   // 16 records per sample over luma and chroma
+}
+// Fixed record regions: superblock sb owns [sb * sbCap, (sb + 1) * sbCap); its blocks follow in decode order.
+__global__ void blockOffsets(TileJob j, uint32_t sbCap) {
+    const int sb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= j.sbCols * j.sbRows) return;
+    uint32_t o = uint32_t(sb) * sbCap;
+    for (uint32_t k = 0; k < j.entryCount[sb]; k++) { j.sbOffset[sb * 64 + k] = o; o += blockRecCap(j.entries[sb * 64 + k]); }
+}
+__global__ void tilePhaseBlocks(TileJob j, int phase, int write) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sb = e >> 6;
+    if (sb >= j.sbCols * j.sbRows) return;
+    if ((e & 63) >= (int)j.entryCount[sb]) { if (phase == 3) j.sbCount[e] = 0; return; }
+    int16_t qv[1024];
+    pft2::TileCoder t;
+    setupCoder(t, j, sb, qv);
+    t.phase = phase;
+    t.recs = write ? j.recs + j.sbOffset[e] : nullptr;
+    t.recCap = write ? blockRecCap(j.entries[e]) : 0xffffffffu;
+    t.runEntry(j.entries[e]);
+    if (t.st.error) atomicMax(j.error, t.st.error);
+    if (phase == 3) j.sbCount[e] = t.nrec;
+}
+// Record offsets: per superblock sums (one thread each), a serial scan over superblocks, then per-block offsets.
+__global__ void prefixSb(TileJob j, uint32_t *sbTotal) {
+    const int sb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= j.sbCols * j.sbRows) return;
+    uint32_t t = 0;
+    for (int k = 0; k < 64; k++) t += j.sbCount[sb * 64 + k];
+    sbTotal[sb] = t;
+}
+__global__ void prefixScan(TileJob j, uint32_t *sbTotal) {
+    if (threadIdx.x || blockIdx.x) return;
+    const int n = j.sbCols * j.sbRows;
+    uint32_t total = 0;
+    for (int i = 0; i < n; i++) { const uint32_t v = sbTotal[i]; sbTotal[i] = total; total += v; }
+    j.sbOffset[n * 64] = total;
+    if (total > j.recCap) atomicMax(j.error, 100);
+}
+__global__ void prefixBlocks(TileJob j, const uint32_t *sbStart) {
+    const int sb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb >= j.sbCols * j.sbRows) return;
+    uint32_t o = sbStart[sb];
+    for (int k = 0; k < 64; k++) { j.sbOffset[sb * 64 + k] = o; o += j.sbCount[sb * 64 + k]; }
+}
+// Records-only mode: pack every tile's records contiguously in decode order (tile after tile).
+__global__ void packOffsets(TileJob j) {
+    if (threadIdx.x || blockIdx.x) return;
+    uint32_t total = 0;
+    for (int t = 0; t < j.tileCols * j.tileRows; t++) {
+        const uint32_t start = total;
+        const int tc = t % j.tileCols, tr = t / j.tileCols;
+        for (int r = j.rowStart[tr]; r < j.rowStart[tr + 1]; r += 16)
+            for (int c = j.colStart[tc]; c < j.colStart[tc + 1]; c += 16) {
+                const int sb = (r / 16) * j.sbCols + c / 16;
+                for (uint32_t b = 0; b < j.entryCount[sb]; b++) {
+                    j.packOff[sb * 64 + b] = total;
+                    total += j.sbCount[sb * 64 + b];
+                }
+            }
+        j.tileCount[t] = total - start;
     }
-    tcod.st = pft2::TileStats{};
-    av1g_ec_init(&tcod.ec, j.ecBuf + j.ecCapPerTile * t, (uint32_t)j.ecCapPerTile);
-    tcod.tile();
-    int n = -1;
-    if (!tcod.st.error) n = av1g_ec_done(&tcod.ec, j.out + j.ecCapPerTile * t);
-    if (n < 0 && !tcod.st.error) tcod.st.error = 6;
-    j.sizes[t] = n;
-    j.stats[t] = tcod.st;
-    if (t == j.contextTile && j.save) {
-        pft2::clearCounters(reinterpret_cast<uint16_t *>(&es), (int)(sizeof(es) / 2));
-        *j.save = es;
+}
+__global__ void packRecords(TileJob j) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sb = e >> 6;
+    if (sb >= j.sbCols * j.sbRows || (e & 63) >= (int)j.entryCount[sb]) return;
+    const uint32_t src = j.sbOffset[e], dst = j.packOff[e], n = j.sbCount[e];
+    for (uint32_t i = 0; i < n; i++) j.packed[dst + i] = j.recs[src + i];
+}
+// One CTA of one warp per tile: the warp prefetches records into shared memory, lane 0 range-codes them with the tile's
+// CDFs in shared memory.
+__global__ void __launch_bounds__(32) tileCode(TileJob j) {
+    __shared__ pft2::EntropyState es;
+    __shared__ pft2::SymRec buf[32];
+    const int t = blockIdx.x, lane = threadIdx.x;
+    if (t >= j.tileCols * j.tileRows) return;
+    if (*j.error) { if (!lane) j.sizes[t] = -1; return; }
+    {
+        const uint32_t *src = reinterpret_cast<const uint32_t *>(j.coderInit);
+        uint32_t *dst = reinterpret_cast<uint32_t *>(&es);
+        for (int i = lane; i < int(sizeof(es) / 4); i += 32) dst[i] = src[i];
+    }
+    __syncwarp();
+    av1g_ec ec;
+    if (!lane) av1g_ec_init(&ec, j.ecBuf + j.ecCapPerTile * t, (uint32_t)j.ecCapPerTile);
+    const int tc = t % j.tileCols, tr = t / j.tileCols;
+    uint16_t *base = reinterpret_cast<uint16_t *>(&es);
+    for (int r = j.rowStart[tr]; r < j.rowStart[tr + 1]; r += 16)
+        for (int c = j.colStart[tc]; c < j.colStart[tc + 1]; c += 16) {
+            const int sb = (r / 16) * j.sbCols + c / 16;
+            for (uint32_t b = 0; b < j.entryCount[sb]; b++) {
+                const uint32_t first = j.sbOffset[sb * 64 + b], last = first + j.sbCount[sb * 64 + b];
+                for (uint32_t k = first; k < last; k += 32) {
+                    if (k + lane < last) buf[lane] = j.recs[k + lane];
+                    __syncwarp();
+                    if (!lane) {
+                        const uint32_t m = min(32u, last - k);
+                        for (uint32_t i = 0; i < m; i++) pft2::codeRecord(&ec, base, buf[i]);
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+    if (!lane) {
+        const int n = av1g_ec_done(&ec, j.out + j.ecCapPerTile * t);
+        j.sizes[t] = n;
+        if (n < 0) atomicMax(j.error, 6);
+        if (t == j.contextTile && j.save) {
+            pft2::clearCounters(base, (int)(sizeof(es) / 2));
+            *j.save = es;
+        }
     }
 }
 // Pack the tiles contiguously (block t copies tile t after the sizes of the tiles before it).
@@ -1086,6 +1224,20 @@ __global__ void padFrame(uint8_t *plane, int pitch, int w, int h, int ph) {
     plane[y * pitch + x] = plane[min(y, h - 1) * pitch + min(x, w - 1)];
 }
 
+struct EntropySlot {
+    BlockInfo *grid = nullptr;
+    int16_t *levels = nullptr;
+    uint8_t *tileOut = nullptr, *packed = nullptr;
+    int *sizes = nullptr;
+    int *error = nullptr;
+    uint32_t *tileCount = nullptr;
+    pft2::SymRec *recs = nullptr;    // records-only mode output
+    bool recordsOnly = false;
+    cudaEvent_t staged = nullptr, done = nullptr;
+    cudaStream_t fetch = nullptr;
+    int nTiles = 0;
+};
+
 struct State {
     uint8_t *ds[1 + kMaxRefs] = {};
     Mv *coarse[kMaxRefs] = {};
@@ -1119,6 +1271,17 @@ struct State {
     int *tileSizes = nullptr;
     size_t ecCap = 0, ctxStride = 0;
     int maxTiles = 64;
+    cudaStream_t entStream = nullptr;
+    pft2::EntropyState *frameInit = nullptr, *coderInit = nullptr;
+    uint32_t *packOff = nullptr;
+    uint8_t *ctxLevel[3] = {}, *ctxDc[3] = {};
+    int ctxStride4[3] = {}, ctxRows4[3] = {};
+    uint32_t *sbCount = nullptr, *sbOffset = nullptr, *entryCount = nullptr;
+    pft2::BlockEntry *entries = nullptr;
+    uint32_t *sbTotal = nullptr;
+    pft2::SymRec *recs = nullptr;
+    uint32_t recCap = 0;
+    EntropySlot eslot[kEntropySlots];
     uint8_t *tfDs[kTfMax + 1] = {};
     Mv *tfCoarse[kTfMax] = {};
     int16_t *hphase = nullptr;
@@ -1126,6 +1289,9 @@ struct State {
     bool profile = false;
     cudaEvent_t ev[8] = {};
     double stageMs[8] = {};
+    cudaEvent_t eev[5] = {};
+    double entMs[4] = {};
+    int entFrames = 0;
     int frames = 0;
 };
 
@@ -1152,9 +1318,18 @@ Analyzer::~Analyzer() {
     cudaFree(s->sse);
     cudaFree(s->hphase);
     for (void *p : {(void *)s->slots, (void *)s->tileWork, (void *)s->staging, (void *)s->defaultInter, (void *)s->mi,
-                    (void *)s->tileStats, (void *)s->ctxArrays, (void *)s->tileOut, (void *)s->packed,
-                    (void *)s->ecBuf, (void *)s->tileSizes})
+                    (void *)s->tileStats, (void *)s->ecBuf})
         cudaFree(p);
+    for (auto &es : s->eslot) {
+        cudaFree(es.grid); cudaFree(es.levels); cudaFree(es.tileOut); cudaFree(es.packed); cudaFree(es.sizes); cudaFree(es.error); cudaFree(es.tileCount); cudaFree(es.recs);
+        if (es.staged) cudaEventDestroy(es.staged);
+        if (es.done) cudaEventDestroy(es.done);
+        if (es.fetch) cudaStreamDestroy(es.fetch);
+    }
+    if (s->entStream) cudaStreamDestroy(s->entStream);
+    cudaFree(s->entries); cudaFree(s->entryCount); cudaFree(s->sbTotal);
+    cudaFree(s->frameInit); cudaFree(s->coderInit); cudaFree(s->packOff); cudaFree(s->sbCount); cudaFree(s->sbOffset); cudaFree(s->recs);
+    for (int p = 0; p < 3; p++) { cudaFree(s->ctxLevel[p]); cudaFree(s->ctxDc[p]); }
     for (auto *p : s->tfDs) cudaFree(p);
     for (auto *p : s->tfCoarse) cudaFree(p);
     for (auto *p : s->best) cudaFree(p);
@@ -1165,6 +1340,11 @@ Analyzer::~Analyzer() {
         for (int i = 0; i < 6; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
     }
     for (auto &e : s->ev) if (e) cudaEventDestroy(e);
+    if (s->profile && s->entFrames) {
+        const char *names[] = {"entropy phase 1", "entropy phase 2", "entropy phase 3", "entropy coder"};
+        for (int i = 0; i < 4; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->entMs[i] / s->entFrames);
+    }
+    for (auto &e : s->eev) if (e) cudaEventDestroy(e);
     delete s;
 }
 
@@ -1232,13 +1412,45 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->mi, sizeof(pft2::MiInfo) * miCols * miRows);
         alloc(&s->tileStats, sizeof(pft2::TileStats) * s->maxTiles);
         s->ctxStride = size_t(miCols + miRows + 64);
-        alloc(&s->ctxArrays, s->ctxStride * 12 * s->maxTiles);
         // the precarry buffer holds one entry per output byte: a generous bound per tile (any tile may hold the frame)
         s->ecCap = size_t(aw) * ah * 3 / 2 + 65536;
         alloc(&s->ecBuf, sizeof(uint16_t) * s->ecCap * 2);
-        alloc(&s->tileOut, s->ecCap * 2);
-        alloc(&s->packed, s->ecCap * 2);
-        alloc(&s->tileSizes, sizeof(int) * (s->maxTiles + 1));
+        {
+            // lowest priority: the entropy kernels fill SMs the analysis of later frames leaves idle
+            int lo = 0, hi = 0;
+            cudaDeviceGetStreamPriorityRange(&lo, &hi);
+            if (e == cudaSuccess) e = cudaStreamCreateWithPriority(&s->entStream, cudaStreamNonBlocking, lo);
+        }
+        alloc(&s->frameInit, sizeof(pft2::EntropyState));
+        alloc(&s->coderInit, sizeof(pft2::EntropyState));
+        for (int p = 0; p < 3; p++) {
+            s->ctxStride4[p] = (p ? aw / 2 : aw) / 4;
+            s->ctxRows4[p] = (p ? ah / 2 : ah) / 4;
+            alloc(&s->ctxLevel[p], size_t(s->ctxStride4[p]) * s->ctxRows4[p]);
+            alloc(&s->ctxDc[p], size_t(s->ctxStride4[p]) * s->ctxRows4[p]);
+        }
+        const int nSb = (aw / 64) * (ah / 64);
+        alloc(&s->sbCount, sizeof(uint32_t) * (nSb * 64 + 1));
+        alloc(&s->sbOffset, sizeof(uint32_t) * (nSb * 64 + 1));
+        alloc(&s->entries, sizeof(pft2::BlockEntry) * nSb * 64);
+        alloc(&s->entryCount, sizeof(uint32_t) * nSb);
+        alloc(&s->sbTotal, sizeof(uint32_t) * nSb);
+        alloc(&s->packOff, sizeof(uint32_t) * nSb * 64);
+        s->recCap = uint32_t(nSb) * (64u * 96u + 24u * 4096u);
+        alloc(&s->recs, sizeof(pft2::SymRec) * s->recCap);
+        for (auto &es : s->eslot) alloc(&es.recs, sizeof(pft2::SymRec) * s->recCap);
+        for (auto &es : s->eslot) {
+            alloc(&es.grid, gridCount() * sizeof(BlockInfo));
+            alloc(&es.levels, levelCount() * sizeof(int16_t));
+            alloc(&es.tileOut, s->ecCap * 2);
+            alloc(&es.packed, s->ecCap * 2);
+            alloc(&es.sizes, sizeof(int) * (s->maxTiles + 1));
+            alloc(&es.error, sizeof(int));
+            alloc(&es.tileCount, sizeof(uint32_t) * s->maxTiles);
+            if (e == cudaSuccess) e = cudaEventCreateWithFlags(&es.staged, cudaEventDisableTiming);
+            if (e == cudaSuccess) e = cudaEventCreateWithFlags(&es.done, cudaEventDisableTiming);
+            if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&es.fetch, cudaStreamNonBlocking);
+        }
         pft2::InterCdfs d{};
         memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
         memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
@@ -1272,6 +1484,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
     s->profile = getenv("AV1GPU_PF_PROFILE") != nullptr;
     if (s->profile)
         for (auto &ev : s->ev) cudaEventCreate(&ev);
+    if (s->profile)
+        for (auto &ev : s->eev) cudaEventCreate(&ev);
     if (gp_upload_tables_pframe(gp_host_tables())) {
         snprintf(err, errLen, "P-frame table upload failed");
         return -1;
@@ -1432,11 +1646,14 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     return 0;
 }
 
-int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen) {
+// Entropy coding of the last analyzed frame, asynchronous: the decisions are staged into entropy slot k (on the
+// analysis stream), then the tile kernel runs on its own stream, overlapping the analysis of later frames. Kernels of
+// that stream run in coding order, so the reference-slot CDFs they read and write stay consistent.
+int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
     const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
-    auto maxLog2 = [](int sb) { int k = 0; while ((1 << k) < (sb < 64 ? sb : 64)) ++k; return k; };
+    auto maxLog2 = [](int sb) { int q = 0; while ((1 << q) < (sb < 64 ? sb : 64)) ++q; return q; };
     const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
     TileJob j{};
     const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
@@ -1445,54 +1662,113 @@ int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLe
     for (int sb = 0; sb < sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
     j.rowStart[j.tileRows] = miRows;
     const int nTiles = j.tileCols * j.tileRows;
-    if (nTiles > s->maxTiles) {
-        snprintf(err, errLen, "too many tiles (%d)", nTiles);
+    if (nTiles > s->maxTiles || k < 0 || k >= kEntropySlots) {
+        snprintf(err, errLen, "too many tiles (%d) or bad entropy slot", nTiles);
         return -1;
     }
+    EntropySlot &es = s->eslot[k];
+    es.nTiles = nTiles;
+    cudaError_t e = cudaMemcpyAsync(es.grid, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(es.levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToDevice);
+    if (e == cudaSuccess) e = cudaEventRecord(es.staged, 0);
+    if (e == cudaSuccess) e = cudaStreamWaitEvent(s->entStream, es.staged, 0);
     j.fs.refName[0] = in.refName[0];
     j.fs.refName[1] = in.refName[1];
     j.fs.referenceSelect = in.referenceSelect;
     j.fs.txModeSelect = in.txModeSelect;
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
-    j.grid = s->grid;
-    j.levels = s->outLevels;
+    j.grid = es.grid;
+    j.levels = es.levels;
     j.mi = s->mi;
-    cudaError_t e = cudaSuccess;
-    if (in.primarySlot >= 0) {
-        // stage the primary CDFs: the save slot may be the same slot
-        e = cudaMemcpyAsync(s->staging, s->slots + in.primarySlot, sizeof(pft2::EntropyState), cudaMemcpyDeviceToDevice);
-        j.primary = s->staging;
-    }
-    j.defaultInter = s->defaultInter;
-    j.work = s->tileWork;
+    j.frameInit = s->frameInit;
+    j.coderInit = s->coderInit;
+    j.packOff = s->packOff; j.tileCount = es.tileCount; j.packed = es.recs;
     j.save = in.saveSlot >= 0 ? s->slots + in.saveSlot : nullptr;
     j.contextTile = std::min(in.contextTile, nTiles - 1);
-    j.qindex = in.qindex;
-    j.ctx = s->ctxArrays;
-    j.ctxStride = s->ctxStride;
+    j.sbCols = sbCols; j.sbRows = sbRows;
+    for (int p = 0; p < 3; p++) { j.ctxLevel[p] = s->ctxLevel[p]; j.ctxDc[p] = s->ctxDc[p]; j.ctxStride[p] = s->ctxStride4[p]; }
+    j.sbCount = s->sbCount; j.sbOffset = s->sbOffset;
+    j.entries = s->entries; j.entryCount = s->entryCount;
+    j.recs = s->recs; j.recCap = s->recCap;
+    j.error = es.error;
     j.ecCapPerTile = s->ecCap * 2 / nTiles;
     j.ecBuf = s->ecBuf;
-    j.out = s->tileOut;
-    j.sizes = s->tileSizes;
-    j.stats = s->tileStats;
-    tileEntropy<<<nTiles, 32>>>(j);
-    packTiles<<<nTiles, 256>>>(s->tileOut, j.ecCapPerTile, s->tileSizes, nTiles, s->packed);
-    std::vector<int> sizes(nTiles);
-    std::vector<pft2::TileStats> stats(nTiles);
-    if (e == cudaSuccess) e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaMemcpy(sizes.data(), s->tileSizes, sizeof(int) * nTiles, cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess)
-        e = cudaMemcpy(stats.data(), s->tileStats, sizeof(pft2::TileStats) * nTiles, cudaMemcpyDeviceToHost);
-    size_t total = 0;
-    for (int t = 0; t < nTiles && e == cudaSuccess; t++) {
-        if (sizes[t] < 0 || stats[t].error) {
-            snprintf(err, errLen, "tile %d could not be coded (error %d)", t, stats[t].error);
+    j.out = es.tileOut;
+    j.sizes = es.sizes;
+    cudaStream_t st = s->entStream;
+    if (e == cudaSuccess) e = cudaMemsetAsync(es.error, 0, sizeof(int), st);
+    for (int p = 0; p < 3 && e == cudaSuccess; p++) {
+        const size_t bytes = size_t(s->ctxStride4[p]) * s->ctxRows4[p];
+        e = cudaMemsetAsync(s->ctxLevel[p], 0, bytes, st);
+        if (e == cudaSuccess) e = cudaMemsetAsync(s->ctxDc[p], 0, bytes, st);
+    }
+    // costs and cdf ids from the default CDFs; the coder starts from the primary slot, copied before this frame may
+    // overwrite it as its save slot
+    initFrameCdfs<<<1, 1, 0, st>>>(s->frameInit, nullptr, s->defaultInter, in.qindex);
+    if (!in.recordsOnly)
+        initFrameCdfs<<<1, 1, 0, st>>>(s->coderInit, in.primarySlot >= 0 ? s->slots + in.primarySlot : nullptr,
+                                       s->defaultInter, in.qindex);
+    const int nSb = sbCols * sbRows;
+    auto emark = [&](int i) { if (s->profile) cudaEventRecord(s->eev[i], st); };
+    emark(0);
+    tilePhase1<<<(nSb + 63) / 64, 64, 0, st>>>(j);
+    emark(1);
+    tilePhaseBlocks<<<nSb, 64, 0, st>>>(j, 4, 0);
+    tilePhaseBlocks<<<nSb, 64, 0, st>>>(j, 2, 0);
+    emark(2);
+    blockOffsets<<<(nSb + 127) / 128, 128, 0, st>>>(j, s->recCap / nSb);
+    tilePhaseBlocks<<<nSb, 64, 0, st>>>(j, 3, 1);
+    emark(3);
+    es.recordsOnly = in.recordsOnly;
+    if (in.recordsOnly) {
+        packOffsets<<<1, 1, 0, st>>>(j);
+        packRecords<<<nSb, 64, 0, st>>>(j);
+        if (e == cudaSuccess) e = cudaEventRecord(es.done, st);
+        if (e == cudaSuccess) e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            snprintf(err, errLen, "tile entropy launch: %s", cudaGetErrorString(e));
             return -1;
         }
-        total += sizes[t];
+        return 0;
     }
+    tileCode<<<nTiles, 32, 0, st>>>(j);
+    emark(4);
+    if (s->profile) {
+        cudaEventSynchronize(s->eev[4]);
+        for (int i = 0; i < 4; i++) { float ms; cudaEventElapsedTime(&ms, s->eev[i], s->eev[i + 1]); s->entMs[i] += ms; }
+        s->entFrames++;
+    }
+    packTiles<<<nTiles, 256, 0, st>>>(es.tileOut, j.ecCapPerTile, es.sizes, nTiles, es.packed);
+    if (e == cudaSuccess) e = cudaEventRecord(es.done, s->entStream);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "tile entropy launch: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
+
+int Analyzer::entropyFetch(int k, EntropyOut &out, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    EntropySlot &es = s->eslot[k];
+    const int nTiles = es.nTiles;
+    std::vector<int> sizes(nTiles);
+    int error = 0;
+    // the fetch stream does not wait for later analysis or entropy work
+    cudaError_t e = cudaEventSynchronize(es.done);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(sizes.data(), es.sizes, sizeof(int) * nTiles, cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(&error, es.error, sizeof(int), cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(es.fetch);
+    if (e == cudaSuccess && error) {
+        snprintf(err, errLen, "tile entropy coding failed (error %d%s)", error,
+                 error == 9 ? ": symbol buffer overflow, use --pf-cpu-entropy" : "");
+        return -1;
+    }
+    size_t total = 0;
+    for (int t = 0; t < nTiles; t++) total += sizes[t];
     std::vector<uint8_t> packed(total);
-    if (e == cudaSuccess && total) e = cudaMemcpy(packed.data(), s->packed, total, cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess && total) e = cudaMemcpyAsync(packed.data(), es.packed, total, cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(es.fetch);
     if (e != cudaSuccess) {
         snprintf(err, errLen, "tile entropy: %s", cudaGetErrorString(e));
         return -1;
@@ -1500,14 +1776,45 @@ int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLe
     out.tiles.assign(nTiles, {});
     size_t off = 0;
     out.compound = 0;
-    for (int k = 0; k < 4; k++) { out.bits[k] = 0; out.modes[k] = 0; }
+    for (int q = 0; q < 4; q++) { out.bits[q] = 0; out.modes[q] = 0; }
     for (int t = 0; t < nTiles; t++) {
         out.tiles[t].assign(packed.begin() + off, packed.begin() + off + sizes[t]);
         off += sizes[t];
-        for (int k = 0; k < 4; k++) { out.bits[k] += stats[t].bits[k]; out.modes[k] += stats[t].modeCount[k]; }
-        out.compound += stats[t].compound;
     }
     return 0;
+}
+
+int Analyzer::entropyFetchRecords(int k, std::vector<uint32_t> &tileCounts, std::vector<uint8_t> &records, char *err,
+                                  int errLen) {
+    auto *s = static_cast<State *>(state);
+    EntropySlot &es = s->eslot[k];
+    tileCounts.assign(es.nTiles, 0);
+    int error = 0;
+    cudaError_t e = cudaEventSynchronize(es.done);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(tileCounts.data(), es.tileCount, sizeof(uint32_t) * es.nTiles, cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(&error, es.error, sizeof(int), cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(es.fetch);
+    if (e == cudaSuccess && error) {
+        snprintf(err, errLen, "inter symbol modeling failed (error %d%s)", error,
+                 error == 9 ? ": symbol buffer overflow, use --pf-cpu-entropy" : "");
+        return -1;
+    }
+    size_t total = 0;
+    for (uint32_t c : tileCounts) total += c;
+    records.resize(total * sizeof(pft2::SymRec));
+    if (e == cudaSuccess && total)
+        e = cudaMemcpyAsync(records.data(), es.recs, records.size(), cudaMemcpyDeviceToHost, es.fetch);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(es.fetch);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "symbol records: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
+
+int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen) {
+    return entropyLaunch(in, 0, err, errLen) ? -1 : entropyFetch(0, out, err, errLen);
 }
 
 int Analyzer::download(BlockInfo *info, int16_t *levels, char *err, int errLen) {
@@ -1530,7 +1837,11 @@ struct HostState {
     std::vector<uint8_t> ctx;
     std::vector<uint16_t> ecBuf;
     std::vector<uint8_t> out;
-    pft2::EntropyState work;
+    pft2::EntropyState work, init;
+    int16_t qv[1024];
+    std::vector<uint8_t> ctxLevel[3], ctxDc[3];
+    std::vector<pft2::SymRec> recs;
+    std::vector<pft2::BlockEntry> entries;
 };
 }  // namespace
 
@@ -1543,7 +1854,10 @@ int HostEntropy::init(int width, int height, char *, int) {
     state = s;
     const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
     s->mi.resize(size_t(miCols) * miRows);
-    s->ctx.resize(size_t(miCols + miRows + 64) * 12);
+    for (int p = 0; p < 3; p++) {
+        s->ctxLevel[p].resize(size_t((p ? aw / 2 : aw) / 4) * ((p ? ah / 2 : ah) / 4));
+        s->ctxDc[p].resize(s->ctxLevel[p].size());
+    }
     s->ecBuf.resize(size_t(aw) * ah * 3 / 2 + 65536);
     s->out.resize(s->ecBuf.size());
     pft2::InterCdfs &d = s->defaults;
@@ -1580,62 +1894,131 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     auto maxLog2 = [](int sb) { int k = 0; while ((1 << k) < (sb < 64 ? sb : 64)) ++k; return k; };
     const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
     const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
-    std::vector<int> colStart, rowStart;
-    for (int sb = 0; sb < sbCols; sb += wSb) colStart.push_back(sb * 16);
-    colStart.push_back(miCols);
-    for (int sb = 0; sb < sbRows; sb += hSb) rowStart.push_back(sb * 16);
-    rowStart.push_back(miRows);
-    const int tileCols = int(colStart.size()) - 1, tileRows = int(rowStart.size()) - 1, nTiles = tileCols * tileRows;
+    TileJob j{};
+    for (int sb = 0; sb < sbCols; sb += wSb) j.colStart[j.tileCols++] = sb * 16;
+    j.colStart[j.tileCols] = miCols;
+    for (int sb = 0; sb < sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
+    j.rowStart[j.tileRows] = miRows;
+    const int nTiles = j.tileCols * j.tileRows;
     pft2::FrameSyntax fs{};
     fs.refName[0] = in.refName[0];
     fs.refName[1] = in.refName[1];
     fs.referenceSelect = in.referenceSelect;
     fs.txModeSelect = in.txModeSelect;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
-    pft2::EntropyState primary;
-    if (in.primarySlot >= 0) {
-        primary = s->slots[in.primarySlot];
-    } else {
-        av1g_cdfs_init(&primary.cdf, in.qindex);
-        primary.inter = s->defaults;
+    // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
+    pft2::EntropyState &init = s->init;
+    av1g_cdfs_init(&init.cdf, in.qindex);
+    init.inter = s->defaults;
+    for (int p = 0; p < 3; p++) {
+        std::fill(s->ctxLevel[p].begin(), s->ctxLevel[p].end(), 0);
+        std::fill(s->ctxDc[p].begin(), s->ctxDc[p].end(), 0);
     }
-    const int contextTile = std::min(in.contextTile, nTiles - 1);
-    out.tiles.assign(nTiles, {});
+    const int nSb = sbCols * sbRows;
+    j.fs = fs;
+    j.grid = grid;
+    j.levels = levels;
+    j.mi = s->mi.data();
+    j.frameInit = &init;
+    j.sbCols = sbCols; j.sbRows = sbRows;
+    for (int p = 0; p < 3; p++) {
+        j.ctxLevel[p] = s->ctxLevel[p].data();
+        j.ctxDc[p] = s->ctxDc[p].data();
+        j.ctxStride[p] = (p ? aw / 2 : aw) / 4;
+    }
+    s->entries.resize(size_t(nSb) * 64);
+    std::vector<uint32_t> entryCount(nSb), count(size_t(nSb) * 64 + 1, 0), offset(size_t(nSb) * 64 + 1, 0);
     out.compound = 0;
     for (int k = 0; k < 4; k++) { out.bits[k] = 0; out.modes[k] = 0; }
-    const size_t stride = size_t(miCols + miRows + 64);
+    int error = 0;
+    for (int sb = 0; sb < nSb && !error; sb++) {
+        pft2::TileCoder t;
+        setupCoder(t, j, sb, s->qv);
+        t.fs = &fs;
+        t.phase = 1;
+        t.entries = s->entries.data() + size_t(sb) * 64;
+        t.superblock((sb / sbCols) * 16, (sb % sbCols) * 16, (uint32_t)sb);
+        error = t.st.error;
+        entryCount[sb] = t.nEntries;
+    }
+    auto blocks = [&](int phase, bool write) {
+        for (int sb = 0; sb < nSb && !error; sb++)
+            for (uint32_t k = 0; k < entryCount[sb] && !error; k++) {
+                const size_t e = size_t(sb) * 64 + k;
+                pft2::TileCoder t;
+                setupCoder(t, j, sb, s->qv);
+                t.fs = &fs;
+                t.phase = phase;
+                t.recs = write ? s->recs.data() + offset[e] : nullptr;
+                t.runEntry(s->entries[e]);
+                error = t.st.error;
+                if (phase == 2) {
+                    for (int q = 0; q < 4; q++) out.modes[q] += t.st.modeCount[q];
+                    out.compound += t.st.compound;
+                }
+                if (phase == 3 && !write) count[e] = t.nrec;
+            }
+    };
+    blocks(4, false);
+    blocks(2, false);
+    blocks(3, false);
+    if (!error) {
+        for (size_t e = 0; e < size_t(nSb) * 64; e++) offset[e + 1] = offset[e] + count[e];
+        if (s->recs.size() < offset[size_t(nSb) * 64]) s->recs.resize(offset[size_t(nSb) * 64]);
+        blocks(3, true);
+    }
+    if (error) {
+        snprintf(err, errLen, "inter tile syntax failed (error %d)", error);
+        return -1;
+    }
+    // pack the records tile after tile in decode order and range-code them
+    std::vector<uint32_t> tileCounts(nTiles, 0);
+    std::vector<uint8_t> packed;
     for (int t = 0; t < nTiles; t++) {
-        s->work = primary;
-        pft2::TileCoder tc;
-        tc.fs = &fs;
-        tc.grid = grid;
-        tc.levels = levels;
-        tc.mi = s->mi.data();
-        tc.rowStart = rowStart[t / tileCols]; tc.rowEnd = rowStart[t / tileCols + 1];
-        tc.colStart = colStart[t % tileCols]; tc.colEnd = colStart[t % tileCols + 1];
-        tc.cdf = &s->work.cdf;
-        tc.ic = &s->work.inter;
-        for (int p = 0; p < 3; p++) {
-            tc.aboveLevel[p] = s->ctx.data() + stride * (4 * p + 0);
-            tc.aboveDc[p] = s->ctx.data() + stride * (4 * p + 1);
-            tc.leftLevel[p] = s->ctx.data() + stride * (4 * p + 2);
-            tc.leftDc[p] = s->ctx.data() + stride * (4 * p + 3);
-        }
-        tc.st = pft2::TileStats{};
-        av1g_ec_init(&tc.ec, s->ecBuf.data(), (uint32_t)s->ecBuf.size());
-        tc.tile();
-        const int n = tc.st.error ? -1 : av1g_ec_done(&tc.ec, s->out.data());
+        const int tc = t % j.tileCols, tr = t / j.tileCols;
+        for (int r = j.rowStart[tr]; r < j.rowStart[tr + 1]; r += 16)
+            for (int c = j.colStart[tc]; c < j.colStart[tc + 1]; c += 16) {
+                const int sb = (r / 16) * sbCols + c / 16;
+                const uint32_t first = offset[size_t(sb) * 64], last = offset[size_t(sb) * 64 + 64];
+                const uint8_t *p0 = reinterpret_cast<const uint8_t *>(s->recs.data() + first);
+                packed.insert(packed.end(), p0, p0 + (last - first) * sizeof(pft2::SymRec));
+                tileCounts[t] += last - first;
+            }
+    }
+    return codeRecords(in, tileCounts, packed, out, err, errLen);
+}
+
+int HostEntropy::codeRecords(const EntropyIn &in, const std::vector<uint32_t> &tileCounts,
+                             const std::vector<uint8_t> &records, EntropyOut &out, char *err, int errLen) {
+    auto *s = static_cast<HostState *>(state);
+    const int nTiles = int(tileCounts.size());
+    const pft2::SymRec *recs = reinterpret_cast<const pft2::SymRec *>(records.data());
+    pft2::EntropyState start;
+    if (in.primarySlot >= 0) {
+        start = s->slots[in.primarySlot];
+    } else {
+        av1g_cdfs_init(&start.cdf, in.qindex);
+        start.inter = s->defaults;
+    }
+    out.tiles.assign(nTiles, {});
+    const int contextTile = std::min(in.contextTile, nTiles - 1);
+    size_t at = 0;
+    for (int t = 0; t < nTiles; t++) {
+        s->work = start;
+        uint16_t *base = reinterpret_cast<uint16_t *>(&s->work);
+        av1g_ec ec;
+        av1g_ec_init(&ec, s->ecBuf.data(), (uint32_t)s->ecBuf.size());
+        for (uint32_t k = 0; k < tileCounts[t]; k++) pft2::codeRecord(&ec, base, recs[at + k]);
+        at += tileCounts[t];
+        const int n = av1g_ec_done(&ec, s->out.data());
         if (n < 0) {
-            snprintf(err, errLen, "tile %d could not be coded (error %d)", t, tc.st.error ? tc.st.error : 6);
+            snprintf(err, errLen, "tile %d overflow", t);
             return -1;
         }
         out.tiles[t].assign(s->out.begin(), s->out.begin() + n);
-        for (int k = 0; k < 4; k++) { out.bits[k] += tc.st.bits[k]; out.modes[k] += tc.st.modeCount[k]; }
-        out.compound += tc.st.compound;
         if (t == contextTile && in.saveSlot >= 0) {
-            pft2::EntropyState saved = s->work;
-            pft2::clearCounters(reinterpret_cast<uint16_t *>(&saved), (int)(sizeof(saved) / 2));
-            s->slots[in.saveSlot] = saved;
+            pft2::clearCounters(base, (int)(sizeof(s->work) / 2));
+            s->slots[in.saveSlot] = s->work;
         }
     }
     return 0;
