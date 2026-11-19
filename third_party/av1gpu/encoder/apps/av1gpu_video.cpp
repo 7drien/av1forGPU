@@ -202,6 +202,8 @@ int main(int argc, char **argv) {
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-no-rect")) {
             pfSettings.rectPartitions = false;
+        } else if (!strcmp(argv[i], "--pf-switchable")) {
+            pfSettings.switchableFilter = true;
         } else if (!strcmp(argv[i], "--pf-no-tx-types")) {
             pfSettings.txTypes = 0;
         } else if (!strcmp(argv[i], "--pf-tx-types-reduced")) {
@@ -648,6 +650,7 @@ int main(int argc, char **argv) {
             ein.referenceSelect = refCount == 2;
             ein.txModeSelect = pfSettings.txSplit;
             ein.reducedTxSet = pfSettings.txTypes < 2;
+            ein.switchableFilter = pfSettings.switchableFilter;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -658,6 +661,7 @@ int main(int argc, char **argv) {
             fp.referenceSelect = refCount == 2;
             fp.txModeSelect = pfSettings.txSplit;
             fp.reducedTxSet = pfSettings.txTypes < 2;
+            fp.switchable = pfSettings.switchableFilter;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;

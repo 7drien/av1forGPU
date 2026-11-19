@@ -31,6 +31,7 @@ struct InterCdfs {
     uint16_t mvSign[2][3], mvClass[2][12], class0Bit[2][3], class0Fr[2][2][5], mvFr[2][5], mvBit[2][10][3];
     uint16_t txSet3[4][3];
     uint16_t txSet1[2][17], txSet2[13];
+    uint16_t interpFilter[16][4];
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
 };
@@ -79,6 +80,7 @@ struct MiInfo {
     pf::Mv mv[2];
     uint8_t refIdx;    // RefMvIdx of the chosen mode
     uint8_t txW, txH;  // log2 of the luma transform width and height (InterTxSizes)
+    uint8_t filter;    // InterpFilters[][0] (EIGHTTAP for GLOBALMV blocks, which code none)
     uint32_t order;    // decode order: superblock index << 8 | block index in the superblock
 };
 
@@ -124,6 +126,7 @@ struct FrameSyntax {
     int referenceSelect;
     int txModeSelect;     // TX_MODE_SELECT: coded blocks signal txfm_split
     int reducedTxSet;     // reduced_tx_set
+    int switchable;       // is_filter_switchable
     int miRows, miCols, aw, ah, gcols;
 };
 
@@ -843,6 +846,7 @@ struct TileCoder {
                     m.txW = (uint8_t)(imin(lw, 6) - (lw == lh ? depth : (depth && lw > lh)));
                     m.txH = (uint8_t)(imin(lh, 6) - (lw == lh ? depth : (depth && lh > lw)));
                     m.order = curOrder;
+                    m.filter = bi.filter;
                 }
             if (!skip) forTransformAreas(miRow, miCol, lw, lh, depth, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
             return;
@@ -874,6 +878,9 @@ struct TileCoder {
                 for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
                     at(r, c).mode = (uint8_t)bestMode;
                     at(r, c).refIdx = (uint8_t)bestIdx;
+                    // needs_interp_filter() is 0 for GLOBALMV / GLOBAL_GLOBALMV (GmType IDENTITY): EIGHTTAP. Their
+                    // vectors are zero, so the prediction does not depend on the filter.
+                    if (bestMode == GLOBALMV || bestMode == GLOBAL_GLOBALMV) at(r, c).filter = 0;
                 }
             const int m0 = modeOfList(bestMode, 0);
             st.modeCount[m0 == NEARESTMV ? 0 : m0 == NEARMV ? 1 : m0 == GLOBALMV ? 2 : 3]++;
@@ -938,6 +945,18 @@ struct TileCoder {
         }
         for (int i = 0; i < 1 + compound; ++i)
             if (modeOfList(bestMode, i) == NEWMV) writeMv(target[i], bestPred[i]);
+        if (fs->switchable && bestMode != GLOBALMV && bestMode != GLOBAL_GLOBALMV) {
+            // interp_filter[0] (enable_dual_filter = 0), context of spec 8.3.2
+            int ctx = compound * 4;
+            int leftType = 3, aboveType = 3;
+            if (availL && (left->ref[0] == rp.r0 || left->ref[1] == rp.r0)) leftType = left->filter;
+            if (availU && (above->ref[0] == rp.r0 || above->ref[1] == rp.r0)) aboveType = above->filter;
+            if (leftType == aboveType) ctx += leftType;
+            else if (leftType == 3) ctx += aboveType;
+            else if (aboveType == 3) ctx += leftType;
+            else ctx += 3;
+            sym(ic->interpFilter[ctx], self.filter, 3);
+        }
         if (fs->txModeSelect && !skip) {
             const int maxTx = imin(size, 6) - 2;   // square find_tx_size(Min(64, Max(bw, bh)))
             auto txCtx = [&](int row, int col, int tw2, int th2) {

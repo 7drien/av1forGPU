@@ -36,6 +36,7 @@ struct Cand {
     uint8_t ref;          // 0, 1: single reference; 2: compound
     uint8_t nz;           // coded option has nonzero levels
     uint8_t txSplit;      // luma of the coded option uses four half-size transforms
+    uint8_t filter;       // interp_filter: 0 EIGHTTAP, 1 SMOOTH, 2 SHARP
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
 };
@@ -65,13 +66,16 @@ __device__ __forceinline__ float mvBits(Mv mv, Mv pred) {
 // Exact AV1 single-reference inter prediction (spec 7.11.3.3 / 7.11.3.4, unscaled reference, regular
 // eight-tap filter; blocks of width or height 4 use the four-tap variant). One warp predicts a w x h block.
 // tmp holds (h + 7) * w intermediate values.
+// Subpel_Filters row of interp_filter f (0 EIGHTTAP, 1 SMOOTH, 2 SHARP) for a block side of n samples: sides of 4 use
+// the four-tap rows (4: regular and sharp, 5: smooth), spec 7.11.3.4.
+__device__ __forceinline__ int filterRow(int f, int n) { return n <= 4 ? (f == 1 ? 5 : 4) : f; }
 __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, int w, int h, Mv mv, int sub,
-                            int16_t *tmp, uint8_t *out) {
+                            int16_t *tmp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
     const int X = (x0 << 4) + ((2 * mv.col) >> sub);
     const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
     const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
-    const int fh = w <= 4 ? 4 : 0, fv = h <= 4 ? 4 : 0;
+    const int fh = filterRow(filt, w), fv = filterRow(filt, h);
     const int lastX = pw - 1, lastY = ph - 1;
     if (!fx && !fy) {
         for (int i = lane; i < w * h; i += 32) {
@@ -104,9 +108,9 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
 // Exact AV1 compound-average prediction (spec 7.11.3.1 with InterRound1 = 7 and InterPostRound = 4):
 // Clip1(Round2(p0 + p1, 5)). hp holds w * h int16 values.
 __device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, int pw, int ph, int x0, int y0, int w,
-                                    int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out) {
+                                    int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
-    const int fh = w <= 4 ? 4 : 0, fv = h <= 4 ? 4 : 0;
+    const int fh = filterRow(filt, w), fv = filterRow(filt, h);
     const int lastX = pw - 1, lastY = ph - 1;
     const int ih = h + 7;
     for (int k = 0; k < 2; k++) {
@@ -540,6 +544,8 @@ struct EvalArgs {
     // null: DCT_DCT only
     uint8_t *types1, *types2, *types3;
     int reducedTxSet;   // reduced_tx_set: luma types limited to IDTX / DCT_DCT
+    int switchable;     // is_filter_switchable: choose the interpolation filter per block
+    float filterBias;   // scale of the SMOOTH / SHARP bit estimate
     int txExhaustive;   // price every type of the set (else a subset)
 };
 // inter_tx_type default CDFs (spec Default_Inter_Tx_Type_Set1/2/3_Cdf) for the type bits of the search
@@ -638,6 +644,30 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     bool nzSplit[3] = {false, false, false}, nzC = false;
     int wholeType = AV1G_DCT_DCT, splitTop[3] = {AV1G_DCT_DCT, AV1G_DCT_DCT, AV1G_DCT_DCT}, depth = 0, chromaType = AV1G_DCT_DCT;
     const int tstride = f.aw >> 2;
+    // interpolation filter (one per block, both references): luma SSE plus approximate interp_filter bits, tried only
+    // when a vector is fractional in some plane (1/16 chroma units: luma integer vectors may be chroma half-pel)
+    int filt = 0;
+    if (a.switchable && (((c.mv.row | c.mv.col) & 15) || (c.ref == 2 && ((c.mv2.row | c.mv2.col) & 15)))) {
+        const float fbits[3] = {0.21f, 2.9f, 7.6f};   // Default_Interp_Filter_Cdf context 3 (no neighbour information)
+        float bestJ = 3.4e38f;
+        uint8_t *pl = predS[warp];
+        for (int t = 0; t < 3; t++) {
+            if (c.ref == 2)
+                warpPredictCompound(f.ref[0], ref2, f.w, f.h, x0, y0, BW, BH, c.mv, c.mv2, 0, interp[warp], hpS[warp], pl, t);
+            else
+                warpPredict(ref, f.w, f.h, x0, y0, BW, BH, c.mv, 0, interp[warp], pl, t);
+            int v = 0;
+            for (int i = lane; i < AREA; i += 32) {
+                const int r = i / BW, col = i % BW;
+                if (x0 + col >= f.w || y0 + r >= f.h) continue;
+                const int d = (int)f.src[0][(y0 + r) * f.pitch[0] + x0 + col] - pl[i];
+                v += d * d;
+            }
+            const float J = (float)warp_sumi(v) + a.lambda * (t ? fbits[t] * a.filterBias : fbits[t]);
+            if (J < bestJ) { bestJ = J; filt = t; }
+        }
+    }
+    if (!lane) c.filter = (uint8_t)filt;
 #pragma unroll
     for (int p = 0; p < 3; p++) {
         const int sub = p > 0, bw = p ? BW / 2 : BW, bh = p ? BH / 2 : BH;
@@ -648,9 +678,9 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
         if (c.ref == 2)
             warpPredictCompound(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, bw, bh, c.mv, c.mv2, sub,
-                                interp[warp], hpS[warp], pred);
+                                interp[warp], hpS[warp], pred, filt);
         else
-            warpPredict(refP, pw, ph, px, py, bw, bh, c.mv, sub, interp[warp], pred);
+            warpPredict(refP, pw, ph, px, py, bw, bh, c.mv, sub, interp[warp], pred, filt);
         const uint8_t *src = f.src[p];
         const int pitch = f.pitch[p];
         int sse = 0;
@@ -1052,6 +1082,7 @@ __global__ void decideGrid(DecideArgs a) {
                 bi.mv2 = c->mv2;
                 bi.skip = (uint8_t)!coded;
                 bi.ref = c->ref;
+                bi.filter = c->filter;
                 bi.ab = (uint8_t)(AV1G_PARTITION_HORZ_A + t);
                 bi.abLog2 = (uint8_t)(3 + s);
                 break;
@@ -1069,6 +1100,7 @@ __global__ void decideGrid(DecideArgs a) {
                 bi.txSplit = (c.nz && c.costCoded < c.costSkip) ? c.txSplit : 0;
                 bi.skip = (uint8_t)!(c.nz && c.costCoded < c.costSkip);
                 bi.ref = c.ref;
+                bi.filter = c.filter;
                 break;
             }
             if (m || s == 0) {
@@ -1079,6 +1111,7 @@ __global__ void decideGrid(DecideArgs a) {
                 bi.log2 = (uint8_t)(3 + s);
                 bi.skip = (uint8_t)(m != 2);
                 bi.ref = c.ref;
+                bi.filter = c.filter;
                 break;
             }
         }
@@ -1858,6 +1891,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         }
         memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
         memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
+        memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
         memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
         memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
         memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
@@ -1964,6 +1998,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.25f;
     ea.rdoq = st.rdoq;
     ea.reducedTxSet = st.txTypes == 1;
+    ea.switchable = st.switchableFilter;
+    ea.filterBias = getenv("AV1GPU_PF_FBIAS") ? (float)atof(getenv("AV1GPU_PF_FBIAS")) : 16.f;
     ea.txExhaustive = st.txTypes == 3;
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
@@ -2092,6 +2128,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.referenceSelect = in.referenceSelect;
     j.fs.txModeSelect = in.txModeSelect;
     j.fs.reducedTxSet = in.reducedTxSet;
+    j.fs.switchable = in.switchableFilter;
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2294,6 +2331,7 @@ int HostEntropy::init(int width, int height, char *, int) {
     }
     memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
         memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
+        memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
         memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
     memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
     memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
@@ -2324,6 +2362,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.referenceSelect = in.referenceSelect;
     fs.txModeSelect = in.txModeSelect;
     fs.reducedTxSet = in.reducedTxSet;
+    fs.switchable = in.switchableFilter;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
     pft2::EntropyState &init = s->init;

@@ -31,6 +31,7 @@ struct BlockInfo {
                        // 3 HORZ_4, 4 VERT_4
     uint8_t ab;        // AV1 PARTITION_HORZ_A .. VERT_B when the block belongs to a three-way node, else 0
     uint8_t abLog2;    // log2 size of that node
+    uint8_t filter;    // interp_filter: 0 EIGHTTAP, 1 SMOOTH, 2 SHARP
     uint16_t txTypes;  // AV1 luma transform type of the transform covering each 4x4 (nibble 2 * dy + dx); 0 DCT_DCT
 };
 
@@ -44,6 +45,7 @@ struct Settings {
     bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
     int txTypes = 3;             // inter transform types: 0 DCT_DCT only, 1 IDTX / DCT_DCT (reduced_tx_set),
                                  // 2 the full inter sets (reduced_tx_set = 0) with a 7-type search, 3 every type
+    bool switchableFilter = false;  // per-block interpolation filter (is_filter_switchable, --pf-switchable)
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 
@@ -62,6 +64,7 @@ struct EntropyIn {
     bool referenceSelect = false;
     bool txModeSelect = false;
     bool reducedTxSet = true;
+    bool switchableFilter = false;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1

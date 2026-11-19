@@ -67,3 +67,7 @@ intra path), then T5, T7, T3, T2, T6.
   default inter_tx_type CDFs; the winner is reconstructed exactly (flipped types included). Chroma inherits the luma
   type when its own set allows it. BD-rate against SVT-AV1 preset 8: +32.5% → +25.3%, about 22 fps.
   `--pf-tx-types-fast` (7 types: +26.0%), `--pf-tx-types-reduced` (stage 1), `--pf-no-tx-types`.
+- T5 done, off by default (`--pf-switchable`): `is_filter_switchable = 1`, one interp_filter per block chosen by luma
+  prediction SSE plus bits, coded with the spec contexts; GLOBALMV blocks code none. Bit-exact with dav1d. On the
+  120-frame test it does not pay for its per-block symbol: +25.7% against +25.3% with the fixed filter (best bias,
+  `AV1GPU_PF_FBIAS` = 16). A gain needs a joint motion and filter search or a full RD choice per filter.

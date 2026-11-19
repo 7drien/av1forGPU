@@ -20,6 +20,7 @@ struct FrameParams {
     bool referenceSelect = false;   // compound prediction allowed
     bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
     bool reducedTxSet = true;
+    bool switchable = false;        // is_filter_switchable (else EIGHTTAP)
     bool persistent = false;        // error_resilient_mode = 0 and CDFs from primary_ref_frame
     bool primary = false;           // primary_ref_frame = LAST (else NONE)
     int grain = 0;
@@ -74,8 +75,8 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     for (int r = 0; r < 7; ++r) b.put(fp.refSlot[r], 3);
     b.bit(0);      // render_and_frame_size_different
     b.bit(0);      // allow_high_precision_mv
-    b.bit(0);      // is_filter_switchable
-    b.put(0, 2);   // interpolation_filter EIGHTTAP
+    b.bit(fp.switchable);           // is_filter_switchable
+    if (!fp.switchable) b.put(0, 2);   // interpolation_filter EIGHTTAP
     b.bit(0);      // is_motion_mode_switchable
     b.bit(0);      // disable_frame_end_update_cdf
     // tile_info

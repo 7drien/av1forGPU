@@ -12,6 +12,8 @@ constexpr int COMP_INTER_CONTEXTS = 5;
 constexpr int COMP_REF_TYPE_CONTEXTS = 5;
 constexpr int DRL_MODE_CONTEXTS = 3;
 constexpr int FWD_REFS = 4;
+constexpr int INTERP_FILTERS = 3;
+constexpr int INTERP_FILTER_CONTEXTS = 16;
 constexpr int INTRA_MODES = 13;
 constexpr int IS_INTER_CONTEXTS = 4;
 constexpr int MV_CLASSES = 11;
@@ -117,6 +119,24 @@ inline constexpr uint16_t Default_Mv_Bit_Cdf[MV_OFFSET_BITS][3] = {
   { 234*128, 32768, 0 },
   { 234*128, 32768, 0 },
   { 240*128, 32768, 0 }
+};
+inline constexpr uint16_t Default_Interp_Filter_Cdf[INTERP_FILTER_CONTEXTS][INTERP_FILTERS + 1] = {
+  { 31935, 32720, 32768, 0 },
+  { 5568, 32719, 32768, 0 },
+  { 422, 2938, 32768, 0 },
+  { 28244, 32608, 32768, 0 },
+  { 31206, 31953, 32768, 0 },
+  { 4862, 32121, 32768, 0 },
+  { 770, 1152, 32768, 0 },
+  { 20889, 25637, 32768, 0 },
+  { 31910, 32724, 32768, 0 },
+  { 4120, 32712, 32768, 0 },
+  { 305, 2247, 32768, 0 },
+  { 27403, 32636, 32768, 0 },
+  { 31022, 32009, 32768, 0 },
+  { 2963, 32093, 32768, 0 },
+  { 601, 943, 32768, 0 },
+  { 14969, 21398, 32768, 0 }
 };
 inline constexpr uint16_t Default_Inter_Tx_Type_Set1_Cdf[2][17] = {
     { 4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504,
