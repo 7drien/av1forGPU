@@ -156,4 +156,6 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
   ran past the old ±64 / ±96 window. The quarter-resolution search now allows R up to 48 (±192 px), the new
   default (`AV1GPU_PF_RANGE` overrides it). Cost: coarse search 0.6 → 4.8 ms per 1080p frame. video_1: +18.9%
   (+18.6% before, within noise).
+- Motion-vector bits in the evaluation's RD cost were weighted 0.25; 0.5 is the new default (video_2 +55.4% → +54.5%,
+  1.0: +56.3%; video_1 +18.8%).
 
