@@ -725,7 +725,8 @@ struct DecideArgs {
     const Cand *cand[kSizes];
     int cols[kSizes];
     float *best[kSizes];      // best cost of the subtree rooted at each block
-    uint8_t *mode[kSizes];    // 0: split, 1: none + skip, 2: none + coded, 3: HORZ, 4: VERT, 5: HORZ_4, 6: VERT_4
+    uint8_t *mode[kSizes];    // 0: split, 1: none + skip, 2: none + coded, 3: HORZ, 4: VERT, 5: HORZ_4, 6: VERT_4,
+                              // 7 + (0 HORZ_A, 1 HORZ_B, 2 VERT_A, 3 VERT_B)
     const Cand *rcand[10];    // rectangular blocks: (level - 1) * 2 + (0 HORZ, 1 VERT); 6 + (level - 2) * 2 + 4:1
     int rcols[10];
     int rect;
@@ -772,6 +773,22 @@ __global__ void decideLevel(DecideArgs a, int s, int rows) {
                 c2 += halfCost(d == 0 ? rc[(2 * by + k) * rcols + bx] : rc[by * rcols + 2 * bx + k]);
             if (c2 < best) { best = c2; mode = 3 + d; }
         }
+        {
+            // three-way partitions: two squares of the half size and one rectangular half
+            const Cand *sq = a.cand[s - 1];
+            const int sc = a.cols[s - 1];
+            const Cand *rh = a.rcand[(s - 1) * 2], *rv = a.rcand[(s - 1) * 2 + 1];
+            const int rhc = a.rcols[(s - 1) * 2], rvc = a.rcols[(s - 1) * 2 + 1];
+            auto S = [&](int y, int x) { return halfCost(sq[(2 * by + y) * sc + 2 * bx + x]); };
+            const float bitsAB = a.lambda * 3.5f;
+            const float c[4] = {
+                S(0, 0) + S(0, 1) + halfCost(rh[(2 * by + 1) * rhc + bx]),   // HORZ_A
+                halfCost(rh[(2 * by) * rhc + bx]) + S(1, 0) + S(1, 1),       // HORZ_B
+                S(0, 0) + S(1, 0) + halfCost(rv[by * rvc + 2 * bx + 1]),     // VERT_A
+                halfCost(rv[by * rvc + 2 * bx]) + S(0, 1) + S(1, 1)};        // VERT_B
+            for (int k = 0; k < 4; k++)
+                if (c[k] + bitsAB < best) { best = c[k] + bitsAB; mode = 7 + k; }
+        }
         if (s >= 2)
             for (int d = 0; d < 2; d++) {
                 const int rk = 6 + (s - 2) * 2 + d;
@@ -796,6 +813,34 @@ __global__ void decideGrid(DecideArgs a) {
         for (int s = kSizes - 1; s >= 0; s--) {
             const int sh = s, idx = (gy >> sh) * a.cols[s] + (gx >> sh);
             const int m = a.mode[s][idx];
+            if (m >= 7) {
+                // three-way node: this unit is in a half-size square or in the rectangular half
+                const int t = m - 7;   // 0 HORZ_A, 1 HORZ_B, 2 VERT_A, 3 VERT_B
+                const int lowHalf = t < 2 ? (gy >> (s - 1)) & 1 : (gx >> (s - 1)) & 1;
+                const bool inRect = (t == 0 || t == 2) ? lowHalf : !lowHalf;
+                const Cand *c;
+                if (inRect) {
+                    const int rk = (s - 1) * 2 + (t >= 2);
+                    c = t < 2 ? &a.rcand[rk][(gy >> (s - 1)) * a.rcols[rk] + (gx >> s)]
+                              : &a.rcand[rk][(gy >> s) * a.rcols[rk] + (gx >> (s - 1))];
+                    bi.log2 = (uint8_t)(3 + s);
+                    bi.part = (uint8_t)(t < 2 ? 1 : 2);
+                    bi.txSplit = 0;
+                } else {
+                    c = &a.cand[s - 1][(gy >> (s - 1)) * a.cols[s - 1] + (gx >> (s - 1))];
+                    bi.log2 = (uint8_t)(2 + s);
+                    bi.part = 0;
+                }
+                const bool coded = c->nz && c->costCoded < c->costSkip;
+                if (!inRect) bi.txSplit = (uint8_t)(coded && c->txSplit);
+                bi.mv = c->mv;
+                bi.mv2 = c->mv2;
+                bi.skip = (uint8_t)!coded;
+                bi.ref = c->ref;
+                bi.ab = (uint8_t)(AV1G_PARTITION_HORZ_A + t);
+                bi.abLog2 = (uint8_t)(3 + s);
+                break;
+            }
             if (m >= 3) {
                 const int rk = m <= 4 ? (s - 1) * 2 + (m - 3) : 6 + (s - 2) * 2 + (m - 5);
                 const int sh = m <= 4 ? s - 1 : s - 2;   // log2 of 8x8 units per block along the split direction

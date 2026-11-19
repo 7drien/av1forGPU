@@ -950,8 +950,9 @@ struct TileCoder {
             const int half = 1 << (size - 3);
             const bool hasRows = miRow + half < fs->miRows, hasCols = miCol + half < fs->miCols;
             const pf::BlockInfo &bi = grid[(miRow >> 1) * fs->gcols + (miCol >> 1)];
-            const bool split = bi.log2 < size;
-            const int part = split ? AV1G_PARTITION_SPLIT : bi.part == 1 ? AV1G_PARTITION_HORZ
+            const bool abNode = bi.ab && bi.abLog2 == size;
+            const bool split = !abNode && bi.log2 < size;
+            const int part = abNode ? bi.ab : split ? AV1G_PARTITION_SPLIT : bi.part == 1 ? AV1G_PARTITION_HORZ
                            : bi.part == 2 ? AV1G_PARTITION_VERT : bi.part == 3 ? AV1G_PARTITION_HORZ_4
                            : bi.part == 4 ? AV1G_PARTITION_VERT_4 : AV1G_PARTITION_NONE;
             if (phase == 1 && (hasRows || hasCols) && nPending < 4)
@@ -962,6 +963,31 @@ struct TileCoder {
                 n.k = 0;
                 stack[top + 1] = Node{miRow, miCol, size - 1, -1};
                 ++top;
+                continue;
+            }
+            if (abNode) {
+                if (!(hasRows && hasCols)) { st.error = 7; return; }
+                auto at2 = [&](int r, int c) -> const pf::BlockInfo & { return grid[(r >> 1) * fs->gcols + (c >> 1)]; };
+                const int sq = size - 1;
+                if (part == AV1G_PARTITION_HORZ_A) {
+                    block(miRow, miCol, sq, sq, at2(miRow, miCol));
+                    if (!st.error) block(miRow, miCol + half, sq, sq, at2(miRow, miCol + half));
+                    if (!st.error) block(miRow + half, miCol, size, size - 1, at2(miRow + half, miCol));
+                } else if (part == AV1G_PARTITION_HORZ_B) {
+                    block(miRow, miCol, size, size - 1, at2(miRow, miCol));
+                    if (!st.error) block(miRow + half, miCol, sq, sq, at2(miRow + half, miCol));
+                    if (!st.error) block(miRow + half, miCol + half, sq, sq, at2(miRow + half, miCol + half));
+                } else if (part == AV1G_PARTITION_VERT_A) {
+                    block(miRow, miCol, sq, sq, at2(miRow, miCol));
+                    if (!st.error) block(miRow + half, miCol, sq, sq, at2(miRow + half, miCol));
+                    if (!st.error) block(miRow, miCol + half, size - 1, size, at2(miRow, miCol + half));
+                } else {
+                    block(miRow, miCol, size - 1, size, at2(miRow, miCol));
+                    if (!st.error) block(miRow, miCol + half, sq, sq, at2(miRow, miCol + half));
+                    if (!st.error) block(miRow + half, miCol + half, sq, sq, at2(miRow + half, miCol + half));
+                }
+                if (st.error) return;
+                --top;
                 continue;
             }
             if (bi.log2 != size) { st.error = 5; return; }

@@ -27,7 +27,10 @@ struct BlockInfo {
     uint8_t skip;   // 1: no residual coded
     uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both
     uint8_t txSplit;   // 1: luma uses four half-size transforms (coded blocks)
-    uint8_t part;      // partition of the log2 node: 0 NONE, 1 HORZ (two n x n/2 blocks), 2 VERT (two n/2 x n)
+    uint8_t part;      // partition of the log2 node: 0 NONE, 1 HORZ (two n x n/2 blocks), 2 VERT (two n/2 x n),
+                       // 3 HORZ_4, 4 VERT_4
+    uint8_t ab;        // AV1 PARTITION_HORZ_A .. VERT_B when the block belongs to a three-way node, else 0
+    uint8_t abLog2;    // log2 size of that node
 };
 
 struct Settings {
