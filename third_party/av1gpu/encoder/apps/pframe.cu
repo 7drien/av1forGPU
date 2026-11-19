@@ -619,37 +619,67 @@ __device__ float interTypeBits(int set, int sq, int idx) {
 // estimate; the winner is then reconstructed. Leaves its levels in q and reconstruction in rec, adds the type bits
 // to o.R and returns the type. An all-zero transform codes no type and counts as DCT_DCT (TxTypes of an all-zero
 // luma transform are DCT_DCT, which inter chroma inherits).
+// Type screening score of a forward transform in tmp (row stride W + 1): sum of coefficient magnitudes in the
+// pixel-domain scale of the type (a SATD-like rate proxy).
+__device__ __forceinline__ float fwdScore(const float *tmp, int W, int H, int txSz, int type) {
+    const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, lt = tw == 4 ? 2 : tw == 8 ? 3 : tw == 16 ? 4 : 5;
+    float s = 0.f;
+    for (int idx = threadIdx.x & 31; idx < tw * th; idx += 32) s += fabsf(tmp[(idx >> lt) * (W + 1) + (idx & (tw - 1))]);
+    return warp_sum(s) * sqrtf(g_txg[txSz][type]);
+}
 template <class Run>
 __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhaustive, float lambda, EvalOut &o,
                               const int16_t *q, int nq, Run run) {
     const int set = enabled ? pft2::interTxSet(txSz, reduced) : AV1G_TX_SET_DCTONLY;
     const int sq = AV1G_T(Tx_Size_Sqr)[txSz];
     const int n = pft2::interTxCount(set);
-    // one call site for run (it inlines the transform, quantizer and inverse): step 0 reconstructs DCT_DCT, steps
-    // 1..n price the set's types, step n + 1 reconstructs the winner
+    // One call site for run (it inlines the transform, quantizer and inverse); mode 0: forward transform only, returns
+    // a coefficient-magnitude score; 1: forward + quantizer estimate; 2: full reconstruction. Steps: DCT_DCT
+    // reconstruction, then (large sets) a forward-only screen of every type keeping the kTop best, the quantizer
+    // estimate of the remaining candidates, and the winner's reconstruction.
+    constexpr int kTop = 3;
+    const bool screen = n > 4;
+    int top[kTop];
+    float topS[kTop];
+    for (int k = 0; k < kTop; k++) { top[k] = -1; topS[k] = 3.4e38f; }
     int best = AV1G_DCT_DCT, step = 0;
     float bestJ = 0.f;
+    // steps: 0 | 1..n screen (when screen) | candidates | final
+    const int candBase = 1 + (screen ? n : 0), nCand = screen ? kTop : n;
     for (;;) {
-        int t = AV1G_DCT_DCT;
-        bool full = true;
+        int t = AV1G_DCT_DCT, mode = 2, cand = -1;
         if (step == 0) {
-        } else if (step <= n) {
+        } else if (step < candBase) {
             t = pft2::interTxInv(set, step - 1);
-            full = false;
-            if (!exhaustive && (av1g_flip_ud(t) || av1g_flip_lr(t) || t >= AV1G_V_ADST)) { step++; continue; }
+            mode = 0;
+            if (t == AV1G_DCT_DCT || (!exhaustive && (av1g_flip_ud(t) || av1g_flip_lr(t) || t >= AV1G_V_ADST))) { step++; continue; }
+        } else if (step < candBase + nCand) {
+            cand = step - candBase;
+            t = screen ? top[cand] : pft2::interTxInv(set, cand);
+            mode = 1;
+            if (t < 0 || t == AV1G_DCT_DCT || (!screen && !exhaustive && (av1g_flip_ud(t) || av1g_flip_lr(t) || t >= AV1G_V_ADST))) {
+                step++;
+                continue;
+            }
         } else {
             t = best;
         }
-        run(t, full);
+        const float score = run(t, mode);
         if (step == 0) {
             if (set == AV1G_TX_SET_DCTONLY) return AV1G_DCT_DCT;
             int any = 0;
             for (int i = threadIdx.x & 31; i < nq; i += 32) any |= q[i];
             // nothing left after DCT quantization: other types rarely code such a residual better
             if (!__any_sync(0xffffffffu, any)) break;
-            bestJ = 3.4e38f;
-        } else if (step <= n) {
-            const float J = o.D + lambda * (o.R + interTypeBits(set, sq, step - 1));
+            bestJ = o.D + lambda * (o.R + interTypeBits(set, sq, pft2::interTxIndex(set, AV1G_DCT_DCT)));
+        } else if (step < candBase) {
+            // keep the kTop smallest scores (insertion)
+            float sc = score;
+            int tt = t;
+            for (int k = 0; k < kTop; k++)
+                if (sc < topS[k]) { const float fs = topS[k]; const int ft = top[k]; topS[k] = sc; top[k] = tt; sc = fs; tt = ft; }
+        } else if (step < candBase + nCand) {
+            const float J = o.D + lambda * (o.R + interTypeBits(set, sq, pft2::interTxIndex(set, t)));
             if (J < bestJ) { bestJ = J; best = t; }
         } else {
             int any = 0;
@@ -777,13 +807,14 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         int16_t *bak = hpS[warp];
         for (int i = lane; i < bw * bh; i += 32) bak[i] = res[i];
         __syncwarp();
-        auto run = [&](int type, bool full) {
+        auto run = [&](int type, int mode) -> float {
             for (int i = lane; i < bw * bh; i += 32) res[i] = bak[i];
             __syncwarp();
             e.txType = type;
             warp_fwd_rt(res, tmpS[warp], bw, bh, txSz, type);
+            if (mode == 0) return fwdScore(tmpS[warp], bw, bh, txSz, type);
             warp_quant_rate_rt<8>(tmpS[warp], q, e, o, bw, bh);
-            if (!full) return;
+            if (mode == 1) return 0.f;
             if (a.rdoq && bw == bh && type == AV1G_DCT_DCT) {
                 if (lane == 0) rdoqBlock(tmpS[warp], q, e, bw, a.lambda);
                 __syncwarp();
@@ -798,6 +829,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                 o.R = warp_sum(rb);
             }
             inverseAddAny(tlw, tlh, q, txSz, type, dcQ, acQ, res, pred, rec);
+            return 0.f;
         };
         auto recSse = [&]() {
             int v = 0;
@@ -815,7 +847,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                 for (int i = lane; i < (bw >> 2) * (bh >> 2); i += 32)
                     a.types1[size_t((py >> 2) + i / (bw >> 2)) * tstride + (px >> 2) + i % (bw >> 2)] = (uint8_t)wholeType;
         } else {
-            run(pft2::interChromaType(chromaType, txSz, a.reducedTxSet), true);
+            run(pft2::interChromaType(chromaType, txSz, a.reducedTxSet), 2);
         }
         bits += o.R;
         int any = 0;
@@ -873,14 +905,16 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                 int16_t *bk = hpS[warp];
                 for (int i = lane; i < SW * SH; i += 32) bk[i] = res[i];
                 __syncwarp();
-                auto runS = [&](int type, bool full) {
+                auto runS = [&](int type, int mode) -> float {
                     for (int i = lane; i < SW * SH; i += 32) res[i] = bk[i];
                     __syncwarp();
                     es.txType = type;
                     warp_fwd_rt(res, tmpS[warp], SW, SH, stx, type);
+                    if (mode == 0) return fwdScore(tmpS[warp], SW, SH, stx, type);
                     warp_quant_rate_rt<8>(tmpS[warp], q, es, os, SW, SH);
-                    if (!full) return;
+                    if (mode == 1) return 0.f;
                     inverseAddAny(lsw, lsh, q, stx, type, dcQ, acQ, res, pq, rq);
+                    return 0.f;
                 };
                 auto sseFn = [&]() {
                     int v = 0;
@@ -951,14 +985,16 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     int16_t *bk = hpS[warp];
                     for (int i = lane; i < hn * hn; i += 32) bk[i] = res[i];
                     __syncwarp();
-                    auto runS = [&](int type, bool full) {
+                    auto runS = [&](int type, int mode) -> float {
                         for (int i = lane; i < hn * hn; i += 32) res[i] = bk[i];
                         __syncwarp();
                         es.txType = type;
                         warp_fwd_rt(res, tmpS[warp], hn, hn, stx, type);
+                        if (mode == 0) return fwdScore(tmpS[warp], hn, hn, stx, type);
                         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
-                        if (!full) return;
+                        if (mode == 1) return 0.f;
                         inverseAddAny(lhn, lhn, q, stx, type, dcQ, acQ, res, pq, rq);
+                        return 0.f;
                     };
                     auto sseFn = [&]() {
                         int v = 0;
