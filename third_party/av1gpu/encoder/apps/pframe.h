@@ -31,6 +31,7 @@ struct BlockInfo {
                        // 3 HORZ_4, 4 VERT_4
     uint8_t ab;        // AV1 PARTITION_HORZ_A .. VERT_B when the block belongs to a three-way node, else 0
     uint8_t abLog2;    // log2 size of that node
+    uint16_t txTypes;  // AV1 luma transform type of the transform covering each 4x4 (nibble 2 * dy + dx); 0 DCT_DCT
 };
 
 struct Settings {
@@ -41,6 +42,7 @@ struct Settings {
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
     bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
+    bool txTypes = true;         // choose IDTX or DCT_DCT per luma transform (else DCT_DCT only)
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 

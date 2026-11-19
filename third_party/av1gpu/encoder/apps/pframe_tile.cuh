@@ -717,21 +717,26 @@ struct TileCoder {
             ctx = (above != 0) + (left != 0) + 7;
             if ((bwPix >> sub) * (bhPix >> sub) > tw * th) ctx += 3;
         }
-        const uint16_t *scan = av1g_get_scan(txSz, AV1G_DCT_DCT);
+        // luma: the type chosen for this transform; inter chroma: the type of the luma 4x4 at the same position
+        // (spec 7.13.3 get_tx_type; every type we use is in TX_SET_INTER_3, which chroma sizes also allow)
+        const int lx4 = plane ? x4 << 1 : x4, ly4 = plane ? y4 << 1 : y4;
+        const int txType = (grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)].txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
+        const uint16_t *scan = av1g_get_scan(txSz, txType);
         const int n = imin(tw, 32) * imin(th, 32);
         int eob = n;
         while (eob && !qv[scan[eob - 1]]) --eob;
         sym(cdf->txb_skip[txSzCtx][ctx], eob == 0, 2);
         if (!eob) return;
         // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
-        if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64) sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
+        if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64)
+            sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], txType == AV1G_IDTX ? 0 : 1, 2);
         int dcSign = 0;
         for (int k = 0; k < w4; k++)
             if (x4 + k < maxX4) { const int v = ctxAt(D, plane, x4 + k, y4 - 1); dcSign += v == 1 ? -1 : v == 2 ? 1 : 0; }
         for (int k = 0; k < h4; k++)
             if (y4 + k < maxY4) { const int v = ctxAt(D, plane, x4 - 1, y4 + k); dcSign += v == 1 ? -1 : v == 2 ? 1 : 0; }
         CoeffSinkT sink{recs, &nrec, recCap, &run};
-        emitCoeffPayload(sink, qv, eob, txSz, AV1G_DCT_DCT, txSzCtx, plane > 0, dcSign);
+        emitCoeffPayload(sink, qv, eob, txSz, txType, txSzCtx, plane > 0, dcSign);
     }
     // Walk the transforms of a coded block: f(plane, x4, y4, txSz) with the levels loaded into qv.
     // transform_tree order of the k-th leaf at uniform depth: quadrants recursively (depth 2: z-order)
