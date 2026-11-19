@@ -73,3 +73,8 @@ if __name__ == "__main__":
         run(b, 448, 256, 20, ["--persistent-cdf", "--pf-gop", "8", "--keyint", "9"])
         run(b, 320, 192, 18, ["--persistent-cdf", "--pf-gop", "16", "--qindex", "140"])
         run(b, 320, 192, 40, ["--persistent-cdf", "--bitrate", "400"])
+        run(b, 448, 256, 12, ["--persistent-cdf", "--pf-tiles", "1", "1"])
+        run(b, 712, 392, 18, ["--persistent-cdf", "--pf-tiles", "2", "2", "--qindex", "70"])
+        run(b, 712, 392, 10, ["--pf-tiles", "3", "0", "--pf-gop", "1"])
+        run(b, 712, 392, 18, ["--persistent-cdf", "--pf-gpu-entropy", "--qindex", "70"])
+        run(b, 448, 256, 12, ["--persistent-cdf", "--pf-gpu-entropy", "--pf-tiles", "0", "0"])

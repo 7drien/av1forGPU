@@ -6,11 +6,14 @@
 #include "rc_inv.cuh"
 #include "inter_tables.h"
 #include "av1g/gpu_postfilter.h"
+#include "gpu_coeff_payload.cuh"
+#include "pframe_tile.cuh"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 GP_DEFINE_TABLE_UPLOAD(gp_upload_tables_pframe)
 const GpHostTables *gp_host_tables();
@@ -617,7 +620,7 @@ __global__ void commit(CommitArgs a) {
     const int s = bi.log2 - 3;
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
-        const int lt = bi.log2 - sub, t = 1 << lt;
+        const int lt = bi.log2 - sub;
         const int tx = x >> lt, ty = y >> lt;
         const int16_t *lv = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[3]);
         level = lv[lbase + ((size_t(ty) * (apw >> lt) + tx) << (2 * lt)) + ((y - (ty << lt)) << lt) + (x - (tx << lt))];
@@ -670,6 +673,77 @@ __global__ void planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int 
     if ((threadIdx.x & 31) == 0 && d) atomicAdd(out, (unsigned long long)d);
 }
 
+// ------------------------------------------------------------------------------------------------
+// GPU tile entropy coding: one thread per AV1 tile.
+struct TileJob {
+    pft2::FrameSyntax fs;
+    const BlockInfo *grid;
+    const int16_t *levels;
+    pft2::MiInfo *mi;
+    const pft2::EntropyState *primary;   // null: default CDFs
+    const pft2::InterCdfs *defaultInter;
+    pft2::EntropyState *work;            // one per tile
+    pft2::EntropyState *save;            // receives the frame-end CDFs of tile contextTile, or null
+    int contextTile, qindex;
+    int tileCols, tileRows;
+    int colStart[65], rowStart[65];
+    uint8_t *ctx;
+    size_t ctxStride;
+    uint16_t *ecBuf;
+    size_t ecCapPerTile;
+    uint8_t *out;
+    int *sizes;
+    pft2::TileStats *stats;
+};
+__global__ void tileEntropy(TileJob j) {
+    const int t = blockIdx.x;
+    if (threadIdx.x || t >= j.tileCols * j.tileRows) return;
+    const int tc = t % j.tileCols, tr = t / j.tileCols;
+    pft2::EntropyState &es = j.work[t];
+    if (j.primary) {
+        es = *j.primary;
+    } else {
+        av1g_cdfs_init(&es.cdf, j.qindex);
+        es.inter = *j.defaultInter;
+    }
+    pft2::TileCoder tcod;
+    tcod.fs = &j.fs;
+    tcod.grid = j.grid;
+    tcod.levels = j.levels;
+    tcod.mi = j.mi;
+    tcod.rowStart = j.rowStart[tr]; tcod.rowEnd = j.rowStart[tr + 1];
+    tcod.colStart = j.colStart[tc]; tcod.colEnd = j.colStart[tc + 1];
+    tcod.cdf = &es.cdf;
+    tcod.ic = &es.inter;
+    uint8_t *ctx = j.ctx + j.ctxStride * 12 * t;
+    for (int p = 0; p < 3; p++) {
+        tcod.aboveLevel[p] = ctx + j.ctxStride * (4 * p + 0);
+        tcod.aboveDc[p] = ctx + j.ctxStride * (4 * p + 1);
+        tcod.leftLevel[p] = ctx + j.ctxStride * (4 * p + 2);
+        tcod.leftDc[p] = ctx + j.ctxStride * (4 * p + 3);
+    }
+    tcod.st = pft2::TileStats{};
+    av1g_ec_init(&tcod.ec, j.ecBuf + j.ecCapPerTile * t, (uint32_t)j.ecCapPerTile);
+    tcod.tile();
+    int n = -1;
+    if (!tcod.st.error) n = av1g_ec_done(&tcod.ec, j.out + j.ecCapPerTile * t);
+    if (n < 0 && !tcod.st.error) tcod.st.error = 6;
+    j.sizes[t] = n;
+    j.stats[t] = tcod.st;
+    if (t == j.contextTile && j.save) {
+        pft2::clearCounters(reinterpret_cast<uint16_t *>(&es), (int)(sizeof(es) / 2));
+        *j.save = es;
+    }
+}
+// Pack the tiles contiguously (block t copies tile t after the sizes of the tiles before it).
+__global__ void packTiles(const uint8_t *out, size_t capPerTile, const int *sizes, int count, uint8_t *packed) {
+    const int t = blockIdx.x;
+    size_t off = 0;
+    for (int k = 0; k < t; k++) off += sizes[k] > 0 ? sizes[k] : 0;
+    const int n = sizes[t];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) packed[off + i] = out[capPerTile * t + i];
+}
+
 struct State {
     uint8_t *ds[1 + kMaxRefs] = {};
     Mv *coarse[kMaxRefs] = {};
@@ -687,6 +761,16 @@ struct State {
     unsigned long long *sse = nullptr;
     float *best[kSizes] = {};
     uint8_t *mode[kSizes] = {};
+    // tile entropy coding
+    pft2::EntropyState *slots = nullptr, *tileWork = nullptr, *staging = nullptr;
+    pft2::InterCdfs *defaultInter = nullptr;
+    pft2::MiInfo *mi = nullptr;
+    pft2::TileStats *tileStats = nullptr;
+    uint8_t *ctxArrays = nullptr, *tileOut = nullptr, *packed = nullptr;
+    uint16_t *ecBuf = nullptr;
+    int *tileSizes = nullptr;
+    size_t ecCap = 0, ctxStride = 0;
+    int maxTiles = 64;
     int16_t *hphase = nullptr;
     uint8_t *phases[kMaxRefs] = {};
     bool profile = false;
@@ -714,6 +798,10 @@ Analyzer::~Analyzer() {
     cudaFree(s->cdefOut);
     cudaFree(s->sse);
     cudaFree(s->hphase);
+    for (void *p : {(void *)s->slots, (void *)s->tileWork, (void *)s->staging, (void *)s->defaultInter, (void *)s->mi,
+                    (void *)s->tileStats, (void *)s->ctxArrays, (void *)s->tileOut, (void *)s->packed,
+                    (void *)s->ecBuf, (void *)s->tileSizes})
+        cudaFree(p);
     for (auto *p : s->best) cudaFree(p);
     for (auto *p : s->mode) cudaFree(p);
     for (auto *p : s->phases) cudaFree(p);
@@ -768,6 +856,46 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
         for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
     }
+    {
+        const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
+        alloc(&s->slots, sizeof(pft2::EntropyState) * 8);
+        alloc(&s->tileWork, sizeof(pft2::EntropyState) * s->maxTiles);
+        alloc(&s->staging, sizeof(pft2::EntropyState));
+        alloc(&s->defaultInter, sizeof(pft2::InterCdfs));
+        alloc(&s->mi, sizeof(pft2::MiInfo) * miCols * miRows);
+        alloc(&s->tileStats, sizeof(pft2::TileStats) * s->maxTiles);
+        s->ctxStride = size_t(miCols + miRows + 64);
+        alloc(&s->ctxArrays, s->ctxStride * 12 * s->maxTiles);
+        // the precarry buffer holds one entry per output byte: a generous bound per tile (any tile may hold the frame)
+        s->ecCap = size_t(aw) * ah * 3 / 2 + 65536;
+        alloc(&s->ecBuf, sizeof(uint16_t) * s->ecCap * 2);
+        alloc(&s->tileOut, s->ecCap * 2);
+        alloc(&s->packed, s->ecCap * 2);
+        alloc(&s->tileSizes, sizeof(int) * (s->maxTiles + 1));
+        pft2::InterCdfs d{};
+        memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
+        memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
+        memcpy(d.newMv, pft::Default_New_Mv_Cdf, sizeof d.newMv);
+        memcpy(d.zeroMv, pft::Default_Zero_Mv_Cdf, sizeof d.zeroMv);
+        memcpy(d.refMv, pft::Default_Ref_Mv_Cdf, sizeof d.refMv);
+        memcpy(d.drl, pft::Default_Drl_Mode_Cdf, sizeof d.drl);
+        memcpy(d.mvJoint, pft::Default_Mv_Joint_Cdf, sizeof d.mvJoint);
+        for (int c = 0; c < 2; c++) {
+            memcpy(d.mvSign[c], pft::Default_Mv_Sign_Cdf, sizeof d.mvSign[c]);
+            memcpy(d.mvClass[c], pft::Default_Mv_Class_Cdf[c], sizeof d.mvClass[c]);
+            memcpy(d.class0Bit[c], pft::Default_Mv_Class0_Bit_Cdf, sizeof d.class0Bit[c]);
+            memcpy(d.class0Fr[c], pft::Default_Mv_Class0_Fr_Cdf[c], sizeof d.class0Fr[c]);
+            memcpy(d.mvFr[c], pft::Default_Mv_Fr_Cdf[c], sizeof d.mvFr[c]);
+            memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
+        }
+        memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
+        memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
+        memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
+        memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
+        memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
+        memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
+        if (e == cudaSuccess) e = cudaMemcpy(s->defaultInter, &d, sizeof d, cudaMemcpyHostToDevice);
+    }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame allocation: %s", cudaGetErrorString(e));
@@ -784,8 +912,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
 }
 
 int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                      const Settings &st, uint8_t *recon, std::vector<BlockInfo> &info, std::vector<int16_t> &levels,
-                      char *err, int errLen) {
+                      const Settings &st, uint8_t *recon, std::vector<BlockInfo> *info,
+                      std::vector<int16_t> *levels, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     const auto t0 = std::chrono::steady_clock::now();
     refCount = refCount < 1 ? 1 : refCount > kMaxRefs ? kMaxRefs : refCount;
@@ -872,11 +1000,17 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);
     mark(5);
     cudaError_t e = cudaGetLastError();
-    info.resize(size_t(s->gcols) * s->grows);
-    levels.resize(size_t(aw) * ah * 3 / 2);
-    if (e == cudaSuccess) e = cudaMemcpy(info.data(), s->grid, info.size() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess) e = cudaMemcpy(levels.data(), s->outLevels, levels.size() * sizeof(int16_t), cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess) e = cudaMemcpy(s->prevGrid, s->grid, info.size() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
+    const size_t gridCount = size_t(s->gcols) * s->grows;
+    if (info) {
+        info->resize(gridCount);
+        if (e == cudaSuccess) e = cudaMemcpy(info->data(), s->grid, gridCount * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
+    }
+    if (levels) {
+        levels->resize(size_t(aw) * ah * 3 / 2);
+        if (e == cudaSuccess)
+            e = cudaMemcpy(levels->data(), s->outLevels, levels->size() * sizeof(int16_t), cudaMemcpyDeviceToHost);
+    }
+    if (e == cudaSuccess) e = cudaMemcpyAsync(s->prevGrid, s->grid, gridCount * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame analysis: %s", cudaGetErrorString(e));
         return -1;
@@ -893,6 +1027,212 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         s->frames++;
     }
     elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return 0;
+}
+
+int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
+    const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
+    auto maxLog2 = [](int sb) { int k = 0; while ((1 << k) < (sb < 64 ? sb : 64)) ++k; return k; };
+    const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
+    TileJob j{};
+    const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
+    for (int sb = 0; sb < sbCols; sb += wSb) j.colStart[j.tileCols++] = sb * 16;
+    j.colStart[j.tileCols] = miCols;
+    for (int sb = 0; sb < sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
+    j.rowStart[j.tileRows] = miRows;
+    const int nTiles = j.tileCols * j.tileRows;
+    if (nTiles > s->maxTiles) {
+        snprintf(err, errLen, "too many tiles (%d)", nTiles);
+        return -1;
+    }
+    j.fs.refName[0] = in.refName[0];
+    j.fs.refName[1] = in.refName[1];
+    j.fs.referenceSelect = in.referenceSelect;
+    j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
+    j.grid = s->grid;
+    j.levels = s->outLevels;
+    j.mi = s->mi;
+    cudaError_t e = cudaSuccess;
+    if (in.primarySlot >= 0) {
+        // stage the primary CDFs: the save slot may be the same slot
+        e = cudaMemcpyAsync(s->staging, s->slots + in.primarySlot, sizeof(pft2::EntropyState), cudaMemcpyDeviceToDevice);
+        j.primary = s->staging;
+    }
+    j.defaultInter = s->defaultInter;
+    j.work = s->tileWork;
+    j.save = in.saveSlot >= 0 ? s->slots + in.saveSlot : nullptr;
+    j.contextTile = std::min(in.contextTile, nTiles - 1);
+    j.qindex = in.qindex;
+    j.ctx = s->ctxArrays;
+    j.ctxStride = s->ctxStride;
+    j.ecCapPerTile = s->ecCap * 2 / nTiles;
+    j.ecBuf = s->ecBuf;
+    j.out = s->tileOut;
+    j.sizes = s->tileSizes;
+    j.stats = s->tileStats;
+    tileEntropy<<<nTiles, 32>>>(j);
+    packTiles<<<nTiles, 256>>>(s->tileOut, j.ecCapPerTile, s->tileSizes, nTiles, s->packed);
+    std::vector<int> sizes(nTiles);
+    std::vector<pft2::TileStats> stats(nTiles);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaMemcpy(sizes.data(), s->tileSizes, sizeof(int) * nTiles, cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(stats.data(), s->tileStats, sizeof(pft2::TileStats) * nTiles, cudaMemcpyDeviceToHost);
+    size_t total = 0;
+    for (int t = 0; t < nTiles && e == cudaSuccess; t++) {
+        if (sizes[t] < 0 || stats[t].error) {
+            snprintf(err, errLen, "tile %d could not be coded (error %d)", t, stats[t].error);
+            return -1;
+        }
+        total += sizes[t];
+    }
+    std::vector<uint8_t> packed(total);
+    if (e == cudaSuccess && total) e = cudaMemcpy(packed.data(), s->packed, total, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "tile entropy: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    out.tiles.assign(nTiles, {});
+    size_t off = 0;
+    out.compound = 0;
+    for (int k = 0; k < 4; k++) { out.bits[k] = 0; out.modes[k] = 0; }
+    for (int t = 0; t < nTiles; t++) {
+        out.tiles[t].assign(packed.begin() + off, packed.begin() + off + sizes[t]);
+        off += sizes[t];
+        for (int k = 0; k < 4; k++) { out.bits[k] += stats[t].bits[k]; out.modes[k] += stats[t].modeCount[k]; }
+        out.compound += stats[t].compound;
+    }
+    return 0;
+}
+
+int Analyzer::download(BlockInfo *info, int16_t *levels, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    cudaError_t e = cudaMemcpy(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) e = cudaMemcpy(levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "decision download: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
+
+// ---- CPU tile entropy ----
+namespace {
+struct HostState {
+    pft2::EntropyState slots[8];
+    pft2::InterCdfs defaults;
+    std::vector<pft2::MiInfo> mi;
+    std::vector<uint8_t> ctx;
+    std::vector<uint16_t> ecBuf;
+    std::vector<uint8_t> out;
+    pft2::EntropyState work;
+};
+}  // namespace
+
+HostEntropy::~HostEntropy() { delete static_cast<HostState *>(state); }
+
+int HostEntropy::init(int width, int height, char *, int) {
+    w = width; h = height;
+    aw = (w + 63) & ~63; ah = (h + 63) & ~63;
+    auto *s = new HostState;
+    state = s;
+    const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
+    s->mi.resize(size_t(miCols) * miRows);
+    s->ctx.resize(size_t(miCols + miRows + 64) * 12);
+    s->ecBuf.resize(size_t(aw) * ah * 3 / 2 + 65536);
+    s->out.resize(s->ecBuf.size());
+    pft2::InterCdfs &d = s->defaults;
+    memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
+    memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
+    memcpy(d.newMv, pft::Default_New_Mv_Cdf, sizeof d.newMv);
+    memcpy(d.zeroMv, pft::Default_Zero_Mv_Cdf, sizeof d.zeroMv);
+    memcpy(d.refMv, pft::Default_Ref_Mv_Cdf, sizeof d.refMv);
+    memcpy(d.drl, pft::Default_Drl_Mode_Cdf, sizeof d.drl);
+    memcpy(d.mvJoint, pft::Default_Mv_Joint_Cdf, sizeof d.mvJoint);
+    for (int c = 0; c < 2; c++) {
+        memcpy(d.mvSign[c], pft::Default_Mv_Sign_Cdf, sizeof d.mvSign[c]);
+        memcpy(d.mvClass[c], pft::Default_Mv_Class_Cdf[c], sizeof d.mvClass[c]);
+        memcpy(d.class0Bit[c], pft::Default_Mv_Class0_Bit_Cdf, sizeof d.class0Bit[c]);
+        memcpy(d.class0Fr[c], pft::Default_Mv_Class0_Fr_Cdf[c], sizeof d.class0Fr[c]);
+        memcpy(d.mvFr[c], pft::Default_Mv_Fr_Cdf[c], sizeof d.mvFr[c]);
+        memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
+    }
+    memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
+    memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
+    memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
+    memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
+    memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
+    memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
+    return 0;
+}
+
+int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t *levels, EntropyOut &out, char *err,
+                      int errLen) {
+    auto *s = static_cast<HostState *>(state);
+    const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
+    const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
+    auto maxLog2 = [](int sb) { int k = 0; while ((1 << k) < (sb < 64 ? sb : 64)) ++k; return k; };
+    const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
+    const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
+    std::vector<int> colStart, rowStart;
+    for (int sb = 0; sb < sbCols; sb += wSb) colStart.push_back(sb * 16);
+    colStart.push_back(miCols);
+    for (int sb = 0; sb < sbRows; sb += hSb) rowStart.push_back(sb * 16);
+    rowStart.push_back(miRows);
+    const int tileCols = int(colStart.size()) - 1, tileRows = int(rowStart.size()) - 1, nTiles = tileCols * tileRows;
+    pft2::FrameSyntax fs{};
+    fs.refName[0] = in.refName[0];
+    fs.refName[1] = in.refName[1];
+    fs.referenceSelect = in.referenceSelect;
+    fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
+    pft2::EntropyState primary;
+    if (in.primarySlot >= 0) {
+        primary = s->slots[in.primarySlot];
+    } else {
+        av1g_cdfs_init(&primary.cdf, in.qindex);
+        primary.inter = s->defaults;
+    }
+    const int contextTile = std::min(in.contextTile, nTiles - 1);
+    out.tiles.assign(nTiles, {});
+    out.compound = 0;
+    for (int k = 0; k < 4; k++) { out.bits[k] = 0; out.modes[k] = 0; }
+    const size_t stride = size_t(miCols + miRows + 64);
+    for (int t = 0; t < nTiles; t++) {
+        s->work = primary;
+        pft2::TileCoder tc;
+        tc.fs = &fs;
+        tc.grid = grid;
+        tc.levels = levels;
+        tc.mi = s->mi.data();
+        tc.rowStart = rowStart[t / tileCols]; tc.rowEnd = rowStart[t / tileCols + 1];
+        tc.colStart = colStart[t % tileCols]; tc.colEnd = colStart[t % tileCols + 1];
+        tc.cdf = &s->work.cdf;
+        tc.ic = &s->work.inter;
+        for (int p = 0; p < 3; p++) {
+            tc.aboveLevel[p] = s->ctx.data() + stride * (4 * p + 0);
+            tc.aboveDc[p] = s->ctx.data() + stride * (4 * p + 1);
+            tc.leftLevel[p] = s->ctx.data() + stride * (4 * p + 2);
+            tc.leftDc[p] = s->ctx.data() + stride * (4 * p + 3);
+        }
+        tc.st = pft2::TileStats{};
+        av1g_ec_init(&tc.ec, s->ecBuf.data(), (uint32_t)s->ecBuf.size());
+        tc.tile();
+        const int n = tc.st.error ? -1 : av1g_ec_done(&tc.ec, s->out.data());
+        if (n < 0) {
+            snprintf(err, errLen, "tile %d could not be coded (error %d)", t, tc.st.error ? tc.st.error : 6);
+            return -1;
+        }
+        out.tiles[t].assign(s->out.begin(), s->out.begin() + n);
+        for (int k = 0; k < 4; k++) { out.bits[k] += tc.st.bits[k]; out.modes[k] += tc.st.modeCount[k]; }
+        out.compound += tc.st.compound;
+        if (t == contextTile && in.saveSlot >= 0) {
+            pft2::EntropyState saved = s->work;
+            pft2::clearCounters(reinterpret_cast<uint16_t *>(&saved), (int)(sizeof(saved) / 2));
+            s->slots[in.saveSlot] = saved;
+        }
+    }
     return 0;
 }
 

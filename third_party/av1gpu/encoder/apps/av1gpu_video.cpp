@@ -2,12 +2,18 @@
 // all AV1 decisions, reconstruction, filters, and entropy coding use the CUDA backend.
 #include "presets.h"
 #include "inter_packet.h"
+#include "pframe.h"
 #include "pframe_writer.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <cmath>
 #include <functional>
 #include <chrono>
 #include <cstdint>
@@ -79,6 +85,8 @@ int main(int argc, char **argv) {
     pf::Settings pfSettings;
     int pfQindex = 0, pfQoffset = 60, pfGop = 16, pfAltrefBoost = 100, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
+    int pfTileCols = -1, pfTileRows = -1;
+    bool pfGpuEntropy = false;
     bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
@@ -177,6 +185,15 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--rc-buffer") && i + 1 < argc) {
             rcBufferSeconds = atof(argv[++i]);
             if (!(rcBufferSeconds >= 0.1 && rcBufferSeconds <= 60)) { fprintf(stderr, "--rc-buffer must be 0.1..60 seconds\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-tiles") && i + 2 < argc) {
+            pfTileCols = atoi(argv[++i]);
+            pfTileRows = atoi(argv[++i]);
+            if (pfTileCols < 0 || pfTileCols > 6 || pfTileRows < 0 || pfTileRows > 6) {
+                fprintf(stderr, "--pf-tiles takes log2 tile columns and rows (0..6)\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--pf-gpu-entropy")) {
+            pfGpuEntropy = true;
         } else if (!strcmp(argv[i], "--pf-no-filters")) {
             pfFilters = false;
         } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
@@ -314,9 +331,7 @@ int main(int argc, char **argv) {
     }
     FILE *reconDump = getenv("AV1GPU_DUMP_RECON") ? fopen(getenv("AV1GPU_DUMP_RECON"), "wb") : nullptr;
     pf::Analyzer pfAnalyzer;
-    std::unique_ptr<pfw::Writer> pfWriter;
-    std::vector<pf::BlockInfo> pfInfo;
-    std::vector<int16_t> pfLevels;
+    double pfBits[4] = {};
     double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0;
     uint64_t rcPeriods = 0;
     uint64_t pfModes[4] = {}, pfCompound = 0;
@@ -375,7 +390,16 @@ int main(int argc, char **argv) {
     if (usePframes) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
-        pfWriter.reset(new pfw::Writer(w, h, pfAnalyzer.alignedWidth(), pfAnalyzer.alignedHeight()));
+        const int sbCols = (w + 63) / 64, sbRows = (h + 63) / 64;
+        // one tile compresses best; the GPU tile coder needs many tiles for throughput
+        if (pfTileCols < 0) {
+            pfTileCols = 0;
+            while (pfGpuEntropy && pfTileCols < 2 && (sbCols >> (pfTileCols + 1)) >= 4) ++pfTileCols;
+        }
+        if (pfTileRows < 0) {
+            pfTileRows = 0;
+            while (pfGpuEntropy && pfTileRows < 3 && (sbRows >> (pfTileRows + 1)) >= 4) ++pfTileRows;
+        }
         pfSettings.qindex = pfQindex ? pfQindex : std::min(255, std::max(1, cfg.qindex + pfQoffset));
     }
 
@@ -396,7 +420,7 @@ int main(int argc, char **argv) {
         for (auto &fb : inBuf)
             for (int p = 0; p < 3; ++p)
                 if (cudaMalloc(&fb[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "input allocation failed\n"); return 1; }
-        pfw::EntropyState slotState[8];
+        bool slotValid[8] = {};
         std::vector<std::vector<uint8_t>> pending;   // raw frames read ahead
         bool eof = false;
         auto readMore = [&](size_t want) {
@@ -424,16 +448,143 @@ int main(int argc, char **argv) {
         };
         const int pitches[3] = {aw, acw, acw};
         char perr[256];
+        // ---- writer thread: CPU tile entropy coding, temporal units and IVF output, overlapped with the GPU ----
+        struct Job {
+            enum Kind { Coded, Tiles, Raw, ShowExisting, Stop } kind = Coded;
+            pf::EntropyIn ein;
+            pfw::FrameParams fp;
+            int buf = -1, slot0 = 0, outSlot = 8, showSlot = 0;
+            std::vector<uint8_t> raw;
+            pf::EntropyOut tiles;
+            bool endTU = false, resetSlots = false;
+            uint64_t pts = 0;
+        };
+        const int kBuffers = 3;
+        std::vector<pf::BlockInfo *> gridBuf(kBuffers, nullptr);
+        std::vector<int16_t *> levelBuf(kBuffers, nullptr);
+        std::vector<int> freeBufs;
+        for (int k = 0; k < kBuffers; ++k) {
+            if (cudaMallocHost(&gridBuf[k], pfAnalyzer.gridCount() * sizeof(pf::BlockInfo)) != cudaSuccess ||
+                cudaMallocHost(&levelBuf[k], pfAnalyzer.levelCount() * sizeof(int16_t)) != cudaSuccess) {
+                fprintf(stderr, "pinned buffer allocation failed\n");
+                return 1;
+            }
+            freeBufs.push_back(k);
+        }
+        pf::HostEntropy hostEntropy;
+        if (hostEntropy.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<Job> jobs;
+        bool writerBusy = false, writerFailed = false;
+        std::string writerError;
+        auto writer = [&]() {
+            bool hostSlotValid[8] = {};
+            std::vector<uint8_t> tu;
+            char werr[256];
+            for (;;) {
+                Job job;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return !jobs.empty(); });
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                    writerBusy = true;
+                }
+                if (job.kind == Job::Stop) break;
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<uint8_t> obu;
+                bool ok = true;
+                if (job.kind == Job::Raw) {
+                    obu = std::move(job.raw);
+                    if (job.resetSlots)
+                        for (auto &v : hostSlotValid) v = false;
+                } else if (job.kind == Job::ShowExisting) {
+                    obu = pfw::showExistingObu(job.showSlot, tu.empty());
+                } else {
+                    pf::EntropyOut eout;
+                    if (job.kind == Job::Coded) {
+                        job.ein.primarySlot = persistentCdf && hostSlotValid[job.slot0] ? job.slot0 : -1;
+                        job.ein.saveSlot = persistentCdf && job.outSlot < 8 ? job.outSlot : -1;
+                        ok = !hostEntropy.code(job.ein, gridBuf[job.buf], levelBuf[job.buf], eout, werr, sizeof werr);
+                        {
+                            std::lock_guard<std::mutex> lock(mtx);
+                            freeBufs.push_back(job.buf);
+                        }
+                        cv.notify_all();
+                        if (job.outSlot < 8) hostSlotValid[job.outSlot] = persistentCdf;
+                    } else {
+                        eout = std::move(job.tiles);
+                    }
+                    if (ok) {
+                        job.fp.primary = job.ein.primarySlot >= 0;
+                        job.fp.temporalDelimiter = tu.empty();
+                        try {
+                            obu = pfw::frameObu(job.fp, 2 * ((w + 7) >> 3), 2 * ((h + 7) >> 3), eout.tiles);
+                        } catch (const std::exception &ex) {
+                            snprintf(werr, sizeof werr, "P-frame syntax: %s", ex.what());
+                            ok = false;
+                        }
+                        for (int k = 0; k < 4; ++k) { pfModes[k] += eout.modes[k]; pfBits[k] += eout.bits[k]; }
+                        pfCompound += eout.compound;
+                    }
+                }
+                if (ok) {
+                    tu.insert(tu.end(), obu.begin(), obu.end());
+                    if (job.endTU) {
+                        ok = write_ivf_frame(outFile, tu, job.pts);
+                        if (!ok) snprintf(werr, sizeof werr, "IVF write failed");
+                        tu.clear();
+                    }
+                }
+                pfWriteMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                std::lock_guard<std::mutex> lock(mtx);
+                writerBusy = false;
+                if (!ok && !writerFailed) { writerFailed = true; writerError = werr; }
+                cv.notify_all();
+            }
+        };
+        std::thread writerThread(writer);
+        auto submit = [&](Job &&job) -> int {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (writerFailed) { fprintf(stderr, "%s\n", writerError.c_str()); return 1; }
+            jobs.push_back(std::move(job));
+            cv.notify_all();
+            return 0;
+        };
+        auto drain = [&]() -> int {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return (jobs.empty() && !writerBusy) || writerFailed; });
+            if (writerFailed) { fprintf(stderr, "%s\n", writerError.c_str()); return 1; }
+            return 0;
+        };
+        auto stopWriter = [&]() {
+            Job stop;
+            stop.kind = Job::Stop;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                jobs.push_back(std::move(stop));
+            }
+            cv.notify_all();
+            writerThread.join();
+        };
+        struct WriterGuard {
+            std::function<void()> f;
+            ~WriterGuard() { f(); }
+        } writerGuard{[&] {
+            if (writerThread.joinable()) stopWriter();
+            for (int k = 0; k < kBuffers; ++k) { cudaFreeHost(gridBuf[k]); cudaFreeHost(levelBuf[k]); }
+        }};
         // Analyze, filter and write one inter frame. refSlots: slots of the AV1 references used by BlockInfo::ref
         // 0 and 1 (second < 0: single reference). The reconstruction goes to outSlot.
         auto interFrame = [&](std::array<uint8_t *, 3> &fb, int slot0, int slot1, int outSlot, int qindex, bool show,
-                              bool td, std::vector<uint8_t> &obu) -> int {
+                              bool endTU, uint64_t pts) -> int {
             const uint8_t *refs[2] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr};
             const int refCount = slot1 >= 0 ? 2 : 1;
             pf::Settings st = pfSettings;
             st.qindex = qindex;
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
-            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, pfInfo, pfLevels, perr, sizeof perr)) {
+            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, nullptr, nullptr, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
             }
@@ -446,16 +597,25 @@ int main(int argc, char **argv) {
             }
             const auto tw0 = std::chrono::steady_clock::now();
             pfFilterMs += std::chrono::duration<double, std::milli>(tw0 - tf0).count();
-            pfw::FrameParams fp;
+            Job job;
+            job.slot0 = slot0;
+            job.outSlot = outSlot;
+            job.endTU = endTU;
+            job.pts = pts;
+            pf::EntropyIn &ein = job.ein;
+            ein.refName[0] = pfw::LAST_FRAME;
+            ein.refName[1] = pfw::ALTREF_FRAME;
+            ein.referenceSelect = refCount == 2;
+            ein.qindex = qindex;
+            ein.tileColsLog2 = pfTileCols;
+            ein.tileRowsLog2 = pfTileRows;
+            pfw::FrameParams &fp = job.fp;
             fp.qindex = qindex;
             for (int r = 0; r < 7; ++r) fp.refSlot[r] = slot0;
             if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
-            fp.refName[0] = pfw::LAST_FRAME;
-            fp.refName[1] = pfw::ALTREF_FRAME;
             fp.referenceSelect = refCount == 2;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
-            fp.temporalDelimiter = td;
             fp.persistent = persistentCdf;
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
@@ -464,18 +624,35 @@ int main(int argc, char **argv) {
             fp.cdef = pfCdef;
             fp.cdefDamping = flt.damping;
             fp.cdefY = flt.yPri; fp.cdefYSec = flt.ySec; fp.cdefUV = flt.uvPri; fp.cdefUVSec = flt.uvSec;
-            pfw::EntropyState out;
-            try {
-                obu = pfWriter->frame(fp, pfInfo, pfLevels, &slotState[slot0], out);
-            } catch (const std::exception &ex) {
-                fprintf(stderr, "P-frame syntax: %s\n", ex.what());
-                return 1;
+            fp.tileColsLog2 = pfTileCols;
+            fp.tileRowsLog2 = pfTileRows;
+            fp.contextTile = 0;
+            if (pfGpuEntropy) {
+                // GPU tile coding: reference-slot CDFs live on the device and are tracked here
+                ein.primarySlot = persistentCdf && slotValid[slot0] ? slot0 : -1;
+                ein.saveSlot = persistentCdf && outSlot < 8 ? outSlot : -1;
+                if (pfAnalyzer.entropy(ein, job.tiles, perr, sizeof perr)) {
+                    fprintf(stderr, "%s\n", perr);
+                    return 1;
+                }
+                job.kind = Job::Tiles;
+            } else {
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return !freeBufs.empty() || writerFailed; });
+                    if (writerFailed) { fprintf(stderr, "%s\n", writerError.c_str()); return 1; }
+                    job.buf = freeBufs.back();
+                    freeBufs.pop_back();
+                }
+                if (pfAnalyzer.download(gridBuf[job.buf], levelBuf[job.buf], perr, sizeof perr)) {
+                    fprintf(stderr, "%s\n", perr);
+                    return 1;
+                }
+                job.kind = Job::Coded;
             }
-            pfWriteMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
-            for (int k = 0; k < 4; ++k) pfModes[k] += pfWriter->modeCount[k];
-            pfCompound += pfWriter->compoundBlocks;
+            if (submit(std::move(job))) return 1;
             if (outSlot < 8) {
-                slotState[outSlot] = out;
+                slotValid[outSlot] = persistentCdf;
                 std::swap(slotBuf[outSlot], spare);
             }
             return 0;
@@ -504,6 +681,7 @@ int main(int argc, char **argv) {
         };
         auto endPeriod = [&](uint64_t frames) {
             if (targetKbps <= 0 || !frames) return;
+            if (drain()) return;
             const long now = ftell(outFile);
             const double bits = double(now - periodStart) * 8.0;
             periodStart = now;
@@ -551,17 +729,21 @@ int main(int argc, char **argv) {
                 int status = gp_entropy_dev(records, 0, scratch, tiles, &entropyMs, err);
                 gp_dev_records_free(records, 0);
                 if (status) { fprintf(stderr, "entropy: %s\n", err.c_str()); return 1; }
-                std::vector<uint8_t> obu;
-                if (gp_assemble_obus(&frames[0].fp, tiles[0], true, obu, err, true, frameCount == 0, grain,
-                                     uint16_t(7391 + frameCount * 31847)) ||
-                    !write_ivf_frame(outFile, obu, frameCount)) {
+                Job kj;
+                kj.kind = Job::Raw;
+                kj.endTU = true;
+                kj.resetSlots = true;
+                kj.pts = frameCount;
+                if (gp_assemble_obus(&frames[0].fp, tiles[0], true, kj.raw, err, true, frameCount == 0, grain,
+                                     uint16_t(7391 + frameCount * 31847))) {
                     fprintf(stderr, "write frame: %s\n", err.c_str());
                     return 1;
                 }
+                if (submit(std::move(kj))) return 1;
                 gpuMs += times.total + entropyMs;
                 for (int k = 0; k < 8; ++k)
                     if (cudaMemcpy(slotBuf[k], reference, frameBytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
-                for (auto &st : slotState) st = pfw::EntropyState{};
+                for (auto &v : slotValid) v = false;
                 pfAnalyzer.resetTemporal();
                 dump(slotBuf[0]);
                 lastShown = 0;
@@ -578,9 +760,7 @@ int main(int argc, char **argv) {
             if (n == 1) {
                 // single P frame from the last shown picture
                 if (!upload(pending[0], inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
-                std::vector<uint8_t> obu;
-                if (interFrame(inBuf[0], lastShown, -1, 0, pfSettings.qindex, true, true, obu)) return 1;
-                if (!write_ivf_frame(outFile, obu, frameCount)) return 1;
+                if (interFrame(inBuf[0], lastShown, -1, 0, pfSettings.qindex, true, true, frameCount)) return 1;
                 dump(slotBuf[0]);
                 lastShown = 0;
                 ++predicted; ++frameCount;
@@ -609,57 +789,40 @@ int main(int argc, char **argv) {
                 const double frac = depthMax ? 1.0 - double(depth) / depthMax : 1.0;
                 return std::max(1, (int)std::lround(pfSettings.qindex - pfAltrefBoost * frac));
             };
-            std::vector<uint8_t> tu;   // OBUs of the temporal unit being assembled
-            auto emitShown = [&](std::vector<uint8_t> &obu) -> bool {
-                tu.insert(tu.end(), obu.begin(), obu.end());
-                const bool ok = write_ivf_frame(outFile, tu, frameCount);
-                tu.clear();
-                return ok;
-            };
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();
-            {
-                std::vector<uint8_t> obu;
-                if (interFrame(inBuf[n - 1], lastShown, -1, hiSlot, qAt(0), false, tu.empty(), obu)) return 1;
-                tu.insert(tu.end(), obu.begin(), obu.end());
-            }
+            if (interFrame(inBuf[n - 1], lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
             std::function<int(uint64_t, uint64_t, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
                                                                             int hiSlotL, int depth) -> int {
                 if (hi == lo + 1) {
-                    pfw::FrameParams se;
-                    se.showExisting = true;
-                    se.showExistingSlot = hiSlotL;
-                    se.temporalDelimiter = tu.empty();
-                    std::vector<pf::BlockInfo> none;
-                    std::vector<int16_t> noLevels;
-                    pfw::EntropyState unused;
-                    auto obu = pfWriter->frame(se, none, noLevels, nullptr, unused);
-                    if (!emitShown(obu)) return 1;
+                    Job se;
+                    se.kind = Job::ShowExisting;
+                    se.showSlot = hiSlotL;
+                    se.endTU = true;
+                    se.pts = frameCount;
+                    if (submit(std::move(se))) return 1;
                     dump(slotBuf[hiSlotL]);
                     ++predicted; ++frameCount;
                     release(loSlot);
                     return 0;
                 }
                 const uint64_t mid = (lo + hi) / 2;
-                std::vector<uint8_t> obu;
                 if (mid == lo + 1) {
                     const bool referenced = hi - mid > 1;
                     const int midSlot = referenced ? allocSlot() : -1;
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
                     if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
                                    referenced ? qAt(depth) : std::min(255, pfSettings.qindex + pfLeafOffset), true,
-                                   tu.empty(), obu))
+                                   true, frameCount))
                         return 1;
-                    if (!emitShown(obu)) return 1;
                     dump(referenced ? slotBuf[midSlot] : spare);
                     ++predicted; ++frameCount;
                     release(loSlot);
                     return rec(mid, hi, midSlot, hiSlotL, depth + 1);
                 }
                 const int midSlot = allocSlot();
-                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, tu.empty(), obu))
+                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0))
                     return 1;
-                tu.insert(tu.end(), obu.begin(), obu.end());
                 if (rec(lo, mid, loSlot, midSlot, depth + 1)) return 1;
                 return rec(mid, hi, midSlot, hiSlotL, depth + 1);
             };
@@ -673,6 +836,8 @@ int main(int argc, char **argv) {
             pending.erase(pending.begin(), pending.begin() + n);
             endPeriod(frameCount - periodBegin);
         }
+        if (drain()) return 1;
+        stopWriter();
         for (auto &fb : inBuf)
             for (auto *p : fb) cudaFree(p);
         for (auto *p : slotBuf) cudaFree(p);
@@ -844,7 +1009,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "rate control: target %.1f kbit/s over %llu periods\n", targetKbps, (unsigned long long)rcPeriods);
     if (usePframes)
         fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
-                pfWriter->bits[0], pfWriter->bits[1], pfWriter->bits[2], pfWriter->bits[3]),
+                pfBits[0], pfBits[1], pfBits[2], pfBits[3]),
         fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms\n", pfFilterMs, pfWriteMs),
         fprintf(stderr, "P-frame analysis %.1f ms; compound blocks %llu; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
                 (unsigned long long)pfCompound,

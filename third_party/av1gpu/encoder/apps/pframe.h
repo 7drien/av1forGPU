@@ -46,21 +46,57 @@ struct FilterParams {
     int yPri = 0, ySec = 0, uvPri = 0, uvSec = 0;   // secondary strengths 0, 1, 2, 4
 };
 
+// GPU tile entropy coding of the last analyzed frame (pframe_tile.cuh).
+struct EntropyIn {
+    int refName[2] = {1, 7};    // AV1 reference (LAST_FRAME, ALTREF_FRAME) of BlockInfo::ref 0 and 1
+    bool referenceSelect = false;
+    int qindex = 100;
+    int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
+    int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1
+    int tileColsLog2 = 0, tileRowsLog2 = 0;
+    int contextTile = 0;        // tile whose final CDFs are the frame-end CDFs
+};
+struct EntropyOut {
+    std::vector<std::vector<uint8_t>> tiles;
+    float bits[4] = {};          // partition + mode info, motion vectors, luma coefficients, chroma coefficients
+    int modes[4] = {};           // NEAREST, NEAR, GLOBAL, NEW (first list)
+    int compound = 0;
+};
+
+// CPU tile entropy coding with the same tile coder as the GPU path (pframe_tile.cuh). It owns host copies of the
+// reference-slot CDFs, so it can run on a worker thread while the GPU analyzes later frames.
+class HostEntropy {
+public:
+    ~HostEntropy();
+    int init(int width, int height, char *err, int errLen);
+    // grid / levels: host copies of the decisions and levels of the frame (Analyzer::analyze downloads).
+    int code(const EntropyIn &in, const BlockInfo *grid, const int16_t *levels, EntropyOut &out, char *err, int errLen);
+private:
+    int w = 0, h = 0, aw = 0, ah = 0;
+    void *state = nullptr;
+};
+
 // Reference frames are tightly packed 8-bit YUV420 (W x H luma, then (W/2) x (H/2) U and V).
 class Analyzer {
 public:
     ~Analyzer();
     int init(int width, int height, char *err, int errLen);
     // src: device planes with pitches; refs: device reference frames (refs[0] = LAST); recon: output frame.
-    // Fills info (8x8 grid) and levels (spatial layout, see levelsAt) on the host.
+    // When info / levels are non-null, also downloads the decisions (8x8 grid) and levels (spatial layout).
     int analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                const Settings &s, uint8_t *recon, std::vector<BlockInfo> &info, std::vector<int16_t> &levels,
+                const Settings &s, uint8_t *recon, std::vector<BlockInfo> *info, std::vector<int16_t> *levels,
                 char *err, int errLen);
+    // Copy the last frame's decisions and levels into host buffers (pinned memory recommended).
+    int download(BlockInfo *info, int16_t *levels, char *err, int errLen);
+    size_t gridCount() const { return size_t(aw / 8) * (ah / 8); }
+    size_t levelCount() const { return size_t(aw) * ah * 3 / 2; }
     // Deblocking and CDEF of the last analyzed frame's reconstruction (in place), choosing levels by SSE.
     int filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
                bool search, FilterParams &out, char *err, int errLen);
     // Forget the temporal motion field (after a keyframe).
     void resetTemporal();
+    // Code the tiles of the last analyzed frame on the GPU.
+    int entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen);
     int width() const { return w; }
     int height() const { return h; }
     int alignedWidth() const { return aw; }
