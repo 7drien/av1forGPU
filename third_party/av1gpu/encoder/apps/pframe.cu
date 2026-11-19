@@ -359,26 +359,26 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) chooseInter(Frame f,
 // coefficients violate the conformance ranges. recon = Clip1(pred + residual).
 template <int LN>
 __device__ void warpInverseAdd(int16_t *q, int txSz, int dcQ, int acQ, int16_t *res, const uint8_t *pred, uint8_t *recon) {
-    constexpr int N = 1 << LN;
+    constexpr int N = 1 << LN, T = N > 32 ? 32 : N;   // T x T stored coefficients
     const int lane = threadIdx.x & 31;
     const int den = av1g_dq_denom(txSz);
     const int rk = av1g_row_kind(AV1G_DCT_DCT), ck = av1g_col_kind(AV1G_DCT_DCT);
     const int rowShift = AV1G_T(Transform_Row_Shift)[txSz];
     for (;;) {
         int any = 0;
-        for (int i = lane; i < N * N; i += 32) any |= q[i];
+        for (int i = lane; i < T * T; i += 32) any |= q[i];
         if (!__any_sync(0xffffffffu, any)) {
             for (int i = lane; i < N * N; i += 32) recon[i] = pred[i];
             __syncwarp();
             return;
         }
         uint32_t err = 0;
-        for (int i = lane; i < N; i += 32) err |= rci::row<LN, 8>(i, N, N, q, dcQ, acQ, nullptr, den, false, rk, rowShift, res);
+        for (int i = lane; i < N; i += 32) err |= rci::row<LN, 8>(i, T, T, q, dcQ, acQ, nullptr, den, false, rk, rowShift, res);
         __syncwarp();
         for (int j = lane; j < N; j += 32) err |= rci::col<LN>(j, N, ck, res);
         __syncwarp();
         if (!__any_sync(0xffffffffu, err != 0)) break;
-        for (int i = lane; i < N * N; i += 32) q[i] = (int16_t)(q[i] / 2);
+        for (int i = lane; i < T * T; i += 32) q[i] = (int16_t)(q[i] / 2);
         __syncwarp();
     }
     for (int i = lane; i < N * N; i += 32) recon[i] = (uint8_t)min(max((int)pred[i] + res[i], 0), 255);
@@ -406,15 +406,15 @@ template <int N>
 __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
     constexpr int W = EvalCfg<N>::warps;
     constexpr int NC = N / 2;
-    constexpr bool coded = N <= 32;
-    constexpr int TN = coded ? N : 1, TC = coded ? NC : 1;
+    constexpr bool coded = true;
+    constexpr int TN = N, TQ = N > 32 ? 32 : N;   // transform size, stored coefficients per side
     __shared__ int16_t interp[W][(N + 7) * N];
     __shared__ int16_t hpS[W][N * N];
     __shared__ uint8_t predS[W][N * N + 2 * NC * NC];
     __shared__ uint8_t recS[W][coded ? N * N : 1];
     __shared__ int16_t resS[W][TN * TN];
-    __shared__ float tmpS[W][TN * (TN + 1)];
-    __shared__ int16_t qS[W][TN * TN];
+    __shared__ float tmpS[W][TQ * (TN + 1)];
+    __shared__ int16_t qS[W][TQ * TQ];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int b = blockIdx.x * W + warp;
     if (b >= a.cols * a.rows) return;
@@ -473,7 +473,9 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
                 energy += (float)(d * d);
             }
             __syncwarp();
-            const int txSz = tn == 4 ? AV1G_TX_4X4 : tn == 8 ? AV1G_TX_8X8 : tn == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
+            const int txSz = tn == 4 ? AV1G_TX_4X4 : tn == 8 ? AV1G_TX_8X8 : tn == 16 ? AV1G_TX_16X16
+                           : tn == 32 ? AV1G_TX_32X32 : AV1G_TX_64X64;
+            const int tq = tn > 32 ? 32 : tn;
             EvalIn e{};
             e.txSz = txSz; e.txType = AV1G_DCT_DCT; e.plane = p;
             e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
@@ -492,10 +494,11 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
             case 4: warpInverseAdd<2>(q, txSz, dcQ, acQ, res, pred, rec); break;
             case 8: warpInverseAdd<3>(q, txSz, dcQ, acQ, res, pred, rec); break;
             case 16: warpInverseAdd<4>(q, txSz, dcQ, acQ, res, pred, rec); break;
-            default: warpInverseAdd<5>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            case 32: warpInverseAdd<5>(q, txSz, dcQ, acQ, res, pred, rec); break;
+            default: warpInverseAdd<6>(q, txSz, dcQ, acQ, res, pred, rec); break;
             }
             int any = 0;
-            for (int i = lane; i < tn * tn; i += 32) any |= q[i];
+            for (int i = lane; i < tq * tq; i += 32) any |= q[i];
             nz = nz || __any_sync(0xffffffffu, any);
             int sseC = 0;
             uint8_t *outRec = a.recon + (p ? ysz + (p - 1) * csz : 0);
@@ -510,8 +513,12 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
             // levels, tile layout of the aligned plane
             const int apw = p ? f.aw / 2 : f.aw;
             const size_t base = p ? size_t(f.aw) * f.ah + size_t(p - 1) * (f.aw / 2) * (f.ah / 2) : 0;
+            // the tn x tn tile holds the stored tq x tq coefficients in its top-left corner (zeros elsewhere)
             int16_t *dst = a.levels + base + (size_t(py / tn) * (apw / tn) + px / tn) * tn * tn;
-            for (int i = lane; i < tn * tn; i += 32) dst[i] = q[i];
+            for (int i = lane; i < tn * tn; i += 32) {
+                const int r = i / tn, col = i - r * tn;
+                dst[i] = (r < tq && col < tq) ? q[r * tq + col] : 0;
+            }
             __syncwarp();
         }
     }
@@ -520,7 +527,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
         const float modeBits = 2.f + c.mvBits * a.mvWeight;
         const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
         c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
-        c.costCoded = coded ? dCoded + a.lambda * (modeBits + skipFlag0 + bits) : kInf;
+        c.costCoded = dCoded + a.lambda * (modeBits + skipFlag0 + bits);
         c.nz = nz;
     }
 }
@@ -593,8 +600,8 @@ __global__ void decideGrid(DecideArgs a) {
 struct CommitArgs {
     const BlockInfo *grid;
     int gcols, w, h, aw, ah;
-    const uint8_t *pred[kSizes], *recon[3];
-    const int16_t *levels[3];
+    const uint8_t *pred[kSizes], *recon[kSizes];
+    const int16_t *levels[kSizes];
     uint8_t *out;
     int16_t *outLevels;
 };
@@ -612,7 +619,7 @@ __global__ void commit(CommitArgs a) {
     if (bi.log2 && !bi.skip) {
         const int lt = bi.log2 - sub, t = 1 << lt;
         const int tx = x >> lt, ty = y >> lt;
-        const int16_t *lv = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[2]);
+        const int16_t *lv = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[3]);
         level = lv[lbase + ((size_t(ty) * (apw >> lt) + tx) << (2 * lt)) + ((y - (ty << lt)) << lt) + (x - (tx << lt))];
     }
     a.outLevels[lbase + size_t(y) * apw + x] = level;
@@ -620,7 +627,7 @@ __global__ void commit(CommitArgs a) {
     if (x >= pw || y >= ph) return;
     const size_t off = (p ? size_t(a.w) * a.h + size_t(p - 1) * pw * ph : 0) + size_t(y) * pw + x;
     const uint8_t *srcBuf = bi.skip ? pick4(s, a.pred[0], a.pred[1], a.pred[2], a.pred[3])
-                                    : pick4(s, a.recon[0], a.recon[1], a.recon[2], a.recon[2]);
+                                    : pick4(s, a.recon[0], a.recon[1], a.recon[2], a.recon[3]);
     a.out[off] = srcBuf[off];
 }
 
@@ -667,8 +674,8 @@ struct State {
     uint8_t *ds[1 + kMaxRefs] = {};
     Mv *coarse[kMaxRefs] = {};
     Cand *cand[kSizes] = {};
-    uint8_t *pred[kSizes] = {}, *recon[3] = {};
-    int16_t *levels[3] = {}, *outLevels = nullptr;
+    uint8_t *pred[kSizes] = {}, *recon[kSizes] = {};
+    int16_t *levels[kSizes] = {}, *outLevels = nullptr;
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
     bool havePrev = false;
     int dw = 0, dh = 0, ccols = 0, crows = 0;
@@ -744,10 +751,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->best[k], sizeof(float) * s->cols[k] * s->rows[k]);
         alloc(&s->mode[k], s->cols[k] * s->rows[k]);
         alloc(&s->pred[k], frame);
-        if (k < 3) {
-            alloc(&s->recon[k], frame);
-            alloc(&s->levels[k], aframe * sizeof(int16_t));
-        }
+        alloc(&s->recon[k], frame);
+        alloc(&s->levels[k], aframe * sizeof(int16_t));
     }
     alloc(&s->outLevels, aframe * sizeof(int16_t));
     s->gcols = aw / 8; s->grows = ah / 8;
@@ -838,7 +843,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.25f;
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
-    ea.pred = s->pred[K]; ea.recon = K < 3 ? s->recon[K] : nullptr; ea.levels = K < 3 ? s->levels[K] : nullptr; \
+    ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \
     evaluate<N><<<(s->cols[K] * s->rows[K] + EvalCfg<N>::warps - 1) / EvalCfg<N>::warps, 32 * EvalCfg<N>::warps>>>(ea)
     PF_EVAL(0, 8);
     PF_EVAL(1, 16);
@@ -861,7 +866,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     CommitArgs ca{};
     ca.grid = s->grid; ca.gcols = s->gcols; ca.w = w; ca.h = h; ca.aw = aw; ca.ah = ah;
     for (int k = 0; k < kSizes; k++) ca.pred[k] = s->pred[k];
-    for (int k = 0; k < 3; k++) { ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k]; }
+    for (int k = 0; k < kSizes; k++) { ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k]; }
     ca.out = recon;
     ca.outLevels = s->outLevels;
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);

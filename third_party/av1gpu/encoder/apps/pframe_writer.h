@@ -606,7 +606,8 @@ private:
         sym(cdf->txb_skip[txSzCtx][ctx], eob == 0, 2);
         int culLevel = 0, dcCategory = 0;
         if (eob) {
-            if (plane == 0) sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);   // DCT_DCT in TX_SET_INTER_3
+            // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
+            if (plane == 0 && txSz != AV1G_TX_64X64) sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
             int dcSign = 0;
             for (int k = 0; k < w4; k++)
                 if (x4 + k < maxX4) dcSign += aD[x4 + k] == 1 ? -1 : aD[x4 + k] == 2 ? 1 : 0;
@@ -856,13 +857,15 @@ private:
         for (int p = 0; p < 3; ++p) {
             const int sub = p > 0;
             const int t = bsize >> sub;
-            const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
+            const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16
+                           : t == 32 ? AV1G_TX_32X32 : AV1G_TX_64X64;
+            const int tq = std::min(t, 32);   // stored coefficients per side
             const int px = (miCol * 4) >> sub, py = (miRow * 4) >> sub;
             const int pw = p ? aw / 2 : aw;
             const size_t base = p ? size_t(aw) * ah + size_t(p - 1) * (aw / 2) * (ah / 2) : 0;
             int16_t qv[1024];
-            for (int r = 0; r < t; ++r)
-                for (int c = 0; c < t; ++c) qv[r * t + c] = levels[base + size_t(py + r) * pw + px + c];
+            for (int r = 0; r < tq; ++r)
+                for (int c = 0; c < tq; ++c) qv[r * tq + c] = levels[base + size_t(py + r) * pw + px + c];
             const double t0 = tell();
             coeffs(p, px >> 2, py >> 2, txSz, bsize, qv);
             bits[p ? 3 : 2] += tell() - t0;
