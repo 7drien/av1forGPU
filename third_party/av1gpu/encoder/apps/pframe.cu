@@ -33,6 +33,8 @@ constexpr int kFullPelPasses = 6;
 __constant__ int16_t c_filter[6][16][8];
 // AV1GPU_PF_PROFILE2: per-launch GPU time by name (synchronizes after every timed launch)
 static std::map<std::string, double> g_fineMs;
+static double g_bitStats[4];
+static struct BitReport { ~BitReport() { const double t = g_bitStats[0] + g_bitStats[1] + g_bitStats[2] + g_bitStats[3]; if (t > 0) fprintf(stderr, "inter bits: modes/partition %.1f%%, mv %.1f%%, coefficients %.1f%%, tx types %.1f%%\n", 100 * g_bitStats[0] / t, 100 * g_bitStats[1] / t, 100 * g_bitStats[2] / t, 100 * g_bitStats[3] / t); } } g_bitReport;
 static bool g_fine = getenv("AV1GPU_PF_PROFILE2") != nullptr;
 struct FineTimer {
     const char *name; std::chrono::steady_clock::time_point t;
@@ -2537,6 +2539,30 @@ int HostEntropy::codeRecords(const EntropyIn &in, const std::vector<uint32_t> &t
         uint16_t *base = reinterpret_cast<uint16_t *>(&s->work);
         av1g_ec ec;
         av1g_ec_init(&ec, s->ecBuf.data(), (uint32_t)s->ecBuf.size());
+        static const bool stats = getenv("AV1GPU_PF_BITSTATS") != nullptr;
+        if (stats) {
+            // bits by syntax group (exact adaptive costs): 0 partition / modes / refs, 1 motion vectors, 2 coefficients
+            // (txb_skip, eob, levels, signs, Golomb literals), 3 other literals / transform types
+            const size_t interOff = offsetof(pft2::EntropyState, inter) / 2;
+            const size_t mvLo = interOff + offsetof(pft2::InterCdfs, mvJoint) / 2, mvHi = interOff + offsetof(pft2::InterCdfs, txSet3) / 2;
+            const size_t txLo = mvHi, txHi = interOff + offsetof(pft2::InterCdfs, compMode) / 2;
+            const size_t partHi = offsetof(av1g_cdfs, txb_skip) / 2;
+            for (uint32_t k = 0; k < tileCounts[t]; k++) {
+                const pft2::SymRec r = recs[at + k];
+                const int type = r.kind >> 5, n = r.kind & 31;
+                float b;
+                int cat;
+                if (type == 0) {
+                    const uint16_t *c = base + r.cdf;
+                    b = -std::log2(std::max(1, c[r.sym] - (r.sym ? c[r.sym - 1] : 0)) / 32768.0f);
+                    cat = r.cdf >= interOff ? (r.cdf >= mvLo && r.cdf < mvHi ? 1 : r.cdf >= txLo && r.cdf < txHi ? 3 : 0)
+                                            : (r.cdf < partHi ? 0 : 2);
+                } else if (type == 3) { b = (float)n; cat = 2; }
+                else { b = 1.f; cat = type == 2 ? 0 : 2; }
+                g_bitStats[cat] += b;
+                pft2::codeRecord(&ec, base, r);
+            }
+        } else
         for (uint32_t k = 0; k < tileCounts[t]; k++) pft2::codeRecord(&ec, base, recs[at + k]);
         at += tileCounts[t];
         const int n = av1g_ec_done(&ec, s->out.data());

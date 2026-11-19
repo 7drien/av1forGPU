@@ -110,4 +110,8 @@ intra path), then T5, T7, T3, T2, T6.
   `--pf-gop 16` (+20.5%), ALTREF temporal filtering 2 / 4 frames (+20.4% / +20.6%).
 - The test clip has no scene cuts (largest inter frame 3 KB against a 35 KB key frame), so intra blocks in inter
   frames (T2) would gain little on it; it needs a clip with cuts and uncovered content to be measured.
+- Inter-frame bits by syntax group (`AV1GPU_PF_BITSTATS=1` with the default entropy path): coefficients 64 to 74%,
+  partition / modes / references 13 to 22%, motion vectors 8 to 10%, transform types about 4%. The key frame is
+  about 11% of the sequence. Residual coding and prediction quality are where the remaining gap is.
+- Quantizer rounding 0.33 → 0.40 (+18.6% → +18.3%); other rounding / deadzone values were within noise.
 
