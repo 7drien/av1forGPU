@@ -2200,6 +2200,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.switchable = in.switchableFilter;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
+    for (int k = 0; k < 8; k++) j.fs.signBias[k] = in.signBias[k];
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2437,6 +2438,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.reducedTxSet = in.reducedTxSet;
     fs.switchable = in.switchableFilter;
     fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
+    for (int k = 0; k < 8; k++) fs.signBias[k] = in.signBias[k];
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
     pft2::EntropyState &init = s->init;

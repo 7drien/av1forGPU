@@ -109,6 +109,10 @@ int av1g_validate(const av1g_decision_record *rec, char *err, size_t errlen);
  * all-zero tx blocks is normalised to DCT_DCT, as the spec does); with
  * AV1G_ENC_FIX_RANGE offending coefficients are modified in place. */
 int av1g_encode(av1g_decision_record *rec, const av1g_encode_opts *opts, av1g_output *out);
+/* Video streams: order hints in the sequence and key frame headers written after this call.  bits 0 (default):
+ * enable_order_hint = 0; bits 1..8: enable_order_hint = 1 (enable_ref_frame_mvs = 1, enable_jnt_comp = 0) and key
+ * frames carry orderHint. */
+void av1g_set_video_order_hint(int bits, int orderHint);
 void av1g_output_free(av1g_output *out);
 
 /* Parse an AV1 OBU stream (Main or High profile 8- or 10-bit sequence header + one intra OBU_FRAME

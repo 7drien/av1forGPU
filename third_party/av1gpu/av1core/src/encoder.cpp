@@ -27,6 +27,9 @@
 #include <string>
 #include <vector>
 
+static int g_orderHintBits = 0, g_orderHint = 0;
+extern "C" void av1g_set_video_order_hint(int bits, int orderHint) { g_orderHintBits = bits; g_orderHint = orderHint; }
+
 namespace av1g {
 
 static_assert(sizeof(av1g_block) == 16, "av1g_block must be 16 bytes");
@@ -1352,9 +1355,14 @@ void write_headers(const av1g_frame_params *fp, const TileInfo &tiles, int level
         seq.put(0, 1);      // enable_masked_compound
         seq.put(0, 1);      // enable_warped_motion
         seq.put(0, 1);      // enable_dual_filter
-        seq.put(0, 1);      // enable_order_hint
+        seq.put(g_orderHintBits > 0, 1);   // enable_order_hint
+        if (g_orderHintBits > 0) {
+            seq.put(0, 1);  // enable_jnt_comp
+            seq.put(1, 1);  // enable_ref_frame_mvs
+        }
         seq.put(1, 1);      // seq_choose_screen_content_tools
         seq.put(1, 1);      // seq_choose_integer_mv
+        if (g_orderHintBits > 0) seq.put(g_orderHintBits - 1, 3);   // order_hint_bits_minus_1
     }
     seq.put(0, 1);          // enable_superres
     seq.put(fp->enable_cdef, 1);  // enable_cdef
@@ -1393,6 +1401,7 @@ void write_headers(const av1g_frame_params *fp, const TileInfo &tiles, int level
         fh.put(fp->allow_screen_content_tools, 1); // allow_screen_content_tools
         if (fp->allow_screen_content_tools) fh.put(0, 1); // force_integer_mv (intra forces it to 1)
         fh.put(0, 1);       // frame_size_override_flag
+        if (g_orderHintBits > 0) fh.put(g_orderHint & ((1 << g_orderHintBits) - 1), g_orderHintBits);   // order_hint
         // order_hint is absent (enable_order_hint = 0); primary_ref_frame is NONE for intra frames.
         // refresh_frame_flags is implicitly all ones for a shown key frame.
         fh.put(0, 1);       // render_and_frame_size_different (frame size comes from the sequence header)

@@ -4,6 +4,7 @@
 #include "inter_packet.h"
 #include "pframe.h"
 #include "pframe_writer.h"
+#include "av1g/av1g.h"
 
 #include <cuda_runtime.h>
 
@@ -88,6 +89,9 @@ int main(int argc, char **argv) {
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
     int pfLrFrames = 0;
+    constexpr int kOrderHintBits = 7;   // --pframes streams: enable_order_hint with 7-bit hints
+    uint64_t frameOrder = 0;            // display index of the inter frame being coded
+    int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
     uint64_t pfCuts = 0;
     double pfSceneCut = 15.0;
@@ -702,6 +706,11 @@ int main(int argc, char **argv) {
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;
+            fp.orderHintBits = kOrderHintBits;
+            fp.orderHint = int(frameOrder & ((1u << kOrderHintBits) - 1));
+            for (int k = 0; k < 8; ++k) fp.slotHint[k] = slotHint[k];
+            for (int r = 0; r < 7; ++r)   // RefFrameSignBias for the tile coder's motion vector candidates
+                ein.signBias[r + 1] = pfw::relDist(slotHint[fp.refSlot[r]], fp.orderHint, kOrderHintBits) > 0;
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
             for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];
@@ -760,6 +769,7 @@ int main(int argc, char **argv) {
             if (submit(std::move(job))) return 1;
             if (outSlot < 8) {
                 slotValid[outSlot] = persistentCdf;
+                slotHint[outSlot] = int(frameOrder & ((1u << kOrderHintBits) - 1));
                 std::swap(slotBuf[outSlot], spare);
             }
             return 0;
@@ -899,6 +909,8 @@ int main(int argc, char **argv) {
                 std::vector<GpFrameOut> frames;
                 GpTimes times;
                 GpDevRecords records;
+                av1g_set_video_order_hint(kOrderHintBits, int(frameCount & ((1u << kOrderHintBits) - 1)));
+                for (int &v : slotHint) v = int(frameCount & ((1u << kOrderHintBits) - 1));
                 if (encoder.encode(inputs, frames, times, err, 0, &records)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
                 std::vector<std::vector<std::vector<uint8_t>>> tiles;
                 double entropyMs = 0;
@@ -941,6 +953,7 @@ int main(int argc, char **argv) {
             if (n == 1) {
                 // single P frame from the last shown picture
                 if (!upload(pending[0], inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
+                frameOrder = frameCount;
                 if (interFrame(inBuf[0], lastShown, -1, 0, pfSettings.qindex, true, true, frameCount)) return 1;
                 dump(slotBuf[0]);
                 lastShown = 0;
@@ -1001,12 +1014,14 @@ int main(int argc, char **argv) {
             };
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();
+            frameOrder = base + n;
             if (interFrame(altSrc, lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
             // hi2Slot: the next anchor after hi (still held, displayed later), the third reference of the interval
             std::function<int(uint64_t, uint64_t, int, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
                                                                                  int hiSlotL, int depth, int hi2Slot) -> int {
                 if (hi == lo + 1 && filtered && hi == base + n) {
                     // overlay: display the original picture coded from the filtered ALTREF (refreshes no slot)
+                    frameOrder = base + n;
                     if (interFrame(inBuf[n - 1], loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
                                    true, true, frameCount))
                         return 1;
@@ -1033,6 +1048,7 @@ int main(int argc, char **argv) {
                     const bool referenced = hi - mid > 1 || (filtered && hi == base + n);
                     const int midSlot = referenced ? allocSlot() : -1;
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
+                    frameOrder = mid;
                     if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
                                    referenced ? qAt(depth) : std::min(255, pfSettings.qindex + pfLeafOffset), true,
                                    true, frameCount, hi2Slot))
@@ -1043,6 +1059,7 @@ int main(int argc, char **argv) {
                     return rec(mid, hi, midSlot, hiSlotL, depth + 1, hi2Slot);
                 }
                 const int midSlot = allocSlot();
+                frameOrder = mid;
                 if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0, hi2Slot))
                     return 1;
                 if (rec(lo, mid, loSlot, midSlot, depth + 1, hiSlotL)) return 1;

@@ -73,6 +73,7 @@ struct EntropyIn {
     bool txModeSelect = false;
     bool reducedTxSet = true;
     bool lrLuma = false;        // luma Wiener loop restoration (parameters in the grid)
+    int signBias[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // RefFrameSignBias by reference frame
     bool switchableFilter = false;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults

@@ -21,7 +21,12 @@ struct FrameParams {
     bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
     bool reducedTxSet = true;
     bool switchable = false;        // is_filter_switchable (else EIGHTTAP)
-    int lrType[3] = {0, 0, 0};      // lr_type per plane (0 NONE, 2 WIENER); 64-sample units
+    int lrType[3] = {0, 0, 0};
+    // order hints (enable_order_hint = 1 when orderHintBits > 0)
+    int orderHintBits = 0;
+    int orderHint = 0;
+    int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // RefOrderHint of each reference slot before this frame
+    bool useRefFrameMvs = false;      // lr_type per plane (0 NONE, 2 WIENER); 64-sample units
     bool persistent = false;        // error_resilient_mode = 0 and CDFs from primary_ref_frame
     bool primary = false;           // primary_ref_frame = LAST (else NONE)
     int grain = 0;
@@ -62,6 +67,32 @@ inline TileGrid tileGrid(int miCols, int miRows, int colsLog2, int rowsLog2) {
     return g;
 }
 
+inline int relDist(int a, int b, int bits) {   // get_relative_dist
+    if (!bits) return 0;
+    int diff = a - b;
+    const int m = 1 << (bits - 1);
+    return (diff & (m - 1)) - (diff & m);
+}
+// skip_mode_params(): whether skip_mode_present is coded
+inline bool skipModeAllowed(const FrameParams &fp) {
+    if (!fp.referenceSelect || !fp.orderHintBits) return false;
+    const int bits = fp.orderHintBits;
+    int fwd = -1, bwd = -1, fwdHint = 0, bwdHint = 0;
+    for (int i = 0; i < 7; i++) {
+        const int h = fp.slotHint[fp.refSlot[i]];
+        if (relDist(h, fp.orderHint, bits) < 0) {
+            if (fwd < 0 || relDist(h, fwdHint, bits) > 0) { fwd = i; fwdHint = h; }
+        } else if (relDist(h, fp.orderHint, bits) > 0) {
+            if (bwd < 0 || relDist(h, bwdHint, bits) < 0) { bwd = i; bwdHint = h; }
+        }
+    }
+    if (fwd < 0) return false;
+    if (bwd >= 0) return true;
+    for (int i = 0; i < 7; i++)
+        if (relDist(fp.slotHint[fp.refSlot[i]], fwdHint, bits) < 0) return true;
+    return false;
+}
+
 inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int miRows, int tileBytes) {
     b.bit(0);              // show_existing_frame
     b.put(1, 2);           // frame_type INTER_FRAME
@@ -71,14 +102,19 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     b.bit(0);                      // disable_cdf_update
     b.bit(0);                      // allow_screen_content_tools
     b.bit(0);                      // frame_size_override_flag
+    if (fp.orderHintBits) b.put(fp.orderHint, fp.orderHintBits);   // order_hint
     if (fp.persistent) b.put(fp.primary ? 0 : 7, 3);   // primary_ref_frame (LAST or NONE)
     b.put(fp.refreshFlags, 8);
+    if (!fp.persistent && fp.orderHintBits)
+        for (int i = 0; i < 8; ++i) b.put(fp.slotHint[i], fp.orderHintBits);   // ref_order_hint
+    if (fp.orderHintBits) b.bit(0);                                            // frame_refs_short_signaling
     for (int r = 0; r < 7; ++r) b.put(fp.refSlot[r], 3);
     b.bit(0);      // render_and_frame_size_different
     b.bit(0);      // allow_high_precision_mv
     b.bit(fp.switchable);           // is_filter_switchable
     if (!fp.switchable) b.put(0, 2);   // interpolation_filter EIGHTTAP
     b.bit(0);      // is_motion_mode_switchable
+    if (fp.persistent && fp.orderHintBits) b.bit(fp.useRefFrameMvs);   // use_ref_frame_mvs
     b.bit(0);      // disable_frame_end_update_cdf
     // tile_info
     const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
@@ -123,6 +159,7 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     }
     b.bit(fp.txModeSelect);      // tx_mode_select (else TX_MODE_LARGEST)
     b.bit(fp.referenceSelect);   // reference_select
+    if (skipModeAllowed(fp)) b.bit(0);   // skip_mode_present
     b.bit(fp.reducedTxSet);      // reduced_tx_set
     for (int r = 0; r < 7; ++r) b.bit(0);   // is_global
     av1g::write_video_grain(b, fp.grain, fp.grainSeed, true);

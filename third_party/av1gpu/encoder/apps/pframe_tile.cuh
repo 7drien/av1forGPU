@@ -129,6 +129,7 @@ struct FrameSyntax {
     int reducedTxSet;     // reduced_tx_set
     int switchable;       // is_filter_switchable
     int lrLuma;           // FrameRestorationType[0] = RESTORE_WIENER (64-sample units)
+    int signBias[8];      // RefFrameSignBias by reference frame (order hints)
     int width, height;    // FrameWidth, FrameHeight
     int miRows, miCols, aw, ah, gcols;
 };
@@ -348,14 +349,18 @@ struct TileCoder {
                     if (rp.compound) {
                         for (int list = 0; list < 2; ++list) {
                             if (candRef == refs[list] && idCount[list] < 2) idMvs[list][idCount[list]++] = candMv;
-                            else if (diffCount[list] < 2) diffMvs[list][diffCount[list]++] = candMv;
+                            else if (diffCount[list] < 2)
+                                diffMvs[list][diffCount[list]++] = fs->signBias[candRef] != fs->signBias[refs[list]]
+                                                                       ? pf::Mv{(int16_t)-candMv.row, (int16_t)-candMv.col} : candMv;
                         }
                     } else {
+                        const pf::Mv m = fs->signBias[candRef] != fs->signBias[rp.r0]
+                                             ? pf::Mv{(int16_t)-candMv.row, (int16_t)-candMv.col} : candMv;
                         int k = 0;
                         for (; k < s.num; ++k)
-                            if (mvEq(candMv, s.mv[k][0])) break;
+                            if (mvEq(m, s.mv[k][0])) break;
                         if (k == s.num) {
-                            s.mv[k][0] = candMv;
+                            s.mv[k][0] = m;
                             s.weight[k] = 2;
                             s.num++;
                         }
