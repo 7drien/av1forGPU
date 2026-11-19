@@ -21,6 +21,7 @@ constexpr int NEW_MV_CONTEXTS = 6;
 constexpr int REF_CONTEXTS = 3;
 constexpr int REF_MV_CONTEXTS = 6;
 constexpr int SINGLE_REFS = 7;
+constexpr int TXFM_PARTITION_CONTEXTS = 21;
 constexpr int ZERO_MV_CONTEXTS = 2;
 constexpr int REF_CAT_LEVEL = 640;
 constexpr int MAX_REF_MV_STACK_SIZE = 8;
@@ -173,6 +174,15 @@ inline constexpr uint16_t Default_Compound_Mode_Cdf[COMPOUND_MODE_CONTEXTS][COMP
   { 10725, 17454, 20124, 22820, 24195, 25168, 26046, 32768, 0 },
   { 17125, 24273, 25814, 27492, 28214, 28704, 30592, 32768, 0 },
   { 13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0 }
+};
+inline constexpr uint16_t Default_Txfm_Split_Cdf[TXFM_PARTITION_CONTEXTS][3] = {
+  { 28581, 32768, 0 }, { 23846, 32768, 0 }, { 20847, 32768, 0 },
+  { 24315, 32768, 0 }, { 18196, 32768, 0 }, { 12133, 32768, 0 },
+  { 18791, 32768, 0 }, { 10887, 32768, 0 }, { 11005, 32768, 0 },
+  { 27179, 32768, 0 }, { 20004, 32768, 0 }, { 11281, 32768, 0 },
+  { 26549, 32768, 0 }, { 19308, 32768, 0 }, { 14224, 32768, 0 },
+  { 28015, 32768, 0 }, { 21546, 32768, 0 }, { 14400, 32768, 0 },
+  { 28165, 32768, 0 }, { 22401, 32768, 0 }, { 16088, 32768, 0 }
 };
 inline constexpr int16_t Subpel_Filters[6][16][8] = {
       {

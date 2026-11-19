@@ -200,6 +200,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--pf-tf-strength") && i + 1 < argc) {
             pfTfStrength = strtof(argv[++i], nullptr);
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-no-tx-split")) {
+            pfSettings.txSplit = false;
         } else if (!strcmp(argv[i], "--pf-rdoq")) {
             pfSettings.rdoq = true;
         } else if (!strcmp(argv[i], "--pf-gpu-entropy")) {
@@ -619,6 +621,7 @@ int main(int argc, char **argv) {
             ein.refName[0] = pfw::LAST_FRAME;
             ein.refName[1] = pfw::ALTREF_FRAME;
             ein.referenceSelect = refCount == 2;
+            ein.txModeSelect = pfSettings.txSplit;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -627,6 +630,7 @@ int main(int argc, char **argv) {
             for (int r = 0; r < 7; ++r) fp.refSlot[r] = slot0;
             if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
             fp.referenceSelect = refCount == 2;
+            fp.txModeSelect = pfSettings.txSplit;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;

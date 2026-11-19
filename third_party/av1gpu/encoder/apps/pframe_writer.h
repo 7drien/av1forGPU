@@ -18,6 +18,7 @@ struct FrameParams {
     int refSlot[7] = {0, 0, 0, 0, 0, 0, 0};   // ref_frame_idx for LAST .. ALTREF
     int refreshFlags = 1;
     bool referenceSelect = false;   // compound prediction allowed
+    bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
     bool persistent = false;        // error_resilient_mode = 0 and CDFs from primary_ref_frame
     bool primary = false;           // primary_ref_frame = LAST (else NONE)
     int grain = 0;
@@ -111,7 +112,7 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
         b.put(fp.cdefUV, 4);
         b.put(fp.cdefUVSec == 4 ? 3 : fp.cdefUVSec, 2);
     }
-    b.bit(0);                    // tx_mode_select = 0: TX_MODE_LARGEST
+    b.bit(fp.txModeSelect);      // tx_mode_select (else TX_MODE_LARGEST)
     b.bit(fp.referenceSelect);   // reference_select
     b.bit(1);                    // reduced_tx_set
     for (int r = 0; r < 7; ++r) b.bit(0);   // is_global

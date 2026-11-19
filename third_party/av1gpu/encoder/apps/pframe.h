@@ -26,7 +26,7 @@ struct BlockInfo {
     uint8_t log2;   // log2 of the block size containing this unit (3..6)
     uint8_t skip;   // 1: no residual coded
     uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both
-    uint8_t pad;
+    uint8_t txSplit;   // 1: luma uses four half-size transforms (coded blocks)
 };
 
 struct Settings {
@@ -35,6 +35,7 @@ struct Settings {
     int searchRange = 64;    // full-pel coarse search radius
     float rnd = 0.33f, zbin = 0.70f;
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
+    bool txSplit = true;         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 
@@ -51,6 +52,7 @@ struct FilterParams {
 struct EntropyIn {
     int refName[2] = {1, 7};    // AV1 reference (LAST_FRAME, ALTREF_FRAME) of BlockInfo::ref 0 and 1
     bool referenceSelect = false;
+    bool txModeSelect = false;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1

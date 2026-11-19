@@ -31,6 +31,7 @@ struct InterCdfs {
     uint16_t mvSign[2][3], mvClass[2][12], class0Bit[2][3], class0Fr[2][2][5], mvFr[2][5], mvBit[2][10][3];
     uint16_t txSet3[4][3];
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
+    uint16_t txfmSplit[21][3];
 };
 // All CDFs of a frame: what a reference slot saves at the end of a frame.
 struct EntropyState {
@@ -50,7 +51,7 @@ struct MiInfo {
     int8_t ref[2];
     pf::Mv mv[2];
     uint8_t written;
-    uint8_t pad;
+    uint8_t txLog2;    // log2 of the luma transform width (InterTxSizes)
 };
 
 struct TileStats {
@@ -63,6 +64,7 @@ struct TileStats {
 struct FrameSyntax {
     int refName[2];       // AV1 reference of BlockInfo::ref 0 and 1
     int referenceSelect;
+    int txModeSelect;     // TX_MODE_SELECT: coded blocks signal txfm_split
     int miRows, miCols, aw, ah, gcols;
 };
 
@@ -553,7 +555,19 @@ struct TileCoder {
         const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
         int ctx;
         if (plane == 0) {
-            ctx = 0;   // the transform covers the whole block
+            if (tw == bsizePixels) {
+                ctx = 0;   // the transform covers the whole block
+            } else {
+                int top = 0, left = 0;
+                for (int k = 0; k < w4; k++) if (x4 + k < maxX4 && aL[x4 + k] > top) top = aL[x4 + k];
+                for (int k = 0; k < h4; k++) if (y4 + k < maxY4 && lL[y4 + k] > left) left = lL[y4 + k];
+                const int mx = imax(top, left), mn = imin(top, left);
+                if (!top && !left) ctx = 1;
+                else if (!top || !left) ctx = 2 + (mx > 3);
+                else if (mx <= 3) ctx = 4;
+                else if (mn <= 3) ctx = 5;
+                else ctx = 6;
+            }
         } else {
             int above = 0, left = 0;
             for (int i = 0; i < w4; i++) if (x4 + i < maxX4) above |= aL[x4 + i] | aD[x4 + i];
@@ -685,7 +699,36 @@ struct TileCoder {
                 m.mv[0] = target[0];
                 m.mv[1] = compound ? target[1] : pf::Mv{0, 0};
                 m.written = 1;
+                m.txLog2 = (uint8_t)(skip ? size : size - (bi.txSplit ? 1 : 0));
             }
+        const bool split = !skip && bi.txSplit;
+        if (fs->txModeSelect && !skip) {
+            const float tt = tell();
+            const int maxTx = size - 2;   // TX_8X8 = 1 .. TX_64X64 = 4 (square transform of the block)
+            auto txCtx = [&](int row, int col, int txLog2) {
+                int aw2, lh2;
+                if (row == miRow) {
+                    if (!inside(row - 1, col)) aw2 = 64;
+                    else { const MiInfo &n = at(row - 1, col); aw2 = n.skip && n.isInter ? 1 << n.size : 1 << n.txLog2; }
+                } else aw2 = 1 << at(row - 1, col).txLog2;
+                if (col == miCol) {
+                    if (!inside(row, col - 1)) lh2 = 64;
+                    else { const MiInfo &n = at(row, col - 1); lh2 = n.skip && n.isInter ? 1 << n.size : 1 << n.txLog2; }
+                } else lh2 = 1 << at(row, col - 1).txLog2;
+                const int txSz = txLog2 - 2;
+                return (txSz != maxTx) * 3 + (4 - maxTx) * 6 + (aw2 < (1 << txLog2)) + (lh2 < (1 << txLog2));
+            };
+            sym(ic->txfmSplit[txCtx(miRow, miCol, size)], split, 2);
+            if (split && size - 1 > 2) {   // children of 4x4 code nothing; depth 1 children code txfm_split = 0
+                const int half = 1 << (size - 3);
+                for (int k = 0; k < 4; k++) {
+                    const int r = miRow + (k >> 1) * half, c = miCol + (k & 1) * half;
+                    if (r >= fs->miRows || c >= fs->miCols) continue;
+                    sym(ic->txfmSplit[txCtx(r, c, size - 1)], 0, 2);
+                }
+            }
+            st.bits[0] += tell() - tt;
+        }
         if (skip) {
             for (int p = 0; p < 3; ++p) {
                 const int sub = p > 0;
@@ -695,7 +738,22 @@ struct TileCoder {
             return;
         }
         const int bsize = 4 * bw4;
-        for (int p = 0; p < 3; ++p) {
+        if (split) {
+            // luma: four half-size transforms in raster order (transform_tree)
+            const int t = bsize >> 1;
+            const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
+            for (int k = 0; k < 4; ++k) {
+                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                int16_t qv[1024];
+                for (int r = 0; r < t; ++r)
+                    for (int c = 0; c < t; ++c) qv[r * t + c] = levels[size_t(py + r) * fs->aw + px + c];
+                const float c0 = tell();
+                coeffs(0, px >> 2, py >> 2, txSz, bsize, qv);
+                st.bits[2] += tell() - c0;
+            }
+        }
+        for (int p = split ? 1 : 0; p < 3; ++p) {
             const int sub = p > 0;
             const int t = bsize >> sub;
             const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16

@@ -34,6 +34,7 @@ struct Cand {
     Mv mv, mv2;           // chosen prediction
     uint8_t ref;          // 0, 1: single reference; 2: compound
     uint8_t nz;           // coded option has nonzero levels
+    uint8_t txSplit;      // luma of the coded option uses four half-size transforms
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
 };
@@ -502,7 +503,9 @@ struct EvalArgs {
     Cand *cand;
     int cols, rows;
     uint8_t *pred, *recon;   // per-size frame-sized buffers (tight YUV420)
-    int16_t *levels;          // per-size tile-layout levels (aligned planes)
+    int16_t *levels;          // per-size levels, spatial layout of the aligned planes
+    uint8_t *recon2;          // per-size luma reconstruction with split transforms (null: no split search)
+    int16_t *levels2;         // per-size luma levels with split transforms
     int qindex, qctx;
     float lambda, rnd, zbin;
     float mvWeight;
@@ -540,6 +543,8 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     float dSkip = 0.f, dCoded = 0.f, bits = 0.f;
     bool nz = false;
+    float lumaD = 0.f, lumaBits = 0.f, splitD = kInf, splitBits = 0.f;
+    bool nzLuma = false, nzSplit = false, nzC = false;
 #pragma unroll
     for (int p = 0; p < 3; p++) {
         const int sub = p > 0, n = p ? NC : N;
@@ -621,7 +626,9 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
             }
             int any = 0;
             for (int i = lane; i < tq * tq; i += 32) any |= q[i];
-            nz = nz || __any_sync(0xffffffffu, any);
+            const bool anyNz = __any_sync(0xffffffffu, any);
+            nz = nz || anyNz;
+            if (p) nzC = nzC || anyNz;
             int sseC = 0;
             uint8_t *outRec = a.recon + (p ? ysz + (p - 1) * csz : 0);
             for (int i = lane; i < tn * tn; i += 32) {
@@ -635,13 +642,66 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
             // levels, tile layout of the aligned plane
             const int apw = p ? f.aw / 2 : f.aw;
             const size_t base = p ? size_t(f.aw) * f.ah + size_t(p - 1) * (f.aw / 2) * (f.ah / 2) : 0;
-            // the tn x tn tile holds the stored tq x tq coefficients in its top-left corner (zeros elsewhere)
-            int16_t *dst = a.levels + base + (size_t(py / tn) * (apw / tn) + px / tn) * tn * tn;
+            // spatial layout: the stored tq x tq coefficients sit at the top-left of the transform area
+            int16_t *dst = a.levels + base + size_t(py) * apw + px;
             for (int i = lane; i < tn * tn; i += 32) {
                 const int r = i / tn, col = i - r * tn;
-                dst[i] = (r < tq && col < tq) ? q[r * tq + col] : 0;
+                dst[size_t(r) * apw + col] = (r < tq && col < tq) ? q[r * tq + col] : 0;
             }
             __syncwarp();
+            if (p == 0) { lumaD = dCoded; lumaBits = bits; nzLuma = nz; }
+            if (p == 0 && a.recon2) {
+                // transform split: four half-size luma transforms with the same prediction
+                const int hn = tn / 2;
+                const int sub = hn == 4 ? AV1G_TX_4X4 : hn == 8 ? AV1G_TX_8X8 : hn == 16 ? AV1G_TX_16X16 : AV1G_TX_32X32;
+                float dS = 0.f, bS = 0.f;
+                bool nzS = false;
+                uint8_t *pq = recS[warp], *rq = recS[warp] + hn * hn;
+                for (int k = 0; k < 4; k++) {
+                    const int qx = (k & 1) * hn, qy = (k >> 1) * hn;
+                    float en = 0.f;
+                    for (int i = lane; i < hn * hn; i += 32) {
+                        const int r = i / hn, col = i - r * hn;
+                        const int x = px + qx + col, y = py + qy + r;
+                        const uint8_t pv = pred[(qy + r) * tn + qx + col];
+                        pq[i] = pv;
+                        int d = 0;
+                        if (x < pw && y < ph) d = (int)src[y * pitch + x] - pv;
+                        res[i] = (int16_t)d;
+                        en += (float)(d * d);
+                    }
+                    __syncwarp();
+                    EvalIn es = e;
+                    es.txSz = sub;
+                    es.skipCtx = 2;
+                    es.resEnergy = warp_sum(en);
+                    EvalOut os;
+                    warp_fwd_rt(res, tmpS[warp], hn, hn, sub, AV1G_DCT_DCT);
+                    warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
+                    bS += os.R;
+                    switch (hn) {
+                    case 4: warpInverseAdd<2>(q, sub, dcQ, acQ, res, pq, rq); break;
+                    case 8: warpInverseAdd<3>(q, sub, dcQ, acQ, res, pq, rq); break;
+                    case 16: warpInverseAdd<4>(q, sub, dcQ, acQ, res, pq, rq); break;
+                    default: warpInverseAdd<5>(q, sub, dcQ, acQ, res, pq, rq); break;
+                    }
+                    int anyS = 0, sseS = 0;
+                    for (int i = lane; i < hn * hn; i += 32) {
+                        anyS |= q[i];
+                        const int r = i / hn, col = i - r * hn;
+                        const int x = px + qx + col, y = py + qy + r;
+                        a.levels2[size_t(y) * apw + x] = q[i];
+                        if (x >= pw || y >= ph) continue;
+                        const int d = (int)src[y * pitch + x] - rq[i];
+                        sseS += d * d;
+                        a.recon2[y * pw + x] = rq[i];
+                    }
+                    nzS = nzS || __any_sync(0xffffffffu, anyS);
+                    dS += (float)warp_sumi(sseS);
+                    __syncwarp();
+                }
+                splitD = dS; splitBits = bS; nzSplit = nzS;
+            }
         }
     }
     if (!lane) {
@@ -649,6 +709,14 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
         const float modeBits = 2.f + c.mvBits * a.mvWeight;
         const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
         c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
+        // split: about one more bit for txfm_split and the child flags
+        const bool split = a.recon2 && splitD + a.lambda * (splitBits + 1.f) < lumaD + a.lambda * lumaBits;
+        if (split) {
+            dCoded += splitD - lumaD;
+            bits += splitBits + 1.f - lumaBits;
+            nz = nzSplit || nzC;
+        }
+        c.txSplit = split;
         c.costCoded = dCoded + a.lambda * (modeBits + skipFlag0 + bits);
         c.nz = nz;
     }
@@ -708,6 +776,7 @@ __global__ void decideGrid(DecideArgs a) {
                 const Cand &c = a.cand[s][idx];
                 bi.mv = c.mv;
                 bi.mv2 = c.mv2;
+                bi.txSplit = (uint8_t)(m == 2 && c.txSplit);
                 bi.log2 = (uint8_t)(3 + s);
                 bi.skip = (uint8_t)(m != 2);
                 bi.ref = c.ref;
@@ -724,6 +793,8 @@ struct CommitArgs {
     int gcols, w, h, aw, ah;
     const uint8_t *pred[kSizes], *recon[kSizes];
     const int16_t *levels[kSizes];
+    const uint8_t *recon2[kSizes];
+    const int16_t *levels2[kSizes];
     uint8_t *out;
     int16_t *outLevels;
 };
@@ -739,15 +810,17 @@ __global__ void commit(CommitArgs a) {
     const int s = bi.log2 - 3;
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
-        const int lt = bi.log2 - sub;
-        const int tx = x >> lt, ty = y >> lt;
-        const int16_t *lv = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[3]);
-        level = lv[lbase + ((size_t(ty) * (apw >> lt) + tx) << (2 * lt)) + ((y - (ty << lt)) << lt) + (x - (tx << lt))];
+        if (p == 0 && bi.txSplit) level = pick4(s, a.levels2[0], a.levels2[1], a.levels2[2], a.levels2[3])[size_t(y) * apw + x];
+        else level = pick4(s, a.levels[0], a.levels[1], a.levels[2], a.levels[3])[lbase + size_t(y) * apw + x];
     }
     a.outLevels[lbase + size_t(y) * apw + x] = level;
     const int pw = a.w >> sub, ph = a.h >> sub;
     if (x >= pw || y >= ph) return;
     const size_t off = (p ? size_t(a.w) * a.h + size_t(p - 1) * pw * ph : 0) + size_t(y) * pw + x;
+    if (p == 0 && !bi.skip && bi.txSplit) {
+        a.out[off] = pick4(s, a.recon2[0], a.recon2[1], a.recon2[2], a.recon2[3])[off];
+        return;
+    }
     const uint8_t *srcBuf = bi.skip ? pick4(s, a.pred[0], a.pred[1], a.pred[2], a.pred[3])
                                     : pick4(s, a.recon[0], a.recon[1], a.recon[2], a.recon[3]);
     a.out[off] = srcBuf[off];
@@ -762,7 +835,7 @@ __global__ void buildFilterMaps(const BlockInfo *grid, int gcols, av1g_pf_frame 
     const BlockInfo bi = grid[(r >> 1) * gcols + (c >> 1)];
     const size_t k = size_t(r) * f.MiCols + c;
     f.skip[k] = bi.skip;
-    f.lfTx[0][k] = (uint8_t)(bi.log2 - 2);
+    f.lfTx[0][k] = (uint8_t)(bi.log2 - 2 - (bi.txSplit && !bi.skip));
     if (!(r & 1) && !(c & 1)) {
         const int cc = f.MiCols >> 1;
         const size_t kc = size_t(r >> 1) * cc + (c >> 1);
@@ -986,6 +1059,8 @@ struct State {
     Cand *cand[kSizes] = {};
     uint8_t *pred[kSizes] = {}, *recon[kSizes] = {};
     int16_t *levels[kSizes] = {}, *outLevels = nullptr;
+    uint8_t *recon2[kSizes] = {};
+    int16_t *levels2[kSizes] = {};
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
     bool havePrev = false;
     int dw = 0, dh = 0, ccols = 0, crows = 0;
@@ -1028,6 +1103,8 @@ Analyzer::~Analyzer() {
     for (auto *p : s->pred) cudaFree(p);
     for (auto *p : s->recon) cudaFree(p);
     for (auto *p : s->levels) cudaFree(p);
+    for (auto *p : s->recon2) cudaFree(p);
+    for (auto *p : s->levels2) cudaFree(p);
     cudaFree(s->outLevels);
     cudaFree(s->grid);
     cudaFree(s->prevGrid);
@@ -1083,6 +1160,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->pred[k], frame);
         alloc(&s->recon[k], frame);
         alloc(&s->levels[k], aframe * sizeof(int16_t));
+        alloc(&s->recon2[k], size_t(w) * h);
+        alloc(&s->levels2[k], size_t(aw) * ah * sizeof(int16_t));
     }
     alloc(&s->outLevels, aframe * sizeof(int16_t));
     s->gcols = aw / 8; s->grows = ah / 8;
@@ -1136,6 +1215,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
         memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
         memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
+        memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
         if (e == cudaSuccess) e = cudaMemcpy(s->defaultInter, &d, sizeof d, cudaMemcpyHostToDevice);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
@@ -1215,6 +1295,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
     ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \
+    ea.recon2 = st.txSplit ? s->recon2[K] : nullptr; ea.levels2 = s->levels2[K];                               \
     evaluate<N><<<(s->cols[K] * s->rows[K] + EvalCfg<N>::warps - 1) / EvalCfg<N>::warps, 32 * EvalCfg<N>::warps>>>(ea)
     PF_EVAL(0, 8);
     PF_EVAL(1, 16);
@@ -1237,7 +1318,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     CommitArgs ca{};
     ca.grid = s->grid; ca.gcols = s->gcols; ca.w = w; ca.h = h; ca.aw = aw; ca.ah = ah;
     for (int k = 0; k < kSizes; k++) ca.pred[k] = s->pred[k];
-    for (int k = 0; k < kSizes; k++) { ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k]; }
+    for (int k = 0; k < kSizes; k++) {
+        ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k];
+        ca.recon2[k] = s->recon2[k]; ca.levels2[k] = s->levels2[k];
+    }
     ca.out = recon;
     ca.outLevels = s->outLevels;
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);
@@ -1293,6 +1377,7 @@ int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLe
     j.fs.refName[0] = in.refName[0];
     j.fs.refName[1] = in.refName[1];
     j.fs.referenceSelect = in.referenceSelect;
+    j.fs.txModeSelect = in.txModeSelect;
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = s->grid;
     j.levels = s->outLevels;
@@ -1408,6 +1493,7 @@ int HostEntropy::init(int width, int height, char *, int) {
     memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
     memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
     memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
+        memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
     return 0;
 }
 
@@ -1429,6 +1515,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.refName[0] = in.refName[0];
     fs.refName[1] = in.refName[1];
     fs.referenceSelect = in.referenceSelect;
+    fs.txModeSelect = in.txModeSelect;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     pft2::EntropyState primary;
     if (in.primarySlot >= 0) {
