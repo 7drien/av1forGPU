@@ -1,10 +1,11 @@
 """Rate/quality comparison of av1gpu-video against SVT-AV1 and libaom.
 
-Run: python3 tests/compare.py BINARY [--frames N] [--ours "ARGS"] [--refs svt,aom]
+Run: python3 tests/compare.py BINARY [--src FILE] [--frames N] [--ours "ARGS"] [--refs svt,aom]
 
-Encodes the first N frames (default 120) of benckmark/video_1.mp4, decodes every
+Encodes the first N frames (default 120) of --src (default benckmark/video_1.mp4), decodes every
 output with dav1d, and reports bytes, kbit/s, PSNR-YUV (6:1:1), encode fps, and
-BD-rate of av1gpu relative to each reference. Outputs go to build-cuda/compare/.
+BD-rate of av1gpu relative to each reference. Outputs go to build-cuda/compare/ (video_1) or
+build-cuda/compare/<source name>/ (other sources).
 """
 import argparse
 import json
@@ -17,6 +18,7 @@ import time
 import numpy as np
 
 W, H, FPS = 1080, 1920, 30
+FPSN, FPSD = 30, 1
 SRC = "benckmark/video_1.mp4"
 OUT = pathlib.Path("build-cuda/compare")
 RANGE = "scale=in_range=tv:out_range=pc:in_color_matrix=bt709:out_color_matrix=bt709"
@@ -86,23 +88,34 @@ def run(name, cmd, source, frames, stdin=True, cache=False):
 
 
 def main():
+    global W, H, FPS, FPSN, FPSD, SRC, OUT
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
+    ap.add_argument("--src", default="benckmark/video_1.mp4")
     ap.add_argument("--frames", type=int, default=120)
     ap.add_argument("--ours", default="--fast --inter-qindex {q} --qindex {q} --rolling-reference")
     ap.add_argument("--qs", default="60,90,120,160")
     ap.add_argument("--refs", default="svt")
     ap.add_argument("--tag", default="ours")
     args = ap.parse_args()
+    if args.src != "benckmark/video_1.mp4":
+        info = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                        "stream=width,height,r_frame_rate", "-of", "csv=p=0", args.src], text=True)
+        w, h, rate = info.strip().split(",")
+        num, den = rate.split("/")
+        W, H, FPS = int(w), int(h), float(num) / float(den)
+        FPSN, FPSD = int(num), int(den)
+        SRC = args.src
+        OUT = OUT / pathlib.Path(args.src).stem
     OUT.mkdir(parents=True, exist_ok=True)
     src = raw_source(args.frames)
     size = f"{W}x{H}"
-    rawin = ["-f", "rawvideo", "-color_range", "pc", "-pix_fmt", "yuv420p", "-s", size, "-r", str(FPS), "-i", str(src)]
+    rawin = ["-f", "rawvideo", "-color_range", "pc", "-pix_fmt", "yuv420p", "-s", size, "-r", f"{FPSN}/{FPSD}", "-i", str(src)]
     curves = {}
     for q in map(int, args.qs.split(",")):
         extra = args.ours.format(q=q).split()
         curves.setdefault(args.tag, []).append(run(
-            f"{args.tag}_q{q}", lambda o: [args.binary, str(W), str(H), str(FPS), "1", str(o), *extra],
+            f"{args.tag}_q{q}", lambda o: [args.binary, str(W), str(H), str(FPSN), str(FPSD), str(o), *extra],
             src, args.frames))
     refs = [r for r in args.refs.split(",") if r]
     for crf in (24, 32, 40, 48):

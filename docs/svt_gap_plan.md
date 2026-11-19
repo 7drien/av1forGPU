@@ -115,3 +115,26 @@ intra path), then T5, T7, T3, T2, T6.
   about 11% of the sequence. Residual coding and prediction quality are where the remaining gap is.
 - Quantizer rounding 0.33 → 0.40 (+18.6% → +18.3%); other rounding / deadzone values were within noise.
 
+## Second clip: video_2.mp4 (1920x1080, 29.92 fps, camera motion and cuts)
+
+`tests/compare.py --src benckmark/video_2.mp4` (outputs in `build-cuda/compare/video_2/`), first 120 frames:
+
+| Encoder state | BD-rate vs SVT-AV1 preset 8 | fps |
+| --- | ---: | ---: |
+| previous defaults (qoffset 60, boost 100, base key frames) | +79.2% | 13 to 21 |
+| current defaults without scene cuts | +85.4% | 13.5 to 19 |
+| + scene-cut key frames | +80.5% | 12 to 17 |
+
+SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +90.8% against our first run.
+
+- Loop restoration had stayed on by default after `a93dc01` (an edit that turned it off did not apply). Measured on
+  both clips it helps (video_2: +90.0% → +85.4%; video_1: +18.7% → +18.3%), so it is now the documented default;
+  `--pf-no-lr` turns it off.
+- Scene cuts (`--pf-scene-cut T`, default 15, 0 disables): the mean difference of 16x16 luma block means between
+  consecutive frames is above T and more than twice the next frame's (sustained motion is not a cut). The cut frame
+  becomes a key frame at the inter quantizer minus `--pf-cut-qoffset` (default 60) and the mini-GOP ends before it.
+  Four cuts in the first 120 frames of video_2, none in video_1.
+- On video_2, motion vectors take 21% of inter bits (video_1: 8 to 10%) and evaluation is twice as slow (fewer
+  skipped blocks). Temporal motion vector candidates (T4, order hints) and a finer motion search are the main
+  missing pieces for this kind of content.
+

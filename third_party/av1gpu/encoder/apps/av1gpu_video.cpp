@@ -86,8 +86,11 @@ int main(int argc, char **argv) {
     int pfQindex = 0, pfQoffset = 130, pfGop = 32, pfAltrefBoost = 128, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
-    bool pfLr = true;
-    int pfLrFrames = 0;   // luma Wiener loop restoration (--pf-no-lr)
+    bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
+    int pfLrFrames = 0;
+    uint64_t pfCuts = 0;
+    double pfSceneCut = 15.0;
+    int pfCutQoffset = 60;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
     int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
     int pfTfFrames = 0;
@@ -214,6 +217,12 @@ int main(int argc, char **argv) {
             pfRefs = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pf-lr")) {
             pfLr = true;
+        } else if (!strcmp(argv[i], "--pf-scene-cut") && i + 1 < argc) {
+            pfSceneCut = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--pf-cut-qoffset") && i + 1 < argc) {
+            pfCutQoffset = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--pf-no-lr")) {
+            pfLr = false;
         } else if (!strcmp(argv[i], "--pf-fast")) {
             pfSettings.splitTypes = 2;
         } else if (!strcmp(argv[i], "--pf-no-prune")) {
@@ -800,17 +809,59 @@ int main(int argc, char **argv) {
         (void)periodFrames;
         bool keyPending = false;
         uint64_t keyPeriodBegin = 0;
+        // scene cuts: mean absolute difference of 16x16 luma block means between consecutive frames
+        std::vector<uint8_t> prevFrame;
+        auto blockMeanDiff = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+            double sum = 0;
+            int nb = 0;
+            for (int by = 0; by + 16 <= h; by += 16)
+                for (int bx = 0; bx + 16 <= w; bx += 16) {
+                    int sa = 0, sb = 0;
+                    for (int y = 0; y < 16; y += 2)
+                        for (int x = 0; x < 16; x += 2) {
+                            sa += a[size_t(by + y) * w + bx + x];
+                            sb += b[size_t(by + y) * w + bx + x];
+                        }
+                    sum += std::abs(sa - sb) / 64.0;
+                    ++nb;
+                }
+            return nb ? sum / nb : 0.0;
+        };
+        // index of the first pending frame (< limit) that starts a new scene, or limit: a large change that is not
+        // followed by a comparable one (sustained motion changes every frame)
+        auto firstCut = [&](size_t limit) -> size_t {
+            if (pfSceneCut <= 0) return limit;
+            readMore(limit + 1);
+            for (size_t i = 0; i < limit && i < pending.size(); ++i) {
+                const std::vector<uint8_t> &prev = i ? pending[i - 1] : prevFrame;
+                if (prev.empty()) continue;
+                const double d = blockMeanDiff(prev, pending[i]);
+                if (d <= pfSceneCut) continue;
+                const double next = i + 1 < pending.size() ? blockMeanDiff(pending[i], pending[i + 1]) : 0.0;
+                if (d > 2.0 * next) return i;
+            }
+            return limit;
+        };
         for (;;) {
             readMore(1);
             if (pending.empty()) break;
             if (!keyPending && applyQ()) return 1;
             const uint64_t periodBegin = keyPending ? keyPeriodBegin : frameCount;
             keyPending = false;
-            if (frameCount == 0 || frameCount - lastKeyIndex >= keyInterval) {
+            const bool cutNow = frameCount > 0 && frameCount != lastKeyIndex && firstCut(1) == 0;
+            if (cutNow) ++pfCuts;
+            if (frameCount == 0 || frameCount - lastKeyIndex >= keyInterval || cutNow) {
+                // scene-cut key frames sit closer to the inter-frame quality than periodic ones
+                if (cutNow && encoder.setQindex(std::max(1, pfSettings.qindex - pfCutQoffset), err)) {
+                    fprintf(stderr, "scene cut: %s\n", err.c_str());
+                    return 1;
+                }
                 // keyframe
                 std::vector<uint8_t> raw = std::move(pending.front());
                 pending.erase(pending.begin());
                 if (!upload(raw, inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
+                prevFrame = raw;
+                const bool restoreQ = cutNow;
                 GpFrameIn in;
                 in.deviceRecon = reference;
                 in.W = w; in.H = h; in.aw = aw; in.ah = ah;
@@ -837,6 +888,10 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 if (submit(std::move(kj))) return 1;
+                if (restoreQ && encoder.setQindex(targetKbps > 0 ? std::max(1, std::min(255, pfSettings.qindex - pfQoffset)) : cfg.qindex, err)) {
+                    fprintf(stderr, "scene cut: %s\n", err.c_str());
+                    return 1;
+                }
                 gpuMs += times.total + entropyMs;
                 for (int k = 0; k < 8; ++k)
                     if (cudaMemcpy(slotBuf[k], reference, frameBytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
@@ -851,8 +906,9 @@ int main(int argc, char **argv) {
                 continue;
             }
             const uint64_t untilKey = keyInterval - (frameCount - lastKeyIndex);
-            const size_t g = std::min<size_t>(G, untilKey);
+            size_t g = std::min<size_t>(G, untilKey);
             readMore(g + pfTfFrames);
+            g = std::max<size_t>(1, firstCut(std::min(g, pending.size())));   // end the mini-GOP before a cut
             const size_t n = std::min(g, pending.size());
             if (n == 1) {
                 // single P frame from the last shown picture
@@ -861,6 +917,7 @@ int main(int argc, char **argv) {
                 dump(slotBuf[0]);
                 lastShown = 0;
                 ++predicted; ++frameCount;
+                prevFrame = pending[0];
                 pending.erase(pending.begin());
                 endPeriod(frameCount - periodBegin);
                 continue;
@@ -966,6 +1023,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             lastShown = hiSlot;
+            prevFrame = pending[n - 1];
             pending.erase(pending.begin(), pending.begin() + n);
             endPeriod(frameCount - periodBegin);
         }
@@ -1144,7 +1202,7 @@ int main(int argc, char **argv) {
     if (usePframes)
         fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
                 pfBits[0], pfBits[1], pfBits[2], pfBits[3]),
-        fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms, loop restoration in %d frames\n", pfFilterMs, pfWriteMs, pfLrFrames),
+        fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms, loop restoration in %d frames, scene cuts %llu\n", pfFilterMs, pfWriteMs, pfLrFrames, (unsigned long long)pfCuts),
         fprintf(stderr, "P-frame analysis %.1f ms; compound blocks %llu; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
                 (unsigned long long)pfCompound,
                 (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],
