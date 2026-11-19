@@ -97,4 +97,10 @@ intra path), then T5, T7, T3, T2, T6.
   from the key frame (`--pf-qoffset` 60 → 130) and boosting the hidden ALTREF frames more (`--pf-altref-boost`
   100 → 128) moves BD-rate from +25.7% to +19.6% with no speed cost (offset 90: +23.0%, 100: +21.7%,
   160: +23.2%; boost 70: +22.5%, 160: +25.9%). These are the new defaults.
+- Rate control now steers the inter-frame quantizer (key frames follow at minus the offset); before, the key-frame
+  quantizer floor of 20 kept inter frames at 150 or more and capped the bitrate.
+- Matched-bitrate benchmark (120 frames, `-b:v` targets 600 to 4000 kbit/s, 5 points, same session): BD-rate
+  against SVT-AV1 preset 8 in its bitrate mode is -12.4% (51.4 to 56.5 dB overlap), at 21 to 28 fps against SVT's
+  26 to 31 fps on this machine. Against SVT in CRF mode (`tests/compare.py`) it is still +19.6%; against libaom
+  `cpu-used 8` (bitrate mode) +35.8%. Our short-clip rate control overshoots its target by 11 to 18%.
 

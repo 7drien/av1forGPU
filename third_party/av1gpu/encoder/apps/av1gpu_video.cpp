@@ -753,19 +753,21 @@ int main(int argc, char **argv) {
         // ln(actual / desired) / slope, where desired corrects the accumulated error over the buffer duration.
         const double fps = double(fpsNum) / fpsDen;
         const double frameBits = targetKbps * 1000.0 / fps;
+        // baseQ: the inter-frame (P) quantizer; key frames use baseQ - pfQoffset
         double baseQ = cfg.qindex, slope = 0.0146, bufferErr = 0;
         if (targetKbps > 0) {
             const double bpp = frameBits / (double(w) * h);
-            baseQ = std::min(230.0, std::max(20.0, 120.0 + std::log(0.0077 / bpp) / slope));
+            baseQ = std::min(255.0, std::max(20.0, 180.0 + std::log(0.0077 / bpp) / slope));
         }
         long periodStart = ftell(outFile);
         uint64_t periodFrames = 0;
         double lastQ = baseQ, lastBpf = 0;
         auto applyQ = [&]() -> int {
             if (targetKbps <= 0) return 0;
-            const int kq = std::max(1, std::min(255, (int)std::lround(baseQ)));
+            const int pq = std::max(1, std::min(255, (int)std::lround(baseQ)));
+            const int kq = std::max(1, std::min(255, pq - pfQoffset));
             if (encoder.setQindex(kq, err)) { fprintf(stderr, "rate control: %s\n", err.c_str()); return 1; }
-            pfSettings.qindex = std::max(1, std::min(255, kq + pfQoffset));
+            pfSettings.qindex = pq;
             return 0;
         };
         auto endPeriod = [&](uint64_t frames) {
