@@ -14,7 +14,7 @@ import numpy as np
 
 def synth(w, h, frames, seed=5):
     rng = np.random.default_rng(seed)
-    big = rng.integers(0, 256, (h + 64, w + 64)).astype(np.float32)
+    big = rng.integers(0, 256, (h + 32 + frames, w + 32 + frames)).astype(np.float32)
     # smooth texture with some sharp detail
     k = np.ones(5) / 5
     big = np.apply_along_axis(lambda r: np.convolve(r, k, "same"), 1, big)
@@ -78,3 +78,4 @@ if __name__ == "__main__":
         run(b, 712, 392, 10, ["--pf-tiles", "3", "0", "--pf-gop", "1"])
         run(b, 712, 392, 18, ["--persistent-cdf", "--pf-gpu-entropy", "--qindex", "70"])
         run(b, 448, 256, 12, ["--persistent-cdf", "--pf-gpu-entropy", "--pf-tiles", "0", "0"])
+        run(b, 256, 128, 70, ["--persistent-cdf", "--pf-gop", "32", "--keyint", "200"])

@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
     bool interRdoq = false;
     bool usePframes = false;
     pf::Settings pfSettings;
-    int pfQindex = 0, pfQoffset = 60, pfGop = 16, pfAltrefBoost = 100, pfLeafOffset = 0;
+    int pfQindex = 0, pfQoffset = 60, pfGop = 32, pfAltrefBoost = 100, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
     bool pfGpuEntropy = false;
