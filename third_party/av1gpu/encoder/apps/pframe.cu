@@ -2357,7 +2357,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
             pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
                                                                      s->cand[K], s->cols[K], n, st.pruneRect,
-                                                                     getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : 2.f);
+                                                                     getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
         }
         for (int r = 0; r < refCount; r++) {
         #define PF_RREFINE(RK, K, BW, BH)                                                                               \

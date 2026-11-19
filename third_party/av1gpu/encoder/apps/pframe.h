@@ -51,6 +51,7 @@ struct Settings {
                                  // 2 the full inter sets (reduced_tx_set = 0) with a 7-type search, 3 every type
     bool switchableFilter = false;  // per-block interpolation filter (is_filter_switchable, --pf-switchable)
     int splitTypes = 0;          // split luma transforms: 0 same type search, 1 seven types, 2 DCT_DCT only (--pf-fast)
+    float pruneMargin = 2.f;     // rectangular search skipped unless the square's coded cost < margin * skip cost
     bool pruneRect = true;       // skip HORZ / VERT / 4:1 searches of nodes whose square evaluation chose skip
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };

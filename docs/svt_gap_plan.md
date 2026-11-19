@@ -195,4 +195,9 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - `--pf-fast`: +55.1%, 12 to 17 fps. SVT-AV1 preset 8: 32 to 34 fps on this clip.
 - Next: restructure evaluation (several warps per block or batched same-size transforms; one warp per 64x64 block
   gives only about 500 warps per frame).
+- Split-external evaluation of square blocks (one warp per split transform, then a finalize kernel): same decisions,
+  evaluation 61.0 → 51.4 ms per frame.
+- Rectangular-partition pruning margin by motion (`--pf-adaptive`): 2.0 for static content, 0.5 for moving content
+  (fixed 0.5: video_2 +53.7% at 17.7 fps but video_1 +22.4%; 1.0: video_2 +53.5%, video_1 +19.9%). Result: video_2
+  +53.3% at about 15.8 fps (q50), video_1 +18.5%.
 

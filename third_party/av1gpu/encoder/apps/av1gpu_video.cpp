@@ -90,6 +90,8 @@ int main(int argc, char **argv) {
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
     int pfLrFrames = 0;
+    double gopMotion = 0.0;      // motion of the current mini-GOP (mean block-mean difference of consecutive frames)
+    auto adaptiveMargin = [](double motion) { const double t = std::min(1.0, std::max(0.0, (motion - 0.3) / 1.2)); return 2.0 + (0.5 - 2.0) * t; };
     bool pfCutPreset = true;    // base-preset scene-cut key frames (--pf-slow-cuts keeps the main preset)
     bool pfTmvp = true;          // temporal motion vector candidates (--pf-no-tmvp)
     pfm::MotionField mfield;
@@ -699,6 +701,8 @@ int main(int argc, char **argv) {
             }
             pf::Settings st = pfSettings;
             st.qindex = qindex;
+            // moving content codes most blocks: search rectangular partitions only where the square clearly wins
+            if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
             if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, nullptr, nullptr, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
@@ -1061,9 +1065,8 @@ int main(int argc, char **argv) {
             };
             auto release = [&](int k) { if (k >= 0) freeSlots.push_back(k); };
             // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
-            const double gopBoost = pfAdaptive && !prevFrame.empty()
-                                        ? adaptive(motionOf(&prevFrame, 0, n - 1), pfAltrefBoost, 60)
-                                        : pfAltrefBoost;
+            gopMotion = !prevFrame.empty() ? motionOf(&prevFrame, 0, n - 1) : 0.0;
+            const double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, 60) : pfAltrefBoost;
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
             auto qAt = [&](int depth) {
