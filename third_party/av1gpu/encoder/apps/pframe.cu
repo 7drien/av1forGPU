@@ -1,3 +1,6 @@
+#include <map>
+#include <string>
+#include <chrono>
 // CUDA P-frame analysis (see pframe.h).
 #include "pframe.h"
 
@@ -28,6 +31,15 @@ constexpr float kInf = 3.0e38f;
 constexpr int kFullPelPasses = 6;
 
 __constant__ int16_t c_filter[6][16][8];
+// AV1GPU_PF_PROFILE2: per-launch GPU time by name (synchronizes after every timed launch)
+static std::map<std::string, double> g_fineMs;
+static bool g_fine = getenv("AV1GPU_PF_PROFILE2") != nullptr;
+struct FineTimer {
+    const char *name; std::chrono::steady_clock::time_point t;
+    explicit FineTimer(const char *n) : name(n) { if (g_fine) { cudaDeviceSynchronize(); t = std::chrono::steady_clock::now(); } }
+    ~FineTimer() { if (g_fine) { cudaDeviceSynchronize(); g_fineMs[name] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } }
+};
+static struct FineReport { ~FineReport() { for (auto &kv : g_fineMs) fprintf(stderr, "fine %-28s %9.1f ms\n", kv.first.c_str(), kv.second); } } g_fineReport;
 
 struct Cand {
     Mv mvR[kMaxRefs];     // best vector per reference (search)
@@ -37,6 +49,7 @@ struct Cand {
     uint8_t nz;           // coded option has nonzero levels
     uint8_t txSplit;      // luma of the coded option uses four half-size transforms
     uint8_t filter;       // interp_filter: 0 EIGHTTAP, 1 SMOOTH, 2 SHARP
+    uint8_t pruned;       // rectangular block of a node whose square evaluation chose skip: not searched
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
 };
@@ -289,13 +302,18 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
                                                                         const Mv *coarse, int ccols, int crows,
                                                                         const Cand *parent, int pcols, int parentSize,
                                                                         const BlockInfo *temporal, int tcols, Cand *out,
-                                                                        int cols, int rows, float lambda) {
+                                                                        int cols, int rows, float lambda,
+                                                                        bool pruneable = false) {
     using GR = Grp<BW, BH>;
     const int b = blockIdx.x * RefineCfg<BW, BH>::per() + threadIdx.x / GR::G;
     if (b >= cols * rows) return;
     const int x0 = (b % cols) * BW, y0 = (b / cols) * BH;
     Cand &o = out[b];
     if (x0 >= f.w || y0 >= f.h) {
+        if (GR::lane() == 0) { o.mvR[refIdx] = Mv{0, 0}; o.costR[refIdx] = kInf; o.bitsR[refIdx] = 0.f; }
+        return;
+    }
+    if (pruneable && o.pruned) {
         if (GR::lane() == 0) { o.mvR[refIdx] = Mv{0, 0}; o.costR[refIdx] = kInf; o.bitsR[refIdx] = 0.f; }
         return;
     }
@@ -381,6 +399,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) chooseInter(Fra
     const int b = blockIdx.x * RefineCfg<BW, BH>::per() + threadIdx.x / GR::G;
     if (b >= cols * rows) return;
     Cand &c = cand[b];
+    if (BW != BH && c.pruned) return;
     const int x0 = (b % cols) * BW, y0 = (b / cols) * BH;
     int choice = 0;
     float bits = c.bitsR[0];
@@ -523,6 +542,17 @@ __device__ void rdoqBlock(const float *tmp, int16_t *q, const EvalIn &e, int W, 
     }
 }
 
+// Rectangular blocks (HORZ / VERT / HORZ_4 / VERT_4 of an n x n node) are searched only when the node's square
+// evaluation codes a residual or skip wins by less than a factor margin (default 2, AV1GPU_PF_PRUNE): a node that
+// clearly prefers skip as one block rarely gains from splitting.
+__global__ void pruneRect(Cand *rc, int rcols, int rrows, int bw, int bh, const Cand *parent, int pcols, int n,
+                          int enabled, float margin) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= rcols * rrows) return;
+    const int x0 = (b % rcols) * bw, y0 = (b / rcols) * bh;
+    const Cand &p = parent[(y0 / n) * pcols + x0 / n];
+    rc[b].pruned = enabled && !(p.nz && p.costCoded < p.costSkip * margin);
+}
 template <int BW, int BH>
 struct EvalCfg {
     static constexpr int warps = BW * BH >= 1024 ? 1 : BW * BH >= 256 ? 2 : 4;
@@ -628,6 +658,10 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     if (b >= a.cols * a.rows) return;
     Cand &c = a.cand[b];
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    if (BW != BH && c.pruned) {
+        if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; c.filter = 0; }
+        return;
+    }
     const Frame &f = a.f;
     if (x0 >= f.w || y0 >= f.h) {
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; }
@@ -1945,9 +1979,11 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     mark(1);
     const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
     for (int r = 0; r < refCount; r++) {
+        { FineTimer ft_("phase planes");
         horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8)>>>(refs[r], w, h, s->hphase);
-        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases[r]);
+        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases[r]); }
 #define PF_REFINE(K, N)                                                                                         \
+    FineTimer ft##K##_("refine " #N "x" #N);                                                                    \
     refine<N, N><<<(s->cols[K] * s->rows[K] + RefineCfg<N, N>::per() - 1) / RefineCfg<N, N>::per(),               \
                    32 * RefineCfg<N, N>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,             \
                                                   K == 3 ? nullptr : s->cand[K + 1], K == 3 ? 0 : s->cols[K + 1],    \
@@ -1956,37 +1992,17 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         PF_REFINE(2, 32);
         PF_REFINE(1, 16);
         PF_REFINE(0, 8);
-#define PF_RREFINE(RK, K, BW, BH)                                                                               \
-    refine<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),   \
-                     32 * RefineCfg<BW, BH>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,          \
-                                                      s->cand[K], s->cols[K], 8 << K, temporal, s->gcols,            \
-                                                      s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad)
-        if (st.rectPartitions) {
-            PF_RREFINE(0, 1, 16, 8); PF_RREFINE(1, 1, 8, 16);
-            PF_RREFINE(2, 2, 32, 16); PF_RREFINE(3, 2, 16, 32);
-            PF_RREFINE(4, 3, 64, 32); PF_RREFINE(5, 3, 32, 64);
-            PF_RREFINE(6, 2, 32, 8); PF_RREFINE(7, 2, 8, 32);
-            PF_RREFINE(8, 3, 64, 16); PF_RREFINE(9, 3, 16, 64);
-        }
-#undef PF_RREFINE
 #undef PF_REFINE
     }
 #define PF_CHOOSE(C, CO, R, BW, BH)                                                                             \
+    { FineTimer ft_("choose " #BW "x" #BH);                                                                     \
     chooseInter<BW, BH><<<(CO * R + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),                     \
                           32 * RefineCfg<BW, BH>::warps>>>(f, refCount, s->phases[0], s->phases[1], C, CO, R,        \
-                                                           lambdaSad, st.compoundBias)
+                                                           lambdaSad, st.compoundBias); }
     PF_CHOOSE(s->cand[3], s->cols[3], s->rows[3], 64, 64);
     PF_CHOOSE(s->cand[2], s->cols[2], s->rows[2], 32, 32);
     PF_CHOOSE(s->cand[1], s->cols[1], s->rows[1], 16, 16);
     PF_CHOOSE(s->cand[0], s->cols[0], s->rows[0], 8, 8);
-    if (st.rectPartitions) {
-        PF_CHOOSE(s->rcand[0], s->rcols[0], s->rrows[0], 16, 8); PF_CHOOSE(s->rcand[1], s->rcols[1], s->rrows[1], 8, 16);
-        PF_CHOOSE(s->rcand[2], s->rcols[2], s->rrows[2], 32, 16); PF_CHOOSE(s->rcand[3], s->rcols[3], s->rrows[3], 16, 32);
-        PF_CHOOSE(s->rcand[4], s->rcols[4], s->rrows[4], 64, 32); PF_CHOOSE(s->rcand[5], s->rcols[5], s->rrows[5], 32, 64);
-        PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8); PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32);
-        PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16); PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64);
-    }
-#undef PF_CHOOSE
     mark(2);
     EvalArgs ea{};
     ea.f = f;
@@ -2008,8 +2024,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.recon3 = s->recon3[K]; ea.levels3 = s->levels3[K];                                                      \
     ea.types1 = st.txTypes ? s->types1[K] : nullptr; ea.types2 = st.txTypes ? s->types2[K] : nullptr;          \
     ea.types3 = st.txTypes ? s->types3[K] : nullptr;                                                           \
+    { FineTimer ft_("evaluate " #N "x" #N);                                                                     \
     evaluate<N, N><<<(s->cols[K] * s->rows[K] + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps,                 \
-                     32 * EvalCfg<N, N>::warps>>>(ea)
+                     32 * EvalCfg<N, N>::warps>>>(ea); }
     PF_EVAL(0, 8);
     PF_EVAL(1, 16);
     PF_EVAL(2, 32);
@@ -2020,14 +2037,50 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                           \
     ea.types1 = st.txTypes ? s->types1[4 + RK] : nullptr; ea.types2 = st.txTypes ? s->types2[4 + RK] : nullptr;  \
     ea.types3 = nullptr;                                                                                       \
+    { FineTimer ft_("evaluate " #BW "x" #BH);                                                                   \
     evaluate<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,       \
-                       32 * EvalCfg<BW, BH>::warps>>>(ea)
+                       32 * EvalCfg<BW, BH>::warps>>>(ea); }
     if (st.rectPartitions) {
+        for (int k = 0; k < 10; k++) {
+            const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;
+            const int n = 8 << K, div = k < 6 ? 2 : 4;
+            const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
+            pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
+                                                                     s->cand[K], s->cols[K], n, st.pruneRect,
+                                                                     getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : 2.f);
+        }
+        for (int r = 0; r < refCount; r++) {
+        #define PF_RREFINE(RK, K, BW, BH)                                                                               \
+            { FineTimer ft_("refine " #BW "x" #BH);                                                                     \
+            refine<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),   \
+                             32 * RefineCfg<BW, BH>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,          \
+                                                              s->cand[K], s->cols[K], 8 << K, temporal, s->gcols,            \
+                                                              s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad, true); }
+                {
+                    PF_RREFINE(0, 1, 16, 8) PF_RREFINE(1, 1, 8, 16)
+                    PF_RREFINE(2, 2, 32, 16) PF_RREFINE(3, 2, 16, 32)
+                    PF_RREFINE(4, 3, 64, 32) PF_RREFINE(5, 3, 32, 64)
+                    PF_RREFINE(6, 2, 32, 8) PF_RREFINE(7, 2, 8, 32)
+                    PF_RREFINE(8, 3, 64, 16) PF_RREFINE(9, 3, 16, 64)
+                }
+        #undef PF_RREFINE
+
+        }
+    {
+        PF_CHOOSE(s->rcand[0], s->rcols[0], s->rrows[0], 16, 8); PF_CHOOSE(s->rcand[1], s->rcols[1], s->rrows[1], 8, 16);
+        PF_CHOOSE(s->rcand[2], s->rcols[2], s->rrows[2], 32, 16); PF_CHOOSE(s->rcand[3], s->rcols[3], s->rrows[3], 16, 32);
+        PF_CHOOSE(s->rcand[4], s->rcols[4], s->rrows[4], 64, 32); PF_CHOOSE(s->rcand[5], s->rcols[5], s->rrows[5], 32, 64);
+        PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8); PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32);
+        PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16); PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64);
+    }
+    {
         PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16);
         PF_REVAL(3, 16, 32); PF_REVAL(4, 64, 32); PF_REVAL(5, 32, 64);
         PF_REVAL(6, 32, 8); PF_REVAL(7, 8, 32); PF_REVAL(8, 64, 16); PF_REVAL(9, 16, 64);
     }
+    }
 #undef PF_REVAL
+#undef PF_CHOOSE
 #undef PF_EVAL
     mark(3);
     DecideArgs da{};

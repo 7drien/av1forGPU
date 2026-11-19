@@ -71,3 +71,12 @@ intra path), then T5, T7, T3, T2, T6.
   prediction SSE plus bits, coded with the spec contexts; GLOBALMV blocks code none. Bit-exact with dav1d. On the
   120-frame test it does not pay for its per-block symbol: +25.7% against +25.3% with the fixed filter (best bias,
   `AV1GPU_PF_FBIAS` = 16). A gain needs a joint motion and filter search or a full RD choice per filter.
+
+## Speed track
+
+- Per-kernel timing (`AV1GPU_PF_PROFILE2=1`): rectangular partitions were about half of the analysis time (refine
+  about 7 ms and evaluate about 12 ms per 1080x1920 frame). The filter stage costs about 6% (23.6 against 25.0 fps
+  without it): its 33 ms of host time was mostly waiting for the analysis kernels.
+- A1 done: rectangular searches run after the square evaluation and skip nodes whose square evaluation prefers skip
+  by a factor 2 or more (`--pf-no-prune` disables it). 21.6 → about 30 fps for +25.3% → +25.7% BD-rate.
+
