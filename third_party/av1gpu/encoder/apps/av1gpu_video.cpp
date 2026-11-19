@@ -888,13 +888,12 @@ int main(int argc, char **argv) {
         uint64_t keyPeriodBegin = 0;
         // scene cuts: mean absolute difference of 16x16 luma block means between consecutive frames
         std::vector<uint8_t> prevFrame;
-        // memoized by buffer address pair (frames keep their buffers while pending; the cache is cleared regularly)
+        // memoized by buffer address pair: valid while the frames stay pending (cleared whenever frames leave)
         std::map<std::pair<const uint8_t *, const uint8_t *>, double> diffCache;
         auto blockMeanDiff = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
             const auto key = std::make_pair(a.data(), b.data());
             const auto hit = diffCache.find(key);
             if (hit != diffCache.end()) return hit->second;
-            if (diffCache.size() > 4096) diffCache.clear();
             double sum = 0;
             int nb = 0;
             for (int by = 0; by + 16 <= h; by += 16)
@@ -973,6 +972,7 @@ int main(int argc, char **argv) {
                 pending.erase(pending.begin());
                 if (!upload(raw, inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
                 prevFrame = raw;
+                diffCache.clear();   // freed buffers may be reused at the same addresses
                 GpFrameIn in;
                 in.deviceRecon = reference;
                 in.W = w; in.H = h; in.aw = aw; in.ah = ah;
@@ -1034,6 +1034,7 @@ int main(int argc, char **argv) {
                 ++predicted; ++frameCount;
                 prevFrame = pending[0];
                 pending.erase(pending.begin());
+                diffCache.clear();
                 endPeriod(frameCount - periodBegin);
                 continue;
             }
@@ -1147,6 +1148,7 @@ int main(int argc, char **argv) {
             lastShown = hiSlot;
             prevFrame = pending[n - 1];
             pending.erase(pending.begin(), pending.begin() + n);
+            diffCache.clear();
             endPeriod(frameCount - periodBegin);
         }
         if (drain()) return 1;
