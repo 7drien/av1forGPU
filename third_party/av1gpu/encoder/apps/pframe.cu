@@ -3141,12 +3141,15 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
                                {s->work, s->work + ysz, s->work + ysz + csz}};
     const int pw[3] = {w, cw, cw}, ph[3] = {h, ch, ch};
     cudaError_t e = cudaSuccess;
-    auto sseOf = [&](uint8_t *const planes[3], unsigned long long res[3]) {
-        cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3);
+    // candidate errors accumulate in device slots (3 per candidate) and are read back once per search
+    auto sseOf = [&](uint8_t *const planes[3], int slot) {
         for (int p = 0; p < 3; p++)
             planeSse<<<dim3((pw[p] + 31) / 32, (ph[p] + 7) / 8), dim3(32, 8)>>>(src[p], pitch[p], planes[p], pw[p], ph[p],
-                                                                               s->sse + p);
-        e = cudaMemcpy(res, s->sse, sizeof(unsigned long long) * 3, cudaMemcpyDeviceToHost);
+                                                                               s->sse + 3 * slot + p);
+    };
+    unsigned long long slotSse[3 * 21];
+    auto fetch = [&](int slots) {
+        e = cudaMemcpy(slotSse, s->sse, sizeof(unsigned long long) * 3 * slots, cudaMemcpyDeviceToHost);
     };
     // deblocking level: libaom's inter-frame estimate, optionally refined per plane by SSE
     const int acq = av1g_ac_q(qindex);
@@ -3155,6 +3158,8 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
     if (search) {
         unsigned long long bestSse[3] = {~0ull, ~0ull, ~0ull};
         const int deltas[] = {-12, -6, 0, 6, 12};
+        int levels[5], n = 0;
+        cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * 5);
         for (int d : deltas) {
             const int L = std::max(0, std::min(63, guess + d));
             if (d && L == std::max(0, std::min(63, guess + d - (d > 0 ? 6 : -6)))) continue;
@@ -3162,11 +3167,13 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
             for (int p = 0; p < 3; p++) { f.plane[p] = planesOf[1][p]; f.stride[p] = pw[p]; }
             for (int k = 0; k < 4; k++) f.lfLevel[k] = L;
             if (L) av1g_gpu_deblock(&f, 0);
-            unsigned long long r[3];
-            sseOf(planesOf[1], r);
-            for (int p = 0; p < 3; p++)
-                if (r[p] < bestSse[p]) { bestSse[p] = r[p]; best[p] = L; }
+            sseOf(planesOf[1], n);
+            levels[n++] = L;
         }
+        fetch(n);
+        for (int i = 0; i < n; i++)
+            for (int p = 0; p < 3; p++)
+                if (slotSse[3 * i + p] < bestSse[p]) { bestSse[p] = slotSse[3 * i + p]; best[p] = levels[i]; }
     }
     out.lf[0] = out.lf[1] = best[0];
     out.lf[2] = best[0] ? best[1] : 0;
@@ -3189,12 +3196,17 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
         int by = 0, buv = 0;
         if (search) {
             unsigned long long bY = ~0ull, bUV = ~0ull;
-            for (int k = 0; k < (int)(sizeof cands / sizeof cands[0]); k++) {
+            const int nc = (int)(sizeof cands / sizeof cands[0]);
+            cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * nc);
+            for (int k = 0; k < nc; k++) {
                 f.cdefYPri[0] = cands[k].pri; f.cdefYSec[0] = cands[k].sec;
                 f.cdefUVPri[0] = cands[k].pri; f.cdefUVSec[0] = cands[k].sec;
                 av1g_gpu_cdef(&f, dst, strides, 0);
-                unsigned long long r[3];
-                sseOf(dst, r);
+                sseOf(dst, k);
+            }
+            fetch(nc);
+            for (int k = 0; k < nc; k++) {
+                const unsigned long long *r = slotSse + 3 * k;
                 if (r[0] < bY) { bY = r[0]; by = k; }
                 if (r[1] + r[2] < bUV) { bUV = r[1] + r[2]; buv = k; }
             }
