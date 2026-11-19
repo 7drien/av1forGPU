@@ -13,6 +13,7 @@
 #include <array>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -92,6 +93,7 @@ int main(int argc, char **argv) {
     int pfLrFrames = 0;
     double gopMotion = 0.0;      // motion of the current mini-GOP (mean block-mean difference of consecutive frames)
     auto adaptiveMargin = [](double motion) { const double t = std::min(1.0, std::max(0.0, (motion - 0.3) / 1.2)); return 2.0 + (0.5 - 2.0) * t; };
+    const char *pfCutPresetName = "base";   // preset of scene-cut key frames (--pf-cut-preset)
     bool pfCutPreset = true;    // base-preset scene-cut key frames (--pf-slow-cuts keeps the main preset)
     bool pfTmvp = true;          // temporal motion vector candidates (--pf-no-tmvp)
     pfm::MotionField mfield;
@@ -240,6 +242,8 @@ int main(int argc, char **argv) {
             pfTmvp = false;
         } else if (!strcmp(argv[i], "--pf-slow-cuts")) {
             pfCutPreset = false;
+        } else if (!strcmp(argv[i], "--pf-cut-preset") && i + 1 < argc) {
+            pfCutPresetName = argv[++i];
         } else if (!strcmp(argv[i], "--pf-no-lr")) {
             pfLr = false;
         } else if (!strcmp(argv[i], "--pf-fast")) {
@@ -463,7 +467,7 @@ int main(int argc, char **argv) {
     bool haveCut = false;
     if (usePframes && pfCutPreset) {
         GpConfig cc = cfg;
-        apply_preset(cc, "base");
+        if (!apply_preset(cc, pfCutPresetName)) { fprintf(stderr, "unknown --pf-cut-preset\n"); return 2; }
         cc.P.filterIntra = cfg.P.filterIntra;
         cc.fLf = cfg.fLf;
         cc.fCdef = cfg.fCdef;
@@ -884,7 +888,13 @@ int main(int argc, char **argv) {
         uint64_t keyPeriodBegin = 0;
         // scene cuts: mean absolute difference of 16x16 luma block means between consecutive frames
         std::vector<uint8_t> prevFrame;
+        // memoized by buffer address pair (frames keep their buffers while pending; the cache is cleared regularly)
+        std::map<std::pair<const uint8_t *, const uint8_t *>, double> diffCache;
         auto blockMeanDiff = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+            const auto key = std::make_pair(a.data(), b.data());
+            const auto hit = diffCache.find(key);
+            if (hit != diffCache.end()) return hit->second;
+            if (diffCache.size() > 4096) diffCache.clear();
             double sum = 0;
             int nb = 0;
             for (int by = 0; by + 16 <= h; by += 16)
@@ -898,7 +908,9 @@ int main(int argc, char **argv) {
                     sum += std::abs(sa - sb) / 64.0;
                     ++nb;
                 }
-            return nb ? sum / nb : 0.0;
+            const double v = nb ? sum / nb : 0.0;
+            diffCache[key] = v;
+            return v;
         };
         // --pf-adaptive: interpolate a setting between its static-content value (motion <= 0.3) and its moving-content
         // value (motion >= 1.5); motion is the mean blockMeanDiff of consecutive frames (independent of GOP length)

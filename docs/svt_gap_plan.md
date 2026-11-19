@@ -200,4 +200,10 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Rectangular-partition pruning margin by motion (`--pf-adaptive`): 2.0 for static content, 0.5 for moving content
   (fixed 0.5: video_2 +53.7% at 17.7 fps but video_1 +22.4%; 1.0: video_2 +53.5%, video_1 +19.9%). Result: video_2
   +53.3% at about 15.8 fps (q50), video_1 +18.5%.
+- Split-external evaluation for rectangular blocks as well: evaluation 47.4 → 33.3 ms per frame, same decisions;
+  video_2 15.8 to 20.6 fps at +53.3%.
+- Scene-cut and motion measures memoize their frame differences (+5% fps, same output).
+- `--pf-cut-preset NAME` sets the scene-cut key-frame preset (default base; turbo: +54.0%, about 7% faster).
+- Remaining per-frame cost on video_2 (60 frames): GPU analysis ~33 ms per inter frame (coarse 5, refine 7, evaluation
+  24), filters 5 ms, key frames ~200 ms each (28% of the time with 5 key frames in 60 frames).
 
