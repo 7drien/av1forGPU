@@ -30,6 +30,7 @@ struct InterCdfs {
     uint16_t mvJoint[5];
     uint16_t mvSign[2][3], mvClass[2][12], class0Bit[2][3], class0Fr[2][2][5], mvFr[2][5], mvBit[2][10][3];
     uint16_t txSet3[4][3];
+    uint16_t txSet1[2][17], txSet2[13];
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
 };
@@ -38,6 +39,32 @@ struct EntropyState {
     av1g_cdfs cdf;
     InterCdfs inter;
 };
+
+// Inter transform sets (spec 5.11.48 get_tx_set, is_inter = 1) and the position of a type in its set's
+// inter_tx_type alphabet (inverse of Tx_Type_Inter_Inv_Set1/2/3).
+AV1G_HDI int interTxSet(int txSz, int reduced) {
+    const int up = AV1G_T(Tx_Size_Sqr_Up)[txSz];
+    if (up > AV1G_TX_32X32) return AV1G_TX_SET_DCTONLY;
+    if (reduced || up == AV1G_TX_32X32) return AV1G_TX_SET_INTER_3;
+    if (AV1G_T(Tx_Size_Sqr)[txSz] == AV1G_TX_16X16) return AV1G_TX_SET_INTER_2;
+    return AV1G_TX_SET_INTER_1;
+}
+AV1G_HDI int interTxCount(int set) { return set == AV1G_TX_SET_INTER_1 ? 16 : set == AV1G_TX_SET_INTER_2 ? 12 : set ? 2 : 1; }
+AV1G_HDI int interTxInv(int set, int i) {
+    const uint8_t s1[16] = {9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 4, 5, 3, 6, 7, 8};
+    const uint8_t s2[12] = {9, 10, 11, 0, 1, 2, 4, 5, 3, 6, 7, 8};
+    return set == AV1G_TX_SET_INTER_1 ? s1[i] : set == AV1G_TX_SET_INTER_2 ? s2[i] : set ? (i ? 0 : 9) : 0;
+}
+AV1G_HDI int interTxIndex(int set, int t) {
+    for (int i = 0; i < interTxCount(set); i++)
+        if (interTxInv(set, i) == t) return i;
+    return -1;
+}
+// Inter chroma type: the luma type at the same position when the chroma transform's set allows it (7.13.3).
+AV1G_HDI int interChromaType(int lumaType, int uvTxSz, int reduced) {
+    const int set = interTxSet(uvTxSz, reduced);
+    return AV1G_T(Tx_Type_In_Set_Inter)[set][lumaType] ? lumaType : AV1G_DCT_DCT;
+}
 
 // Decoders clear every CDF's adaptation counter (the entry after the final 32768) when they save frame-end CDFs.
 AV1G_HDI void clearCounters(uint16_t *v, int n) {
@@ -96,6 +123,7 @@ struct FrameSyntax {
     int refName[2];       // AV1 reference of BlockInfo::ref 0 and 1
     int referenceSelect;
     int txModeSelect;     // TX_MODE_SELECT: coded blocks signal txfm_split
+    int reducedTxSet;     // reduced_tx_set
     int miRows, miCols, aw, ah, gcols;
 };
 
@@ -720,7 +748,8 @@ struct TileCoder {
         // luma: the type chosen for this transform; inter chroma: the type of the luma 4x4 at the same position
         // (spec 7.13.3 get_tx_type; every type we use is in TX_SET_INTER_3, which chroma sizes also allow)
         const int lx4 = plane ? x4 << 1 : x4, ly4 = plane ? y4 << 1 : y4;
-        const int txType = (grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)].txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
+        int txType = (grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)].txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
+        if (plane) txType = interChromaType(txType, txSz, fs->reducedTxSet);
         const uint16_t *scan = av1g_get_scan(txSz, txType);
         const int n = imin(tw, 32) * imin(th, 32);
         int eob = n;
@@ -728,8 +757,13 @@ struct TileCoder {
         sym(cdf->txb_skip[txSzCtx][ctx], eob == 0, 2);
         if (!eob) return;
         // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
-        if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64)
-            sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], txType == AV1G_IDTX ? 0 : 1, 2);
+        if (plane == 0) {
+            const int set = interTxSet(txSz, fs->reducedTxSet), sq = AV1G_T(Tx_Size_Sqr)[txSz];
+            const int idx = interTxIndex(set, txType);
+            if (set == AV1G_TX_SET_INTER_1) sym(ic->txSet1[sq], idx, 16);
+            else if (set == AV1G_TX_SET_INTER_2) sym(ic->txSet2, idx, 12);
+            else if (set == AV1G_TX_SET_INTER_3) sym(ic->txSet3[sq], idx, 2);
+        }
         int dcSign = 0;
         for (int k = 0; k < w4; k++)
             if (x4 + k < maxX4) { const int v = ctxAt(D, plane, x4 + k, y4 - 1); dcSign += v == 1 ? -1 : v == 2 ? 1 : 0; }

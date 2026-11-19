@@ -62,5 +62,8 @@ intra path), then T5, T7, T3, T2, T6.
 - T1 stage 1 done: each luma transform up to 32x32 chooses IDTX or DCT_DCT (`TX_SET_INTER_3`, `reduced_tx_set = 1`),
   chroma inherits the top-left luma type. BD-rate against SVT-AV1 preset 8: +38.2% → +32.5%, about 25 fps (was 26).
   `--pf-no-tx-types` disables it. Types travel in `BlockInfo::txTypes` (one nibble per 4x4).
-- T1 stage 2 (next): `reduced_tx_set = 0`, the 16-type `TX_SET_INTER_1` (needs flipped inverse transforms and the
-  Set1 / Set2 default CDFs from the specification).
+- T1 stage 2 done: `reduced_tx_set = 0`. Luma transforms search every type of their inter set (16 for 4x4 / 8x8
+  sizes, 12 for 16x16, IDTX / DCT_DCT for 32-point sizes), priced by the quantizer's distortion estimate with the
+  default inter_tx_type CDFs; the winner is reconstructed exactly (flipped types included). Chroma inherits the luma
+  type when its own set allows it. BD-rate against SVT-AV1 preset 8: +32.5% → +25.3%, about 22 fps.
+  `--pf-tx-types-fast` (7 types: +26.0%), `--pf-tx-types-reduced` (stage 1), `--pf-no-tx-types`.

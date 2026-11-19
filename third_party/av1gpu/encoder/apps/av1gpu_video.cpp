@@ -203,7 +203,11 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--pf-no-rect")) {
             pfSettings.rectPartitions = false;
         } else if (!strcmp(argv[i], "--pf-no-tx-types")) {
-            pfSettings.txTypes = false;
+            pfSettings.txTypes = 0;
+        } else if (!strcmp(argv[i], "--pf-tx-types-reduced")) {
+            pfSettings.txTypes = 1;
+        } else if (!strcmp(argv[i], "--pf-tx-types-fast")) {
+            pfSettings.txTypes = 2;
         } else if (!strcmp(argv[i], "--pf-no-tx-split")) {
             pfSettings.txSplit = false;
         } else if (!strcmp(argv[i], "--pf-rdoq")) {
@@ -643,6 +647,7 @@ int main(int argc, char **argv) {
             ein.refName[1] = pfw::ALTREF_FRAME;
             ein.referenceSelect = refCount == 2;
             ein.txModeSelect = pfSettings.txSplit;
+            ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -652,6 +657,7 @@ int main(int argc, char **argv) {
             if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
             fp.referenceSelect = refCount == 2;
             fp.txModeSelect = pfSettings.txSplit;
+            fp.reducedTxSet = pfSettings.txTypes < 2;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;

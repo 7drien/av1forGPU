@@ -445,10 +445,16 @@ __device__ void warpInverseAdd(int16_t *q, int txSz, int txType, int dcQ, int ac
         for (int i = lane; i < TW * TH; i += 32) q[i] = (int16_t)(q[i] / 2);
         __syncwarp();
     }
-    for (int i = lane; i < W * H; i += 32) recon[i] = (uint8_t)min(max((int)pred[i] + res[i], 0), 255);
+    // flipped types: Residual[i][j] lands at (flipUD ? H-1-i : i, flipLR ? W-1-j : j) (spec 7.13.3 step 3)
+    const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
+    for (int i = lane; i < W * H; i += 32) {
+        const int r = i >> LW, c = i & (W - 1);
+        const int src = (fud ? H - 1 - r : r) * W + (flr ? W - 1 - c : c);
+        recon[i] = (uint8_t)min(max((int)pred[i] + res[src], 0), 255);
+    }
     __syncwarp();
 }
-__device__ void inverseAddAny(int lw, int lh, int16_t *q, int txSz, int txType, int dcQ, int acQ, int16_t *res,
+__device__ __noinline__ void inverseAddAny(int lw, int lh, int16_t *q, int txSz, int txType, int dcQ, int acQ, int16_t *res,
                               const uint8_t *pred, uint8_t *recon) {
 #define PF_INV(A, B) if (lw == A && lh == B) { warpInverseAdd<A, B>(q, txSz, txType, dcQ, acQ, res, pred, recon); return; }
     PF_INV(2, 2) PF_INV(3, 3) PF_INV(4, 4) PF_INV(5, 5) PF_INV(6, 6)
@@ -533,37 +539,68 @@ struct EvalArgs {
     // luma transform types per 4x4 unit (stride aw / 4) of the whole-block transform and of the depth 1 / 2 splits;
     // null: DCT_DCT only
     uint8_t *types1, *types2, *types3;
+    int reducedTxSet;   // reduced_tx_set: luma types limited to IDTX / DCT_DCT
+    int txExhaustive;   // price every type of the set (else a subset)
 };
-// inter_tx_type bits of TX_SET_INTER_3 (default CDFs, by Tx_Size_Sqr): IDTX and DCT_DCT
-__constant__ float kIdtxBits[4] = {1.f, 2.975f, 4.036f, 5.453f};
-__constant__ float kDctBits[4] = {1.f, 0.197f, 0.092f, 0.033f};
-// Try DCT_DCT and IDTX for one luma transform whose residual is in bak (W x H); leaves the chosen levels in q, the
-// reconstruction in rec, adds the type bits to o.R and returns the type. run(type) must restore res from bak, then
-// transform, quantize and reconstruct. An all-zero transform codes no type and counts as DCT_DCT (TxTypes of an
-// all-zero luma transform are DCT_DCT, which inter chroma inherits).
-template <class Run, class Sse>
-__device__ int chooseLumaType(int txSz, bool enabled, float lambda, EvalOut &o, const int16_t *q, int nq, Run run,
-                              Sse sse) {
-    run(AV1G_DCT_DCT);
-    if (!enabled || AV1G_T(Tx_Size_Sqr_Up)[txSz] > AV1G_TX_32X32) return AV1G_DCT_DCT;
+// inter_tx_type default CDFs (spec Default_Inter_Tx_Type_Set1/2/3_Cdf) for the type bits of the search
+__constant__ uint16_t kTxSet1Cdf[2][16] = {
+    {4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915, 30631, 32768},
+    {1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856, 30749, 32768}};
+__constant__ uint16_t kTxSet2Cdf[12] = {770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768};
+__constant__ uint16_t kTxSet3Cdf[4][2] = {{16384, 32768}, {4167, 32768}, {1998, 32768}, {748, 32768}};
+__device__ float interTypeBits(int set, int sq, int idx) {
+    const uint16_t *c = set == AV1G_TX_SET_INTER_1 ? kTxSet1Cdf[sq] : set == AV1G_TX_SET_INTER_2 ? kTxSet2Cdf : kTxSet3Cdf[sq];
+    const int p = c[idx] - (idx ? c[idx - 1] : 0);
+    return -log2f((float)max(p, 1) * (1.f / 32768.f));
+}
+// Choose the inter transform type of one luma transform. run(type, full) restores the residual, transforms and
+// quantizes (o.D, o.R); full also reconstructs. Every type of the set is priced by the quantizer's distortion
+// estimate; the winner is then reconstructed. Leaves its levels in q and reconstruction in rec, adds the type bits
+// to o.R and returns the type. An all-zero transform codes no type and counts as DCT_DCT (TxTypes of an all-zero
+// luma transform are DCT_DCT, which inter chroma inherits).
+template <class Run>
+__device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhaustive, float lambda, EvalOut &o,
+                              const int16_t *q, int nq, Run run) {
+    const int set = enabled ? pft2::interTxSet(txSz, reduced) : AV1G_TX_SET_DCTONLY;
     const int sq = AV1G_T(Tx_Size_Sqr)[txSz];
-    {
-        // nothing left after DCT quantization: the identity transform rarely codes such a residual better
-        int any = 0;
-        for (int i = threadIdx.x & 31; i < nq; i += 32) any |= q[i];
-        if (!__any_sync(0xffffffffu, any)) return AV1G_DCT_DCT;
+    const int n = pft2::interTxCount(set);
+    // one call site for run (it inlines the transform, quantizer and inverse): step 0 reconstructs DCT_DCT, steps
+    // 1..n price the set's types, step n + 1 reconstructs the winner
+    int best = AV1G_DCT_DCT, step = 0;
+    float bestJ = 0.f;
+    for (;;) {
+        int t = AV1G_DCT_DCT;
+        bool full = true;
+        if (step == 0) {
+        } else if (step <= n) {
+            t = pft2::interTxInv(set, step - 1);
+            full = false;
+            if (!exhaustive && (av1g_flip_ud(t) || av1g_flip_lr(t) || t >= AV1G_V_ADST)) { step++; continue; }
+        } else {
+            t = best;
+        }
+        run(t, full);
+        if (step == 0) {
+            if (set == AV1G_TX_SET_DCTONLY) return AV1G_DCT_DCT;
+            int any = 0;
+            for (int i = threadIdx.x & 31; i < nq; i += 32) any |= q[i];
+            // nothing left after DCT quantization: other types rarely code such a residual better
+            if (!__any_sync(0xffffffffu, any)) break;
+            bestJ = 3.4e38f;
+        } else if (step <= n) {
+            const float J = o.D + lambda * (o.R + interTypeBits(set, sq, step - 1));
+            if (J < bestJ) { bestJ = J; best = t; }
+        } else {
+            int any = 0;
+            for (int i = threadIdx.x & 31; i < nq; i += 32) any |= q[i];
+            if (best == AV1G_DCT_DCT || __any_sync(0xffffffffu, any)) break;
+            best = AV1G_DCT_DCT;   // an all-zero result codes as DCT_DCT: reconstruct that instead
+            continue;
+        }
+        step++;
     }
-    const float jD = (float)sse() + lambda * (o.R + kDctBits[sq]);
-    run(AV1G_IDTX);
-    const float jI = (float)sse() + lambda * (o.R + kIdtxBits[sq]);
-    if (jI < jD) {
-        int any = 0;
-        for (int i = threadIdx.x & 31; i < nq; i += 32) any |= q[i];
-        if (__any_sync(0xffffffffu, any)) { o.R += kIdtxBits[sq]; return AV1G_IDTX; }
-    }
-    run(AV1G_DCT_DCT);
-    o.R += kDctBits[sq];
-    return AV1G_DCT_DCT;
+    o.R += interTypeBits(set, sq, pft2::interTxIndex(set, best));
+    return best;
 }
 
 // Evaluate skip and coded options of every block of one shape.
@@ -641,7 +678,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         e.txSz = txSz; e.txType = AV1G_DCT_DCT; e.plane = p;
         e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
         e.rnd = a.rnd; e.zbin = a.zbin;
-        e.skipCtx = p ? 7 : 0; e.dcCtx = 0; e.intraDir = 0; e.reduced = 1;
+        e.skipCtx = p ? 7 : 0; e.dcCtx = 0; e.intraDir = -1; e.reduced = 1;
         e.C = g_cost[a.qctx];
         e.resEnergy = warp_sum(energy);
         e.qmDist = 0; e.qmRnd = 0;
@@ -651,12 +688,13 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         int16_t *bak = hpS[warp];
         for (int i = lane; i < bw * bh; i += 32) bak[i] = res[i];
         __syncwarp();
-        auto run = [&](int type) {
+        auto run = [&](int type, bool full) {
             for (int i = lane; i < bw * bh; i += 32) res[i] = bak[i];
             __syncwarp();
             e.txType = type;
             warp_fwd_rt(res, tmpS[warp], bw, bh, txSz, type);
             warp_quant_rate_rt<8>(tmpS[warp], q, e, o, bw, bh);
+            if (!full) return;
             if (a.rdoq && bw == bh && type == AV1G_DCT_DCT) {
                 if (lane == 0) rdoqBlock(tmpS[warp], q, e, bw, a.lambda);
                 __syncwarp();
@@ -683,12 +721,12 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
             return warp_sumi(v);
         };
         if (p == 0) {
-            wholeType = chooseLumaType(txSz, a.types1 != nullptr, a.lambda, o, q, tqw * tqh, run, recSse);
+            wholeType = chooseLumaType(txSz, a.types1 != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, o, q, tqw * tqh, run);
             if (a.types1)
                 for (int i = lane; i < (bw >> 2) * (bh >> 2); i += 32)
                     a.types1[size_t((py >> 2) + i / (bw >> 2)) * tstride + (px >> 2) + i % (bw >> 2)] = (uint8_t)wholeType;
         } else {
-            run(chromaType);
+            run(pft2::interChromaType(chromaType, txSz, a.reducedTxSet), true);
         }
         bits += o.R;
         int any = 0;
@@ -746,12 +784,13 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                 int16_t *bk = hpS[warp];
                 for (int i = lane; i < SW * SH; i += 32) bk[i] = res[i];
                 __syncwarp();
-                auto runS = [&](int type) {
+                auto runS = [&](int type, bool full) {
                     for (int i = lane; i < SW * SH; i += 32) res[i] = bk[i];
                     __syncwarp();
                     es.txType = type;
                     warp_fwd_rt(res, tmpS[warp], SW, SH, stx, type);
                     warp_quant_rate_rt<8>(tmpS[warp], q, es, os, SW, SH);
+                    if (!full) return;
                     inverseAddAny(lsw, lsh, q, stx, type, dcQ, acQ, res, pq, rq);
                 };
                 auto sseFn = [&]() {
@@ -765,7 +804,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     }
                     return warp_sumi(v);
                 };
-                const int ty = chooseLumaType(stx, a.types2 != nullptr, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS, sseFn);
+                const int ty = chooseLumaType(stx, a.types2 != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS);
                 if (!k) splitTop[1] = ty;
                 if (a.types2)
                     for (int i = lane; i < (SW >> 2) * (SH >> 2); i += 32)
@@ -823,12 +862,13 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     int16_t *bk = hpS[warp];
                     for (int i = lane; i < hn * hn; i += 32) bk[i] = res[i];
                     __syncwarp();
-                    auto runS = [&](int type) {
+                    auto runS = [&](int type, bool full) {
                         for (int i = lane; i < hn * hn; i += 32) res[i] = bk[i];
                         __syncwarp();
                         es.txType = type;
                         warp_fwd_rt(res, tmpS[warp], hn, hn, stx, type);
                         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
+                        if (!full) return;
                         inverseAddAny(lhn, lhn, q, stx, type, dcQ, acQ, res, pq, rq);
                     };
                     auto sseFn = [&]() {
@@ -843,7 +883,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                         return warp_sumi(v);
                     };
                     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
-                    const int ty = chooseLumaType(stx, tmap != nullptr, a.lambda, os, q, hn * hn, runS, sseFn);
+                    const int ty = chooseLumaType(stx, tmap != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, os, q, hn * hn, runS);
                     if (!k) splitTop[d] = ty;
                     if (tmap)
                         for (int i = lane; i < (hn >> 2) * (hn >> 2); i += 32)
@@ -1817,6 +1857,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
             memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
         }
         memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
+        memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
+        memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
         memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
         memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
         memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
@@ -1921,6 +1963,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.25f;
     ea.rdoq = st.rdoq;
+    ea.reducedTxSet = st.txTypes == 1;
+    ea.txExhaustive = st.txTypes == 3;
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
     ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \
@@ -2047,6 +2091,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.refName[1] = in.refName[1];
     j.fs.referenceSelect = in.referenceSelect;
     j.fs.txModeSelect = in.txModeSelect;
+    j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2248,6 +2293,8 @@ int HostEntropy::init(int width, int height, char *, int) {
         memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
     }
     memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
+        memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
+        memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
     memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
     memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
     memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
@@ -2276,6 +2323,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.refName[1] = in.refName[1];
     fs.referenceSelect = in.referenceSelect;
     fs.txModeSelect = in.txModeSelect;
+    fs.reducedTxSet = in.reducedTxSet;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
     pft2::EntropyState &init = s->init;

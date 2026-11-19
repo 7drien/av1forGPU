@@ -42,7 +42,8 @@ struct Settings {
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
     bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
-    bool txTypes = true;         // choose IDTX or DCT_DCT per luma transform (else DCT_DCT only)
+    int txTypes = 3;             // inter transform types: 0 DCT_DCT only, 1 IDTX / DCT_DCT (reduced_tx_set),
+                                 // 2 the full inter sets (reduced_tx_set = 0) with a 7-type search, 3 every type
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 
@@ -60,6 +61,7 @@ struct EntropyIn {
     int refName[2] = {1, 7};    // AV1 reference (LAST_FRAME, ALTREF_FRAME) of BlockInfo::ref 0 and 1
     bool referenceSelect = false;
     bool txModeSelect = false;
+    bool reducedTxSet = true;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1

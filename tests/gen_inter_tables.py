@@ -14,7 +14,7 @@ TABLES = [
     "Default_New_Mv_Cdf", "Default_Zero_Mv_Cdf", "Default_Ref_Mv_Cdf", "Default_Drl_Mode_Cdf",
     "Default_Mv_Joint_Cdf", "Default_Mv_Class_Cdf", "Default_Mv_Class0_Bit_Cdf",
     "Default_Mv_Class0_Fr_Cdf", "Default_Mv_Class0_Hp_Cdf", "Default_Mv_Fr_Cdf", "Default_Mv_Hp_Cdf",
-    "Default_Mv_Sign_Cdf", "Default_Mv_Bit_Cdf", "Default_Inter_Tx_Type_Set3_Cdf",
+    "Default_Mv_Sign_Cdf", "Default_Mv_Bit_Cdf", "Default_Inter_Tx_Type_Set1_Cdf", "Default_Inter_Tx_Type_Set2_Cdf", "Default_Inter_Tx_Type_Set3_Cdf",
     "Default_Y_Mode_Cdf", "Default_Comp_Ref_Cdf", "Default_Comp_Bwd_Ref_Cdf",
     "Default_Comp_Ref_Type_Cdf", "Default_Compound_Mode_Cdf", "Default_Txfm_Split_Cdf",
 ]

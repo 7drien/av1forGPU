@@ -52,7 +52,7 @@ static __device__ float base_bits(const EvalIn &e, int eob) {
     if (eob == 0) return C[CID(txb_skip[txSzCtx][e.skipCtx]) + 1];
     float b = C[CID(txb_skip[txSzCtx][e.skipCtx]) + 0];
     const int ptype = e.plane > 0;
-    if (e.plane == 0) {
+    if (e.plane == 0 && e.intraDir >= 0) {   // intraDir < 0: inter block (the caller prices inter_tx_type)
         const int set = av1g_get_tx_set_intra(txSz, e.reduced);
         if (set > 0) {
             const int sqr = AV1G_T(Tx_Size_Sqr)[txSz];

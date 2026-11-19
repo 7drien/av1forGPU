@@ -19,6 +19,7 @@ struct FrameParams {
     int refreshFlags = 1;
     bool referenceSelect = false;   // compound prediction allowed
     bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
+    bool reducedTxSet = true;
     bool persistent = false;        // error_resilient_mode = 0 and CDFs from primary_ref_frame
     bool primary = false;           // primary_ref_frame = LAST (else NONE)
     int grain = 0;
@@ -114,7 +115,7 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     }
     b.bit(fp.txModeSelect);      // tx_mode_select (else TX_MODE_LARGEST)
     b.bit(fp.referenceSelect);   // reference_select
-    b.bit(1);                    // reduced_tx_set
+    b.bit(fp.reducedTxSet);      // reduced_tx_set
     for (int r = 0; r < 7; ++r) b.bit(0);   // is_global
     av1g::write_video_grain(b, fp.grain, fp.grainSeed, true);
 }
