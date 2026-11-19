@@ -122,7 +122,7 @@ struct TileStats {
 };
 
 struct FrameSyntax {
-    int refName[2];       // AV1 reference of BlockInfo::ref 0 and 1
+    int refName[3];       // AV1 reference of BlockInfo::ref 0, 1 and 3 (2: compound of the first two)
     int referenceSelect;
     int txModeSelect;     // TX_MODE_SELECT: coded blocks signal txfm_split
     int reducedTxSet;     // reduced_tx_set
@@ -818,7 +818,7 @@ struct TileCoder {
         const bool compound = bi.ref == 2;
         const int depth = skip ? 0 : bi.txSplit;   // luma transform split depth (0..2)
         const bool split = depth > 0;
-        RefPair rp{fs->refName[bi.ref == 1 ? 1 : 0], compound ? fs->refName[1] : -1, compound};
+        RefPair rp{fs->refName[bi.ref == 1 ? 1 : bi.ref == 3 ? 2 : 0], compound ? fs->refName[1] : -1, compound};
         if (phase == 1) {   // block list only
             curOrder = sbOrder | blockIndex++;
             BlockEntry &e = entries[nEntries++];

@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
     int pfQindex = 0, pfQoffset = 60, pfGop = 32, pfAltrefBoost = 100, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
+    int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
     int pfTfFrames = 0;
     float pfTfStrength = 1.0f;
@@ -202,6 +203,8 @@ int main(int argc, char **argv) {
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-no-rect")) {
             pfSettings.rectPartitions = false;
+        } else if (!strcmp(argv[i], "--pf-refs") && i + 1 < argc) {
+            pfRefs = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pf-fast")) {
             pfSettings.splitTypes = 2;
         } else if (!strcmp(argv[i], "--pf-no-prune")) {
@@ -624,9 +627,11 @@ int main(int argc, char **argv) {
         // Analyze, filter and write one inter frame. refSlots: slots of the AV1 references used by BlockInfo::ref
         // 0 and 1 (second < 0: single reference). The reconstruction goes to outSlot.
         auto interFrame = [&](std::array<uint8_t *, 3> &fb, int slot0, int slot1, int outSlot, int qindex, bool show,
-                              bool endTU, uint64_t pts) -> int {
-            const uint8_t *refs[2] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr};
-            const int refCount = slot1 >= 0 ? 2 : 1;
+                              bool endTU, uint64_t pts, int slot2 = -1) -> int {
+            // slot2: a third single reference (ALTREF2), used only with slot1 (--pf-refs 3)
+            if (pfRefs < 3 || slot1 < 0) slot2 = -1;
+            const uint8_t *refs[3] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr, slot2 >= 0 ? slotBuf[slot2] : nullptr};
+            const int refCount = slot2 >= 0 ? 3 : slot1 >= 0 ? 2 : 1;
             pf::Settings st = pfSettings;
             st.qindex = qindex;
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
@@ -651,7 +656,8 @@ int main(int argc, char **argv) {
             pf::EntropyIn &ein = job.ein;
             ein.refName[0] = pfw::LAST_FRAME;
             ein.refName[1] = pfw::ALTREF_FRAME;
-            ein.referenceSelect = refCount == 2;
+            ein.refName[2] = pfw::ALTREF2_FRAME;
+            ein.referenceSelect = refCount >= 2;
             ein.txModeSelect = pfSettings.txSplit;
             ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.switchableFilter = pfSettings.switchableFilter;
@@ -662,7 +668,8 @@ int main(int argc, char **argv) {
             fp.qindex = qindex;
             for (int r = 0; r < 7; ++r) fp.refSlot[r] = slot0;
             if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
-            fp.referenceSelect = refCount == 2;
+            if (slot2 >= 0) fp.refSlot[pfw::ALTREF2_FRAME - 1] = slot2;
+            fp.referenceSelect = refCount >= 2;
             fp.txModeSelect = pfSettings.txSplit;
             fp.reducedTxSet = pfSettings.txTypes < 2;
             fp.switchable = pfSettings.switchableFilter;
@@ -890,8 +897,9 @@ int main(int argc, char **argv) {
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();
             if (interFrame(altSrc, lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
-            std::function<int(uint64_t, uint64_t, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
-                                                                            int hiSlotL, int depth) -> int {
+            // hi2Slot: the next anchor after hi (still held, displayed later), the third reference of the interval
+            std::function<int(uint64_t, uint64_t, int, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
+                                                                                 int hiSlotL, int depth, int hi2Slot) -> int {
                 if (hi == lo + 1 && filtered && hi == base + n) {
                     // overlay: display the original picture coded from the filtered ALTREF (refreshes no slot)
                     if (interFrame(inBuf[n - 1], loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
@@ -922,21 +930,21 @@ int main(int argc, char **argv) {
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
                     if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
                                    referenced ? qAt(depth) : std::min(255, pfSettings.qindex + pfLeafOffset), true,
-                                   true, frameCount))
+                                   true, frameCount, hi2Slot))
                         return 1;
                     dump(referenced ? slotBuf[midSlot] : spare);
                     ++predicted; ++frameCount;
                     release(loSlot);
-                    return rec(mid, hi, midSlot, hiSlotL, depth + 1);
+                    return rec(mid, hi, midSlot, hiSlotL, depth + 1, hi2Slot);
                 }
                 const int midSlot = allocSlot();
-                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0))
+                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0, hi2Slot))
                     return 1;
-                if (rec(lo, mid, loSlot, midSlot, depth + 1)) return 1;
-                return rec(mid, hi, midSlot, hiSlotL, depth + 1);
+                if (rec(lo, mid, loSlot, midSlot, depth + 1, hiSlotL)) return 1;
+                return rec(mid, hi, midSlot, hiSlotL, depth + 1, hi2Slot);
             };
             try {
-                if (rec(base, base + n, lastShown, hiSlot, 1)) return 1;
+                if (rec(base, base + n, lastShown, hiSlot, 1, -1)) return 1;
             } catch (const std::exception &ex) {
                 fprintf(stderr, "mini-GOP: %s\n", ex.what());
                 return 1;

@@ -81,4 +81,7 @@ intra path), then T5, T7, T3, T2, T6.
   by a factor 2 or more (`--pf-no-prune` disables it). 21.6 → about 30 fps for +25.3% → +25.7% BD-rate.
 - `--pf-fast`: split transforms code DCT_DCT only (no type search): +28.1% at about 35 fps (default +25.7% at about
   30 fps; a seven-type subset on splits, `AV1GPU_PF_SPLITTX=1`, gives +26.1% at about 31 fps).
+- T3 stage 1, off by default (`--pf-refs 3`): pyramid frames also predict from the next anchor after their interval
+  (ALTREF2, single prediction). Bit-exact; +25.7% → +25.3% for about 9% less speed, below the speed budget. A far
+  past reference (a pinned golden frame) and compound pairs with it are the next things to try.
 

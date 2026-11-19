@@ -26,7 +26,7 @@ namespace {
 
 constexpr int kSizes = 4;       // 8, 16, 32, 64
 constexpr int kEntropySlots = Analyzer::kEntropySlots;
-constexpr int kMaxRefs = 2;
+constexpr int kMaxRefs = 3;
 constexpr float kInf = 3.0e38f;
 constexpr int kFullPelPasses = 6;
 
@@ -422,12 +422,15 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) chooseInter(Fra
         }
         sad = GR::sum(sad);
         const float cc = (float)sad + lambda * (c.bitsR[0] + c.bitsR[1] + compoundBias);
-        if (c1 < c0 && c1 <= cc) { choice = 1; bits = c.bitsR[1] + 1.0f; }
-        else if (cc < c0) { choice = 2; bits = c.bitsR[0] + c.bitsR[1] + compoundBias; }
+        float best = c0;
+        if (c1 < c0 && c1 <= cc) { choice = 1; bits = c.bitsR[1] + 1.0f; best = c1; }
+        else if (cc < c0) { choice = 2; bits = c.bitsR[0] + c.bitsR[1] + compoundBias; best = cc; }
+        // third reference (single prediction only): about two more bits of reference signalling
+        if (refCount > 2 && c.costR[2] + lambda * 2.0f < best) { choice = 3; bits = c.bitsR[2] + 2.0f; }
     }
     if (!lane) {
         c.ref = (uint8_t)choice;
-        c.mv = choice == 1 ? c.mvR[1] : c.mvR[0];
+        c.mv = choice == 1 ? c.mvR[1] : choice == 3 ? c.mvR[2] : c.mvR[0];
         c.mv2 = c.mvR[1];
         c.mvBits = bits;
     }
@@ -668,7 +671,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; }
         return;
     }
-    const uint8_t *ref = c.ref == 1 ? f.ref[1] : f.ref[0];
+    const uint8_t *ref = c.ref == 1 ? f.ref[1] : c.ref == 3 ? f.ref[2] : f.ref[0];
     const uint8_t *ref2 = f.ref[1];
     const int cw = f.w >> 1, chh = f.h >> 1;
     const size_t ysz = size_t(f.w) * f.h, csz = size_t(cw) * chh;
@@ -2180,6 +2183,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     if (e == cudaSuccess) e = cudaStreamWaitEvent(s->entStream, es.staged, 0);
     j.fs.refName[0] = in.refName[0];
     j.fs.refName[1] = in.refName[1];
+    j.fs.refName[2] = in.refName[2];
     j.fs.referenceSelect = in.referenceSelect;
     j.fs.txModeSelect = in.txModeSelect;
     j.fs.reducedTxSet = in.reducedTxSet;
@@ -2414,6 +2418,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     pft2::FrameSyntax fs{};
     fs.refName[0] = in.refName[0];
     fs.refName[1] = in.refName[1];
+    fs.refName[2] = in.refName[2];
     fs.referenceSelect = in.referenceSelect;
     fs.txModeSelect = in.txModeSelect;
     fs.reducedTxSet = in.reducedTxSet;

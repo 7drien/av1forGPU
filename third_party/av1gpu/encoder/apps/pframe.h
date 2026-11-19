@@ -25,7 +25,7 @@ struct BlockInfo {
     Mv mv2;         // vector of the second reference of a compound block
     uint8_t log2;   // log2 of the block size containing this unit (3..6)
     uint8_t skip;   // 1: no residual coded
-    uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both
+    uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both, 3: reference 2 only
     uint8_t txSplit;   // 1: luma uses four half-size transforms (coded blocks)
     uint8_t part;      // partition of the log2 node: 0 NONE, 1 HORZ (two n x n/2 blocks), 2 VERT (two n/2 x n),
                        // 3 HORZ_4, 4 VERT_4
@@ -62,7 +62,7 @@ struct FilterParams {
 
 // GPU tile entropy coding of the last analyzed frame (pframe_tile.cuh).
 struct EntropyIn {
-    int refName[2] = {1, 7};    // AV1 reference (LAST_FRAME, ALTREF_FRAME) of BlockInfo::ref 0 and 1
+    int refName[3] = {1, 7, 6};   // AV1 reference (LAST, ALTREF, ALTREF2) of BlockInfo::ref 0, 1 and 3
     bool referenceSelect = false;
     bool txModeSelect = false;
     bool reducedTxSet = true;
