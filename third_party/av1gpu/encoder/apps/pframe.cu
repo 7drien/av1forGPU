@@ -881,7 +881,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         }
         __syncwarp();
         if (p == 0) { lumaD = dCoded; lumaBits = bits; }
-        if (BW != BH && p == 0 && a.recon2) {
+        if (BW != BH && p == 0 && a.recon2 && !EXT) {
             // rectangular split: two transforms, the longer side halved (Split_Tx_Size)
             constexpr int SW = BW > BH ? BW / 2 : BW, SH = BW > BH ? BH : BH / 2;
             constexpr int lsw = Log2<SW>::v, lsh = Log2<SH>::v;
@@ -1074,24 +1074,33 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
 // Split-external evaluation of square blocks: one warp per split transform (all blocks of a size at once), from the
 // prediction evaluate<.., true> stored in a.pred. Writes the depth-1 / depth-2 levels, reconstruction and types like the
 // in-kernel split path, and per transform D, R, nz and type for evalFinal.
-template <int N>
+template <int BW, int BH>
+struct SplitGeo {   // split-external evaluation: split transforms per block and the largest one
+    static constexpr bool sq = BW == BH;
+    static constexpr int nsub = sq ? (BW >= 16 ? 20 : 4) : 2;
+    static constexpr int sw = sq ? BW / 2 : (BW > BH ? BW / 2 : BW), sh = sq ? BH / 2 : (BW > BH ? BH : BH / 2);
+};
+template <int BW, int BH>
 __global__ void __launch_bounds__(128) evalSplit(EvalArgs a) {
-    constexpr int NSUB = N >= 16 ? 20 : 4, HN = N / 2;   // largest split transform: N / 2
-    __shared__ int16_t resS[4][HN * HN], bkS[4][HN * HN], qS[4][HN * HN];
-    __shared__ uint8_t pqS[4][HN * HN], rqS[4][HN * HN];
-    __shared__ float tmpS[4][HN * (HN + 1)];
+    using G = SplitGeo<BW, BH>;
+    constexpr int NSUB = G::nsub, SA = G::sw * G::sh;   // largest split transform area
+    __shared__ int16_t resS[4][SA], bkS[4][SA], qS[4][SA];
+    __shared__ uint8_t pqS[4][SA], rqS[4][SA];
+    __shared__ float tmpS[4][(G::sw + 1) * G::sh];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int idx = blockIdx.x * 4 + warp;
     if (idx >= a.cols * a.rows * NSUB) return;
     const int b = idx / NSUB, k = idx % NSUB;
     const Cand &c = a.cand[b];
     const Frame &f = a.f;
-    const int x0 = (b % a.cols) * N, y0 = (b / a.cols) * N;
-    if (x0 >= f.w || y0 >= f.h) return;
-    const int d = k < 4 ? 1 : 2, kk = k < 4 ? k : k - 4;
-    const int hn = N >> d, lhn = Log2<N>::v - d, per = 1 << d;
-    const int stx = txSizeOf(lhn, lhn);
-    const int qx = (kk % per) * hn, qy = (kk / per) * hn;
+    const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
+    // square: depth 1 (k 0..3) or depth 2 (k 4..19) quadrants; rectangle: the two halves along the longer side
+    const int d = k < 4 ? 1 : 2, kk = k < 4 ? k : k - 4, per = 1 << d;
+    const int lsw = G::sq ? Log2<BW>::v - d : Log2<G::sw>::v, lsh = G::sq ? Log2<BH>::v - d : Log2<G::sh>::v;
+    const int hw = 1 << lsw, hh = 1 << lsh;
+    const int stx = txSizeOf(lsw, lsh);
+    const int qx = G::sq ? (kk % per) * hw : (BW > BH ? k * hw : 0), qy = G::sq ? (kk / per) * hh : (BW > BH ? 0 : k * hh);
     const int px = x0, py = y0, pw = f.w, ph = f.h, pitch = f.pitch[0];
     const uint8_t *src = f.src[0], *predF = a.pred;
     uint8_t *dstRec = d == 1 ? a.recon2 : a.recon3;
@@ -1101,8 +1110,8 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a) {
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     const int apw = f.aw, tstride = f.aw >> 2;
     float en = 0.f;
-    for (int i = lane; i < hn * hn; i += 32) {
-        const int r = i >> lhn, col = i & (hn - 1);
+    for (int i = lane; i < hw * hh; i += 32) {
+        const int r = i >> lsw, col = i & (hw - 1);
         const int x = px + qx + col, y = py + qy + r;
         int dd = 0;
         uint8_t pv = 0;
@@ -1122,26 +1131,26 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a) {
     es.qmDist = 0; es.qmRnd = 0;
     EvalOut os;
     auto runS = [&](int type, int mode) -> float {
-        for (int i = lane; i < hn * hn; i += 32) res[i] = bk[i];
+        for (int i = lane; i < hw * hh; i += 32) res[i] = bk[i];
         __syncwarp();
         es.txType = type;
-        warp_fwd_rt(res, tmpS[warp], hn, hn, stx, type);
-        if (mode == 0) return fwdScore(tmpS[warp], hn, hn, stx, type);
-        warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
+        warp_fwd_rt(res, tmpS[warp], hw, hh, stx, type);
+        if (mode == 0) return fwdScore(tmpS[warp], hw, hh, stx, type);
+        warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hw, hh);
         if (mode == 1) return 0.f;
-        inverseAddAny(lhn, lhn, q, stx, type, dcQ, acQ, res, pq, rq);
+        inverseAddAny(lsw, lsh, q, stx, type, dcQ, acQ, res, pq, rq);
         return 0.f;
     };
     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
     const int ty = chooseLumaType(stx, tmap != nullptr && a.splitTypes < 2, a.reducedTxSet,
-                                  a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hn * hn, runS);
+                                  a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hw * hh, runS);
     if (tmap)
-        for (int i = lane; i < (hn >> 2) * (hn >> 2); i += 32)
-            tmap[size_t(((py + qy) >> 2) + i / (hn >> 2)) * tstride + ((px + qx) >> 2) + i % (hn >> 2)] = (uint8_t)ty;
+        for (int i = lane; i < (hw >> 2) * (hh >> 2); i += 32)
+            tmap[size_t(((py + qy) >> 2) + i / (hw >> 2)) * tstride + ((px + qx) >> 2) + i % (hw >> 2)] = (uint8_t)ty;
     int anyS = 0, sseS = 0;
-    for (int i = lane; i < hn * hn; i += 32) {
+    for (int i = lane; i < hw * hh; i += 32) {
         anyS |= q[i];
-        const int r = i >> lhn, col = i & (hn - 1);
+        const int r = i >> lsw, col = i & (hw - 1);
         const int x = px + qx + col, y = py + qy + r;
         dstLev[size_t(y) * apw + x] = q[i];
         if (x >= pw || y >= ph) continue;
@@ -1161,20 +1170,20 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a) {
 
 // Split-external evaluation, last step: luma depth from the evalSplit results, chroma with the type of the top-left
 // luma transform, and the block's skip / coded costs.
-template <int N>
+template <int BW, int BH>
 __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
-    constexpr int NSUB = N >= 16 ? 20 : 4, CN = N / 2;
-    constexpr int TQ = (CN > 32 ? 32 : CN) * (CN > 32 ? 32 : CN);
-    __shared__ int16_t resS[4][CN * CN], bkS[4][CN * CN], qS[4][TQ];
-    __shared__ uint8_t pS[4][CN * CN], recS[4][CN * CN];
-    __shared__ float tmpS[4][CN * (CN + 1)];
+    using G = SplitGeo<BW, BH>;
+    constexpr int NSUB = G::nsub, CW = BW / 2, CH = BH / 2;   // chroma block (one transform: CW, CH <= 32)
+    __shared__ int16_t resS[4][CW * CH], bkS[4][CW * CH], qS[4][CW * CH];
+    __shared__ uint8_t pS[4][CW * CH], recS[4][CW * CH];
+    __shared__ float tmpS[4][(CW + 1) * CH];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int b = blockIdx.x * 4 + warp;
     if (b >= a.cols * a.rows) return;
     Cand &c = a.cand[b];
     const Frame &f = a.f;
-    const int x0 = (b % a.cols) * N, y0 = (b / a.cols) * N;
-    if (x0 >= f.w || y0 >= f.h) return;
+    const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
     float splitD[3] = {kInf, 0.f, 0.f}, splitBits[3] = {0.f, 0.f, 0.f};
     bool nzSplit[3] = {false, false, false};
     for (int k = 0; k < NSUB; k++) {
@@ -1183,7 +1192,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         splitBits[d] += a.subR[size_t(b) * NSUB + k];
         nzSplit[d] = nzSplit[d] || a.subNz[size_t(b) * NSUB + k];
     }
-    if (N < 16) splitD[2] = kInf;
+    if (!G::sq || BW < 16) splitD[2] = kInf;
     const float lumaD = c.lumaD, lumaBits = c.lumaBits;
     int depth = 0;
     float bestJ = lumaD + a.lambda * lumaBits;
@@ -1196,9 +1205,8 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
     const int cw = f.w >> 1, chh = f.h >> 1;
     const size_t ysz = size_t(f.w) * f.h, csz = size_t(cw) * chh;
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
-    constexpr int lw = Log2<CN>::v, tl = lw > 6 ? 6 : lw;
-    const int txSz = txSizeOf(tl, tl);
-    constexpr int tq = CN > 32 ? 32 : CN;
+    constexpr int lw = Log2<CW>::v, lh = Log2<CH>::v;
+    const int txSz = txSizeOf(lw, lh);
     float dC = 0.f, bC = 0.f;
     bool nzC = false;
     for (int p = 1; p <= 2; p++) {
@@ -1207,8 +1215,8 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         int16_t *res = resS[warp], *bk = bkS[warp], *q = qS[warp];
         uint8_t *pred = pS[warp], *rec = recS[warp];
         float en = 0.f;
-        for (int i = lane; i < CN * CN; i += 32) {
-            const int r = i >> lw, col = i & (CN - 1);
+        for (int i = lane; i < CW * CH; i += 32) {
+            const int r = i >> lw, col = i & (CW - 1);
             int dd = 0;
             uint8_t pv = 0;
             if (px + col < cw && py + r < chh) { pv = predF[size_t(py + r) * cw + px + col]; dd = (int)src[(py + r) * pitch + px + col] - pv; }
@@ -1227,17 +1235,17 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         e.resEnergy = warp_sum(en);
         e.qmDist = 0; e.qmRnd = 0;
         EvalOut o;
-        warp_fwd_rt(res, tmpS[warp], CN, CN, txSz, e.txType);
-        warp_quant_rate_rt<8>(tmpS[warp], q, e, o, CN, CN);
-        inverseAddAny(tl, tl, q, txSz, e.txType, dcQ, acQ, res, pred, rec);
+        warp_fwd_rt(res, tmpS[warp], CW, CH, txSz, e.txType);
+        warp_quant_rate_rt<8>(tmpS[warp], q, e, o, CW, CH);
+        inverseAddAny(lw, lh, q, txSz, e.txType, dcQ, acQ, res, pred, rec);
         bC += o.R;
         int any = 0;
-        for (int i = lane; i < tq * tq; i += 32) any |= q[i];
+        for (int i = lane; i < CW * CH; i += 32) any |= q[i];
         nzC = nzC || __any_sync(0xffffffffu, any);
         int sseC = 0;
         uint8_t *outRec = a.recon + ysz + (p - 1) * csz;
-        for (int i = lane; i < CN * CN; i += 32) {
-            const int r = i >> lw, col = i & (CN - 1);
+        for (int i = lane; i < CW * CH; i += 32) {
+            const int r = i >> lw, col = i & (CW - 1);
             if (px + col >= cw || py + r >= chh) continue;
             const int dd = (int)src[(py + r) * pitch + px + col] - rec[i];
             sseC += dd * dd;
@@ -1246,9 +1254,9 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         dC += (float)warp_sumi(sseC);
         const int apw = f.aw / 2;
         int16_t *dst = a.levels + size_t(f.aw) * f.ah + size_t(p - 1) * (f.aw / 2) * (f.ah / 2) + size_t(py) * apw + px;
-        for (int i = lane; i < CN * CN; i += 32) {
-            const int r = i >> lw, col = i & (CN - 1);
-            dst[size_t(r) * apw + col] = (r < tq && col < tq) ? q[r * tq + col] : 0;
+        for (int i = lane; i < CW * CH; i += 32) {
+            const int r = i >> lw, col = i & (CW - 1);
+            dst[size_t(r) * apw + col] = q[i];
         }
         __syncwarp();
     }
@@ -1264,7 +1272,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
             nz = nzSplit[depth] || nzC;
         }
         c.txSplit = (uint8_t)depth;
-        c.costCoded = dCoded + a.lambda * (modeBits + skipFlag0 + bits);
+        c.costCoded = dCoded + a.lambda * (modeBits + skipFlag0 + (G::sq ? 0.f : 0.5f) + bits);
         c.nz = nz;
     }
 }
@@ -1967,6 +1975,8 @@ struct State {
     uint8_t *types1[kShapes] = {}, *types2[kShapes] = {}, *types3[kSizes] = {};   // luma tx types per 4x4
     float *subD[kSizes] = {}, *subR[kSizes] = {};       // split-external evaluation of squares
     uint8_t *subNz[kSizes] = {}, *subType[kSizes] = {};
+    float *rsubD[10] = {}, *rsubR[10] = {};
+    uint8_t *rsubNz[10] = {}, *rsubType[10] = {};
     Cand *rcand[10] = {};
     uint8_t *rpred[10] = {}, *rrecon[10] = {};
     int16_t *rlevels[10] = {};
@@ -2041,6 +2051,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->outLevels);
     for (int k = 0; k < kShapes; k++) { cudaFree(s->types1[k]); cudaFree(s->types2[k]); }
     for (int k = 0; k < kSizes; k++) { cudaFree(s->types3[k]); cudaFree(s->subD[k]); cudaFree(s->subR[k]); cudaFree(s->subNz[k]); cudaFree(s->subType[k]); }
+    for (int k = 0; k < 10; k++) { cudaFree(s->rsubD[k]); cudaFree(s->rsubR[k]); cudaFree(s->rsubNz[k]); cudaFree(s->rsubType[k]); }
     cudaFree(s->grid);
     cudaFree(s->prevGrid);
     cudaFree(s->pfScratch);
@@ -2127,6 +2138,9 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->rlevels[k], aframe * sizeof(int16_t));
         alloc(&s->rrecon2[k], size_t(w) * h);
         alloc(&s->rlevels2[k], size_t(aw) * ah * sizeof(int16_t));
+        const size_t rn = size_t(s->rcols[k]) * s->rrows[k] * 2;
+        alloc(&s->rsubD[k], sizeof(float) * rn); alloc(&s->rsubR[k], sizeof(float) * rn);
+        alloc(&s->rsubNz[k], rn); alloc(&s->rsubType[k], rn);
     }
     alloc(&s->outLevels, aframe * sizeof(int16_t));
     for (int k = 0; k < kShapes; k++) { alloc(&s->types1[k], size_t(aw / 4) * (ah / 4)); alloc(&s->types2[k], size_t(aw / 4) * (ah / 4)); }
@@ -2332,8 +2346,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     if (ea.recon2 && splitExternal) {                                                                          \
         const int nb = s->cols[K] * s->rows[K];                                                                \
         { FineTimer t1_("eval whole " #N); evaluate<N, N, true><<<(nb + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps, 32 * EvalCfg<N, N>::warps>>>(ea); } \
-        { FineTimer t2_("eval split " #N); evalSplit<N><<<(nb * (N >= 16 ? 20 : 4) + 3) / 4, 128>>>(ea); }      \
-        { FineTimer t3_("eval final " #N); evalFinal<N><<<(nb + 3) / 4, 128>>>(ea); }                           \
+        { FineTimer t2_("eval split " #N); evalSplit<N, N><<<(nb * SplitGeo<N, N>::nsub + 3) / 4, 128>>>(ea); }  \
+        { FineTimer t3_("eval final " #N); evalFinal<N, N><<<(nb + 3) / 4, 128>>>(ea); }                        \
     } else                                                                                                     \
         evaluate<N, N><<<(s->cols[K] * s->rows[K] + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps,             \
                          32 * EvalCfg<N, N>::warps>>>(ea); }
@@ -2347,9 +2361,16 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                           \
     ea.types1 = st.txTypes ? s->types1[4 + RK] : nullptr; ea.types2 = st.txTypes ? s->types2[4 + RK] : nullptr;  \
     ea.types3 = nullptr;                                                                                       \
+    ea.subD = s->rsubD[RK]; ea.subR = s->rsubR[RK]; ea.subNz = s->rsubNz[RK]; ea.subType = s->rsubType[RK];   \
     { FineTimer ft_("evaluate " #BW "x" #BH);                                                                   \
-    evaluate<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,       \
-                       32 * EvalCfg<BW, BH>::warps>>>(ea); }
+    const int nb = s->rcols[RK] * s->rrows[RK];                                                                \
+    if (ea.recon2 && splitExternal) {                                                                          \
+        evaluate<BW, BH, true><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps, 32 * EvalCfg<BW, BH>::warps>>>(ea); \
+        evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(ea);                                 \
+        evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(ea);                                                          \
+    } else                                                                                                     \
+        evaluate<BW, BH><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,                           \
+                           32 * EvalCfg<BW, BH>::warps>>>(ea); }
     if (st.rectPartitions) {
         for (int k = 0; k < 10; k++) {
             const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;
