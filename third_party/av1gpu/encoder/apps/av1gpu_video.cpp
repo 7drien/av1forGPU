@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
     bool interRdoq = false;
     bool usePframes = false;
     pf::Settings pfSettings;
-    int pfQindex = 0, pfQoffset = 60, pfGop = 32, pfAltrefBoost = 100, pfLeafOffset = 0;
+    int pfQindex = 0, pfQoffset = 130, pfGop = 32, pfAltrefBoost = 128, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;
@@ -171,8 +171,8 @@ int main(int argc, char **argv) {
             pfQindex = static_cast<int>(value);
         } else if (!strcmp(argv[i], "--pf-qoffset") && i + 1 < argc) {
             pfQoffset = atoi(argv[++i]);
-            if (pfQoffset < -100 || pfQoffset > 100) {
-                fprintf(stderr, "P-frame qindex offset must be in -100..100\n");
+            if (pfQoffset < -100 || pfQoffset > 200) {
+                fprintf(stderr, "P-frame qindex offset must be in -100..200\n");
                 return 2;
             }
         } else if (!strcmp(argv[i], "--pf-gop") && i + 1 < argc) {
@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
             if (pfGop < 1 || pfGop > 32) { fprintf(stderr, "--pf-gop must be 1..32\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-altref-boost") && i + 1 < argc) {
             pfAltrefBoost = atoi(argv[++i]);
-            if (pfAltrefBoost < 0 || pfAltrefBoost > 128) { fprintf(stderr, "--pf-altref-boost must be 0..128\n"); return 2; }
+            if (pfAltrefBoost < 0 || pfAltrefBoost > 200) { fprintf(stderr, "--pf-altref-boost must be 0..200\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-leaf-offset") && i + 1 < argc) {
             pfLeafOffset = atoi(argv[++i]);
             if (pfLeafOffset < 0 || pfLeafOffset > 100) { fprintf(stderr, "--pf-leaf-offset must be 0..100\n"); return 2; }

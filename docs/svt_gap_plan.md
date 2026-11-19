@@ -91,3 +91,10 @@ intra path), then T5, T7, T3, T2, T6.
   120-frame test (46 to 57 dB PSNR) it gains 0.1% (+25.7% → +25.6%) for 8% speed; lower thresholds lose. Worth
   re-measuring at lower qualities and with chroma / self-guided filters.
 
+## Quality allocation
+
+- SVT-AV1 spends 36 to 42% of its bits on the key frame of the test; we spent 6%. Coding inter frames further
+  from the key frame (`--pf-qoffset` 60 → 130) and boosting the hidden ALTREF frames more (`--pf-altref-boost`
+  100 → 128) moves BD-rate from +25.7% to +19.6% with no speed cost (offset 90: +23.0%, 100: +21.7%,
+  160: +23.2%; boost 70: +22.5%, 160: +25.9%). These are the new defaults.
+
