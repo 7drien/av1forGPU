@@ -662,11 +662,12 @@ struct TileCoder {
             }
     }
     template <class F>
-    AV1G_HDI void forTransformAreas(int miRow, int miCol, int lw, int lh, bool split, F f) {
+    AV1G_HDI void forTransformAreas(int miRow, int miCol, int lw, int lh, int depth, F f) {
+        const bool split = depth > 0;
         if (split) {
-            const int t = 1 << (lw - 1), txSz = txSizeOfLog2(lw - 1, lw - 1);
-            for (int k = 0; k < 4; ++k) {
-                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
+            const int t = 1 << (lw - depth), txSz = txSizeOfLog2(lw - depth, lw - depth), per = 1 << depth;
+            for (int k = 0; k < per * per; ++k) {
+                const int px = miCol * 4 + treeX(k, depth) * t, py = miRow * 4 + treeY(k, depth) * t;
                 if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
                 f(0, px, py, txSz);
             }
@@ -725,12 +726,16 @@ struct TileCoder {
         emitCoeffPayload(sink, qv, eob, txSz, AV1G_DCT_DCT, txSzCtx, plane > 0, dcSign);
     }
     // Walk the transforms of a coded block: f(plane, x4, y4, txSz) with the levels loaded into qv.
+    // transform_tree order of the k-th leaf at uniform depth: quadrants recursively (depth 2: z-order)
+    AV1G_HDI static int treeX(int k, int depth) { return depth == 1 ? (k & 1) : ((k >> 2) & 1) * 2 + (k & 1); }
+    AV1G_HDI static int treeY(int k, int depth) { return depth == 1 ? (k >> 1) : ((k >> 3) & 1) * 2 + ((k >> 1) & 1); }
     template <class F>
-    AV1G_HDI void forTransforms(int miRow, int miCol, int lw, int lh, bool split, F f) {
+    AV1G_HDI void forTransforms(int miRow, int miCol, int lw, int lh, int depth, F f) {
+        const bool split = depth > 0;
         if (split) {
-            const int t = 1 << (lw - 1), txSz = txSizeOfLog2(lw - 1, lw - 1);
-            for (int k = 0; k < 4; ++k) {
-                const int px = miCol * 4 + (k & 1) * t, py = miRow * 4 + (k >> 1) * t;
+            const int t = 1 << (lw - depth), txSz = txSizeOfLog2(lw - depth, lw - depth), per = 1 << depth;
+            for (int k = 0; k < per * per; ++k) {
+                const int px = miCol * 4 + treeX(k, depth) * t, py = miRow * 4 + treeY(k, depth) * t;
                 if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
                 loadLevels(0, px, py, t, t);
                 f(0, px >> 2, py >> 2, txSz);
@@ -752,7 +757,8 @@ struct TileCoder {
         const int size = lw > lh ? lw : lh;   // log2 of the larger side
         const int skip = bi.skip;
         const bool compound = bi.ref == 2;
-        const bool split = !skip && bi.txSplit;
+        const int depth = skip ? 0 : bi.txSplit;   // luma transform split depth (0..2)
+        const bool split = depth > 0;
         RefPair rp{fs->refName[bi.ref == 1 ? 1 : 0], compound ? fs->refName[1] : -1, compound};
         if (phase == 1) {   // block list only
             curOrder = sbOrder | blockIndex++;
@@ -778,11 +784,11 @@ struct TileCoder {
                     m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
                     m.mv[0] = bi.mv;
                     m.mv[1] = compound ? bi.mv2 : pf::Mv{0, 0};
-                    m.txW = (uint8_t)(imin(lw, 6) - split);
-                    m.txH = (uint8_t)(imin(lh, 6) - split);
+                    m.txW = (uint8_t)(imin(lw, 6) - depth);
+                    m.txH = (uint8_t)(imin(lh, 6) - depth);
                     m.order = curOrder;
                 }
-            if (!skip) forTransformAreas(miRow, miCol, lw, lh, split, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
+            if (!skip) forTransformAreas(miRow, miCol, lw, lh, depth, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
             return;
         }
         const pf::Mv target[2] = {bi.mv, bi.mv2};
@@ -892,17 +898,17 @@ struct TileCoder {
                 return (sqrUp != maxTx) * 3 + (4 - maxTx) * 6 + (aw2 < (1 << tw2)) + (lh2 < (1 << th2));
             };
             sym(ic->txfmSplit[txCtx(miRow, miCol, imin(lw, 6), imin(lh, 6))], split, 2);
-            if (split && size - 1 > 2) {   // children of 4x4 code nothing; depth 1 children code txfm_split = 0
+            if (split && size - 1 > 2) {   // depth 1 children (not 4x4) code txfm_split; depth 2 leaves code nothing
                 const int half = 1 << (size - 3);
                 for (int k = 0; k < 4; k++) {
                     const int r = miRow + (k >> 1) * half, c = miCol + (k & 1) * half;
                     if (r >= fs->miRows || c >= fs->miCols) continue;
-                    sym(ic->txfmSplit[txCtx(r, c, size - 1, size - 1)], 0, 2);
+                    sym(ic->txfmSplit[txCtx(r, c, size - 1, size - 1)], depth == 2, 2);
                 }
             }
         }
         if (skip) return;
-        forTransforms(miRow, miCol, lw, lh, split, [&](int p, int x4, int y4, int t) { coeffs(p, x4, y4, t, 4 * bw4, 4 * bh4); });
+        forTransforms(miRow, miCol, lw, lh, depth, [&](int p, int x4, int y4, int t) { coeffs(p, x4, y4, t, 4 * bw4, 4 * bh4); });
     }
 
     // Phase 3: the partition symbol of a node.
