@@ -150,3 +150,10 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Result: video_2 +80.5% → +59.1%, video_1 +18.6% (unchanged within noise). An end-point difference was tried
   first and failed on video_2, whose cuts make short mini-GOPs (+77.3%).
 
+### Motion search range (step 2 diagnostics)
+
+- video_2 BD-rate by coarse search radius: 32 px +65.1%, 64 +59.1%, 96 +57.6%, 128 +56.5%, 192 +55.4%. Fast motion
+  ran past the old ±64 / ±96 window. The quarter-resolution search now allows R up to 48 (±192 px), the new
+  default (`AV1GPU_PF_RANGE` overrides it). Cost: coarse search 0.6 → 4.8 ms per 1080p frame. video_1: +18.9%
+  (+18.6% before, within noise).
+

@@ -168,7 +168,7 @@ __global__ void downsample4(const uint8_t *src, int pitch, int w, int h, uint8_t
 
 // Exhaustive search of 8x8 blocks on the quarter-resolution luma (32x32 full-resolution areas).
 constexpr int kCoarseWarps = 4;
-constexpr int kCoarseMaxR = 24;
+constexpr int kCoarseMaxR = 48;
 __global__ void coarseSearch(const uint8_t *cur, const uint8_t *ref, int dw, int dh, int R, int cols, int rows,
                              float lambda, Mv *out) {
     __shared__ uint8_t win[kCoarseWarps][(8 + 2 * kCoarseMaxR) * (8 + 2 * kCoarseMaxR)];

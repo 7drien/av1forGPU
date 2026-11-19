@@ -42,7 +42,7 @@ struct BlockInfo {
 struct Settings {
     int qindex = 100;
     float lambdaMul = 0.7f;
-    int searchRange = 64;    // full-pel coarse search radius
+    int searchRange = 192;   // full-pel coarse search radius (quarter-resolution search, at most 192)
     float rnd = 0.40f, zbin = 0.70f;
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
