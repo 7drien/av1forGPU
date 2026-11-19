@@ -41,8 +41,8 @@ The `av1gpu-framehdr` utility writes a reduced still-picture key-frame header OB
 The supported inter subset:
 
 - **Frames:** single-tile by default (uniform tiles optional), 64×64 superblocks, `enable_order_hint = 0`. Each mini-GOP is a pyramid of hidden ALTREF and middle frames, displayed with `show_existing_frame`. A filtered ALTREF is displayed through an overlay frame instead.
-- **Blocks:** square partitions from 64×64 to 8×8. Each block is single-reference (LAST or ALTREF) or a COMPOUND_AVERAGE of both. Modes are NEAREST, NEAR, GLOBAL and NEW, with their compound forms. Vectors use quarter-sample precision and the regular eight-tap filter.
-- **Residuals:** TX_MODE_LARGEST, with DCT_DCT from 8×8 to 64×64 and `reduced_tx_set`.
+- **Blocks:** square partitions from 64×64 to 8×8, plus HORZ/VERT partitions of 16×16 to 64×64 nodes. Each block is single-reference (LAST or ALTREF) or a COMPOUND_AVERAGE of both. Modes are NEAREST, NEAR, GLOBAL and NEW, with their compound forms. Vectors use quarter-sample precision and the regular eight-tap filter.
+- **Residuals:** TX_MODE_SELECT. DCT_DCT transforms equal to the block (square or 2:1, up to 64×64), or one level of luma transform split for square blocks, with `reduced_tx_set`.
 - **Filters:** deblocking and CDEF, with one CDEF strength per frame.
 - **CDFs:** frame-end CDFs are kept per reference slot for `primary_ref_frame`.
 
@@ -52,7 +52,7 @@ Pipeline (`encoder/apps/pframe.cu`, `pframe_tile.cuh`, `pframe_writer.h`):
 2. **Search (GPU):** a quarter-resolution coarse search, then per-size refinement on the phase planes, then the LAST / ALTREF / compound choice.
 3. **Evaluation (GPU):** exact prediction, forward DCT, quantization, an AV1-context rate estimate, and an exact inverse transform. Bottom-up partition decisions, then commit of the reconstruction and levels.
 4. **Filters (GPU):** deblocking and CDEF searches on the reconstruction.
-5. **Entropy coding:** the tile coder runs on a CPU writer thread overlapped with the GPU (default), or on the GPU with one thread per tile. The host writes the frame header and OBUs.
+5. **Entropy coding (GPU + host):** on a separate stream, one thread per superblock builds decode-order block lists. One thread per block then fills mode info and coefficient-context maps, chooses inter modes from the motion-vector candidate list (costs from the default CDFs, so blocks are independent), and emits symbol records with exact contexts. A host writer thread range-codes the records, which is the one inherently serial step. The all-GPU option range-codes on the GPU instead. The host writes the frame header and OBUs.
 6. **Rate control (host):** one quantizer per period, adjusted by the measured bits.
 
 Every feature is validated by decoding with dav1d and comparing to the encoder reconstruction. Full-clip streams are also cross-checked with libaom and NVDEC.
@@ -61,7 +61,7 @@ Every feature is validated by decoding with dav1d and comparing to the encoder r
 
 Done: CUDA motion search with per-block vectors, a hidden-ALTREF pyramid with compound prediction, rate control, in-loop filters, GPU and overlapped CPU entropy coding, and BD-rate tooling (`tests/compare.py`). Remaining gaps relative to SVT-AV1 preset 8:
 
-1. Rectangular and 4×N partitions, and transform split (TX_MODE_SELECT).
+1. 4×N, 4:1 and AB partitions, and deeper transform split.
 2. Intra blocks in inter frames. These need a wavefront for neighbor reconstruction.
 3. Switchable interpolation filters, inter transform types other than DCT_DCT, OBMC and warped motion.
 4. Broader input formats and audio/container support, once the elementary video path is stable.

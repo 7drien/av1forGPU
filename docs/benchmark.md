@@ -62,25 +62,37 @@ Same RTX 3060 Ti and clip. The rate-quality points come from `python3 tests/comp
 
 | qindex | kbit/s | PSNR (dB) |
 | ---: | ---: | ---: |
-| 40 | 2637.6 | 55.50 |
-| 80 | 824.4 | 50.77 |
-| 120 | 470.0 | 47.96 |
-| 160 | 261.5 | 45.26 |
+| 40 | 2506.0 | 56.06 |
+| 80 | 785.3 | 51.32 |
+| 120 | 454.2 | 48.73 |
+| 160 | 260.8 | 45.79 |
 
 BD-rate of `--pframes` (negative is better):
 
 | Against | BD-rate |
 | --- | ---: |
-| This encoder at the start of the inter work (`--inter-qindex`, rolling reference) | −79.0% |
-| SVT-AV1 preset 12 | −11.2% |
-| SVT-AV1 preset 8 | +72.5% |
-| libaom `cpu-used 8` | +112.9% |
+| This encoder at the start of the inter work (`--inter-qindex`, rolling reference) | −81.8% |
+| SVT-AV1 preset 12 | −25.4% |
+| SVT-AV1 preset 8 | +45.7% |
+| libaom `cpu-used 8` | +79.4% |
+
+Contributions measured on the way (BD-rate against SVT-AV1 preset 8): transform split +72.5% → +54.1%, then rectangular partitions → +45.5%.
 
 Full 1,207-frame clip, piped from FFmpeg as in the commands above:
 
 | Mode | Wall time | Frames/s | Output |
 | --- | ---: | ---: | ---: |
-| `--pframes --persistent-cdf --qindex 100` | 20.5 s | 59.9 | 3,477,442 bytes |
-| `--pframes --persistent-cdf --bitrate 600` | 20.0 s | 61.4 | 3,007,951 bytes (598.1 kbit/s) |
+| `--pframes --persistent-cdf --qindex 100` | 29.8 s | 41.1 | 3,322,332 bytes |
+| `--pframes --persistent-cdf --bitrate 600` | 29.6 s | 41.3 | 3,017,131 bytes (599.9 kbit/s) |
 
-dav1d, libaom and NVDEC (`av1_cuvid`) decoded both streams to byte-identical output (1,207 frames). P-frame GPU time is about 8 ms per frame: refinement 5.3 ms, evaluation 2.0 ms, coarse search 0.6 ms. Filters add about 2 ms. Entropy coding runs concurrently on the CPU.
+dav1d, libaom and NVDEC (`av1_cuvid`) decoded both streams to byte-identical output (1,207 frames).
+
+Entropy paths on the first 120 frames (identical output in every case):
+
+| qindex | `--pf-cpu-entropy` | default (GPU modeling, host range coder) | `--pf-gpu-entropy` |
+| ---: | ---: | ---: | ---: |
+| 100 | 45.0 fps | 45.4 fps | 42.3 fps |
+| 40 | 43.1 fps | 44.2 fps | 26.8 fps |
+| 1 | 38.7 fps | 41.5 fps | 19.4 fps |
+
+The all-GPU range coder is a single serial thread per tile, so it trails at high bitrates. Symbol modeling, the parallel part, runs on the GPU in every mode except `--pf-cpu-entropy`.

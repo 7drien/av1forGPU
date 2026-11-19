@@ -68,13 +68,14 @@ The single-frame analysis tool accepts exactly one tightly packed, 8-bit planar 
 
 Per frame, CUDA does the following:
 
-- **Motion search:** for each reference, an exhaustive quarter-resolution search, then a per-block full-pel and quarter-sample search on exact AV1 interpolation phase planes. Square blocks from 64×64 to 8×8 each carry their own vector.
+- **Motion search:** for each reference, an exhaustive quarter-resolution search, then a per-block full-pel and quarter-sample search on exact AV1 interpolation phase planes. Square blocks from 64×64 to 8×8 and rectangular HORZ/VERT halves (64×32 down to 16×8) each carry their own vector.
 - **Prediction:** each block uses LAST, ALTREF, or their compound average.
-- **Residuals:** a quantized DCT with a transform the size of the block (8×8 to 64×64), with skip, coded and split decisions made by rate-distortion cost.
+- **Residuals:** a quantized DCT the size of the block (up to 64×64, rectangular for rectangular blocks), or four half-size luma transforms (TX_MODE_SELECT transform split). Partition, skip and transform choices are made by rate-distortion cost.
 - **Loop filtering:** deblocking and CDEF with levels chosen by measured error.
+- **Entropy modeling:** parallel kernels build the mode info and coefficient contexts, choose NEAREST/NEAR/NEW modes from the AV1 motion-vector candidate list, and emit compact symbol records with exact contexts.
 - **Reconstruction:** decoder-exact, so it can serve as a reference picture.
 
-The AV1 tile syntax is one `__host__ __device__` coder (`encoder/apps/pframe_tile.cuh`). By default a writer thread runs it on the CPU from pinned-memory copies of the decisions, overlapped with the GPU analysis of later frames. `--pf-gpu-entropy` instead codes each AV1 tile in its own CUDA thread. That is slower here and needs many tiles, which cost about 5% in size. `--pf-tiles C R` sets log2 tile columns and rows.
+A writer thread range-codes the GPU's symbol records and writes the stream, overlapped with the GPU's work on later frames. `--pf-gpu-entropy` also runs the range coder on the GPU (one warp per tile, on a low-priority stream). `--pf-cpu-entropy` runs every entropy phase on the CPU. All three produce identical bitstreams; the default is the fastest at every bitrate tested. `--pf-tiles C R` sets log2 tile columns and rows.
 
 ```sh
 ffmpeg -hide_banner -loglevel error -i benckmark/video_1.mp4 -map 0:v:0 \
@@ -89,9 +90,9 @@ Options:
 - `--persistent-cdf` carries adapted probabilities between frames through each reference slot.
 - `--pf-tf-frames K` enables a GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display. Off by default: no gain on the sample clip.
 - `--pf-rdoq` enables greedy rate-distortion optimized quantization. Off by default: no gain on the sample clip.
-- `--pf-no-filters` turns off in-loop filtering.
+- `--pf-no-filters` turns off in-loop filtering. `--pf-no-tx-split` and `--pf-no-rect` turn off transform split and rectangular partitions.
 
-On the 1,207-frame sample clip this path runs at about 60 fps on an RTX 3060 Ti, including FFmpeg's H.264 decode. Its output decodes byte-identically with dav1d, libaom and the GPU's NVDEC AV1 decoder. See [docs/benchmark.md](docs/benchmark.md) for rate-quality results.
+On the 1,207-frame sample clip this path runs at about 41 fps on an RTX 3060 Ti, including FFmpeg's H.264 decode. Its output decodes byte-identically with dav1d, libaom and the GPU's NVDEC AV1 decoder. See [docs/benchmark.md](docs/benchmark.md) for rate-quality results.
 
 ### Native temporal prediction (earlier experimental modes)
 
