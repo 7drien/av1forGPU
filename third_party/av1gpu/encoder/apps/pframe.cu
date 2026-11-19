@@ -209,23 +209,39 @@ __global__ void verticalPhases(const int16_t *hp, int w, int h, uint8_t *out) {
     out[(size_t(phase) * h + y) * w + x] = (uint8_t)min(max(round2(s, 11), 0), 255);
 }
 
+// Lanes cooperating on one block: 8 for 8x8 blocks (4 blocks per warp), else the whole warp.
+template <int N> struct Grp {
+    static constexpr int G = N == 8 ? 8 : 32;
+    __device__ static int lane() { return threadIdx.x & (G - 1); }
+    __device__ static unsigned mask() {
+        return G == 32 ? 0xffffffffu : ((1u << G) - 1) << ((threadIdx.x & 31) & ~(G - 1));
+    }
+    __device__ static int sum(int v) {
+        const unsigned m = mask();
+#pragma unroll
+        for (int o = G / 2; o; o >>= 1) v += __shfl_xor_sync(m, v, o);
+        return v;
+    }
+};
+
 template <int N>
-__device__ __forceinline__ int warpSadPlane(const uint8_t *src, int pitch, const uint8_t *plane, int w, int h, int x0,
-                                            int y0, int dx, int dy) {
+__device__ __forceinline__ int groupSadPlane(const uint8_t *src, int pitch, const uint8_t *plane, int w, int h, int x0,
+                                             int y0, int dx, int dy) {
     constexpr int L = N == 8 ? 3 : N == 16 ? 4 : N == 32 ? 5 : 6;
-    const int lane = threadIdx.x & 31;
+    constexpr int G = Grp<N>::G;
+    const int lane = Grp<N>::lane();
     int s = 0;
     const bool inside = x0 + dx >= 0 && y0 + dy >= 0 && x0 + dx + N <= w && y0 + dy + N <= h && x0 + N <= w && y0 + N <= h;
     if (inside) {
         const uint8_t *p = plane + size_t(y0 + dy) * w + x0 + dx;
         const uint8_t *q = src + size_t(y0) * pitch + x0;
 #pragma unroll 4
-        for (int i = lane; i < N * N; i += 32) {
+        for (int i = lane; i < N * N; i += G) {
             const int r = i >> L, c = i & (N - 1);
             s += abs((int)q[r * pitch + c] - (int)p[r * w + c]);
         }
     } else {
-        for (int i = lane; i < N * N; i += 32) {
+        for (int i = lane; i < N * N; i += G) {
             const int r = i >> L, c = i & (N - 1);
             const int x = x0 + c, y = y0 + r;
             if (x >= w || y >= h) continue;
@@ -233,7 +249,26 @@ __device__ __forceinline__ int warpSadPlane(const uint8_t *src, int pitch, const
             s += abs((int)src[y * pitch + x] - (int)plane[size_t(ry) * w + rx]);
         }
     }
-    return warp_sumi(s);
+    return Grp<N>::sum(s);
+}
+
+// SAD against source samples cached in registers (sv[k] = sample lane + k * G of the block, N <= 32).
+template <int N>
+__device__ __forceinline__ int groupSadCached(const uint8_t *sv, const uint8_t *src, int pitch, const uint8_t *plane,
+                                              int w, int h, int x0, int y0, int dx, int dy) {
+    constexpr int L = N == 8 ? 3 : N == 16 ? 4 : 5;
+    constexpr int G = Grp<N>::G, PL = N * N / G;
+    const int lane = Grp<N>::lane();
+    const bool inside = x0 + dx >= 0 && y0 + dy >= 0 && x0 + dx + N <= w && y0 + dy + N <= h && x0 + N <= w && y0 + N <= h;
+    if (!inside) return groupSadPlane<N>(src, pitch, plane, w, h, x0, y0, dx, dy);
+    const uint8_t *p = plane + size_t(y0 + dy) * w + x0 + dx;
+    int s = 0;
+#pragma unroll
+    for (int k = 0; k < PL; k++) {
+        const int i = lane + k * G, r = i >> L, c = i & (N - 1);
+        s += abs((int)sv[k] - (int)p[r * w + c]);
+    }
+    return Grp<N>::sum(s);
 }
 
 // Per-size motion refinement from coarse, parent, temporal and zero candidates: full-pel search, then half
@@ -241,6 +276,7 @@ __device__ __forceinline__ int warpSadPlane(const uint8_t *src, int pitch, const
 template <int N>
 struct RefineCfg {
     static constexpr int warps = N >= 64 ? 2 : N >= 32 ? 4 : 8;
+    static constexpr int per() { return warps * 32 / (N == 8 ? 8 : 32); }   // blocks per CTA
 };
 template <int N>
 __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int refIdx, const uint8_t *phases,
@@ -248,14 +284,13 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
                                                                   const Cand *parent, int pcols,
                                                                   const BlockInfo *temporal, int tcols, Cand *out,
                                                                   int cols, int rows, float lambda) {
-    constexpr int W = RefineCfg<N>::warps;
-    const int warp = threadIdx.x >> 5;
-    const int b = blockIdx.x * W + warp;
+    constexpr int PER = RefineCfg<N>::warps * 32 / Grp<N>::G;   // blocks per CTA
+    const int b = blockIdx.x * PER + threadIdx.x / Grp<N>::G;
     if (b >= cols * rows) return;
     const int bx = b % cols, by = b / cols, x0 = bx * N, y0 = by * N;
     Cand &o = out[b];
     if (x0 >= f.w || y0 >= f.h) {
-        if ((threadIdx.x & 31) == 0) { o.mvR[refIdx] = Mv{0, 0}; o.costR[refIdx] = kInf; o.bitsR[refIdx] = 0.f; }
+        if (Grp<N>::lane() == 0) { o.mvR[refIdx] = Mv{0, 0}; o.costR[refIdx] = kInf; o.bitsR[refIdx] = 0.f; }
         return;
     }
     const uint8_t *src = f.src[0];
@@ -282,9 +317,22 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
         pred = p.mvR[refIdx];
     }
     if (temporal) add(temporal[(y0 / 8) * tcols + x0 / 8].mv);
+    constexpr int CL = N <= 32 ? N * N / Grp<N>::G : 1;   // cached source samples per lane
+    uint8_t sv[CL];
+    if constexpr (N <= 32) {
+        constexpr int L = N == 8 ? 3 : N == 16 ? 4 : 5;
+#pragma unroll
+        for (int k = 0; k < CL; k++) {
+            const int i = Grp<N>::lane() + k * Grp<N>::G, r = i >> L, c = i & (N - 1);
+            sv[k] = (x0 + c < f.w && y0 + r < f.h) ? src[(y0 + r) * pitch + x0 + c] : 0;
+        }
+    }
     auto costOf = [&](Mv m) {
         const int ph = (((2 * m.row) & 15) >> 2) * 4 + (((2 * m.col) & 15) >> 2);
-        const int s = warpSadPlane<N>(src, pitch, phases + ph * planeSize, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
+        const uint8_t *plane = phases + ph * planeSize;
+        int s;
+        if constexpr (N <= 32) s = groupSadCached<N>(sv, src, pitch, plane, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
+        else s = groupSadPlane<N>(src, pitch, plane, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
         return (float)s + lambda * mvBits(m, pred);
     };
     Mv bm{0, 0};
@@ -306,7 +354,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
         for (int k = 0; k < 9; k++)
             if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)});
     }
-    if ((threadIdx.x & 31) == 0) {
+    if (Grp<N>::lane() == 0) {
         o.mvR[refIdx] = bm;
         o.costR[refIdx] = bc;
         o.bitsR[refIdx] = mvBits(bm, pred);
@@ -318,10 +366,10 @@ template <int N>
 __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) chooseInter(Frame f, int refCount, const uint8_t *phases0,
                                                                        const uint8_t *phases1, Cand *cand, int cols,
                                                                        int rows, float lambda, float compoundBias) {
-    constexpr int W = RefineCfg<N>::warps;
     constexpr int L = N == 8 ? 3 : N == 16 ? 4 : N == 32 ? 5 : 6;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b = blockIdx.x * W + warp;
+    constexpr int G = Grp<N>::G, PER = RefineCfg<N>::warps * 32 / G;
+    const int lane = Grp<N>::lane();
+    const int b = blockIdx.x * PER + threadIdx.x / G;
     if (b >= cols * rows) return;
     Cand &c = cand[b];
     const int x0 = (b % cols) * N, y0 = (b / cols) * N;
@@ -336,7 +384,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) chooseInter(Frame f,
         const uint8_t *p1 = phases1 + ((((2 * m1.row) & 15) >> 2) * 4 + (((2 * m1.col) & 15) >> 2)) * planeSize;
         const int dx0 = m0.col >> 3, dy0 = m0.row >> 3, dx1 = m1.col >> 3, dy1 = m1.row >> 3;
         int sad = 0;
-        for (int i = lane; i < N * N; i += 32) {
+        for (int i = lane; i < N * N; i += G) {
             const int r = i >> L, col = i & (N - 1);
             const int x = x0 + col, y = y0 + r;
             if (x >= f.w || y >= f.h) continue;
@@ -344,7 +392,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) chooseInter(Frame f,
             const int bb = p1[size_t(min(max(y + dy1, 0), f.h - 1)) * f.w + min(max(x + dx1, 0), f.w - 1)];
             sad += abs((int)f.src[0][y * f.pitch[0] + x] - ((a + bb + 1) >> 1));
         }
-        sad = warp_sumi(sad);
+        sad = Grp<N>::sum(sad);
         const float cc = (float)sad + lambda * (c.bitsR[0] + c.bitsR[1] + compoundBias);
         if (c1 < c0 && c1 <= cc) { choice = 1; bits = c.bitsR[1] + 1.0f; }
         else if (cc < c0) { choice = 2; bits = c.bitsR[0] + c.bitsR[1] + compoundBias; }
@@ -941,7 +989,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8)>>>(refs[r], w, h, s->hphase);
         verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases[r]);
 #define PF_REFINE(K, N)                                                                                         \
-    refine<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                      \
+    refine<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::per() - 1) / RefineCfg<N>::per(),                       \
                 32 * RefineCfg<N>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
                                             K == 3 ? 0 : s->cols[K + 1], temporal, s->gcols, s->cand[K], s->cols[K],  \
                                             s->rows[K], lambdaSad)
@@ -952,7 +1000,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #undef PF_REFINE
     }
 #define PF_CHOOSE(K, N)                                                                                         \
-    chooseInter<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                 \
+    chooseInter<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::per() - 1) / RefineCfg<N>::per(),                  \
                      32 * RefineCfg<N>::warps>>>(f, refCount, s->phases[0], s->phases[1], s->cand[K], s->cols[K], \
                                                  s->rows[K], lambdaSad, st.compoundBias)
     PF_CHOOSE(3, 64);
