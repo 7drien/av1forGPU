@@ -206,4 +206,10 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - `--pf-cut-preset NAME` sets the scene-cut key-frame preset (default base; turbo: +54.0%, about 7% faster).
 - Remaining per-frame cost on video_2 (60 frames): GPU analysis ~33 ms per inter frame (coarse 5, refine 7, evaluation
   24), filters 5 ms, key frames ~200 ms each (28% of the time with 5 key frames in 60 frames).
+- Depth-2 split search (16 transforms per square block) runs only for blocks whose depth-1 split beat the whole
+  transform (`AV1GPU_PF_D2MARGIN`, default 1.0): evaluation about 33 → 31 ms, same BD-rate (+53.3%).
+- Tried and reverted: a two-level coarse search (eighth resolution then quarter resolution) cut the coarse stage from
+  5.3 to 0.8 ms but cost 1.4 to 1.6 points of BD-rate on video_2.
+- Per inter frame on video_2: GPU work about 38 ms (analysis 30, filters 5, entropy modeling 3) against about 49 ms of
+  wall time; key frames about 200 ms each. The remaining speed is in CPU / GPU serialization and key frames.
 

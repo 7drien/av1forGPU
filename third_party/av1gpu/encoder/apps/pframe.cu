@@ -602,6 +602,7 @@ struct EvalArgs {
     uint8_t *types1, *types2, *types3;
     float *subD, *subR;          // split-external: per block and split transform (4 depth-1, then 16 depth-2)
     uint8_t *subNz, *subType;
+    float d2Margin;              // depth-2 split search only when depth 1 beats the whole transform by this factor
     int reducedTxSet;   // reduced_tx_set: luma types limited to IDTX / DCT_DCT
     int switchable;     // is_filter_switchable: choose the interpolation filter per block
     float filterBias;   // scale of the SMOOTH / SHARP bit estimate
@@ -1081,20 +1082,32 @@ struct SplitGeo {   // split-external evaluation: split transforms per block and
     static constexpr int sw = sq ? BW / 2 : (BW > BH ? BW / 2 : BW), sh = sq ? BH / 2 : (BW > BH ? BH : BH / 2);
 };
 template <int BW, int BH>
-__global__ void __launch_bounds__(128) evalSplit(EvalArgs a) {
+__global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     using G = SplitGeo<BW, BH>;
     constexpr int NSUB = G::nsub, SA = G::sw * G::sh;   // largest split transform area
     __shared__ int16_t resS[4][SA], bkS[4][SA], qS[4][SA];
     __shared__ uint8_t pqS[4][SA], rqS[4][SA];
     __shared__ float tmpS[4][(G::sw + 1) * G::sh];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // dsel 0: every split transform; 1: depth 1 only; 2: depth 2 only, for blocks whose depth 1 beat the whole
+    // transform by a.d2Margin (the others get an infinite depth-2 cost)
+    const int per0 = dsel == 1 ? (G::sq ? 4 : 2) : dsel == 2 ? 16 : NSUB, off0 = dsel == 2 ? 4 : 0;
     const int idx = blockIdx.x * 4 + warp;
-    if (idx >= a.cols * a.rows * NSUB) return;
-    const int b = idx / NSUB, k = idx % NSUB;
+    if (idx >= a.cols * a.rows * per0) return;
+    const int b = idx / per0, k = off0 + idx % per0;
     const Cand &c = a.cand[b];
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
+    if (dsel == 2) {
+        float d1 = 0.f, r1 = 0.f;
+        for (int j = 0; j < 4; j++) { d1 += a.subD[size_t(b) * NSUB + j]; r1 += a.subR[size_t(b) * NSUB + j]; }
+        const float j0 = c.lumaD + a.lambda * c.lumaBits, j1 = d1 + a.lambda * (r1 + 1.f);
+        if (!(j1 < a.d2Margin * j0)) {
+            if (!lane) { a.subD[size_t(b) * NSUB + k] = kInf; a.subR[size_t(b) * NSUB + k] = 0.f; a.subNz[size_t(b) * NSUB + k] = 0; a.subType[size_t(b) * NSUB + k] = 0; }
+            return;
+        }
+    }
     // square: depth 1 (k 0..3) or depth 2 (k 4..19) quadrants; rectangle: the two halves along the longer side
     const int d = k < 4 ? 1 : 2, kk = k < 4 ? k : k - 4, per = 1 << d;
     const int lsw = G::sq ? Log2<BW>::v - d : Log2<G::sw>::v, lsh = G::sq ? Log2<BH>::v - d : Log2<G::sh>::v;
@@ -2328,6 +2341,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
     ea.rdoq = st.rdoq;
+    ea.d2Margin = getenv("AV1GPU_PF_D2MARGIN") ? (float)atof(getenv("AV1GPU_PF_D2MARGIN")) : 1.0f;
     static const bool splitExternal = !getenv("AV1GPU_PF_INKERNEL") ;
     ea.reducedTxSet = st.txTypes == 1;
     ea.switchable = st.switchableFilter;
@@ -2346,7 +2360,11 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     if (ea.recon2 && splitExternal) {                                                                          \
         const int nb = s->cols[K] * s->rows[K];                                                                \
         { FineTimer t1_("eval whole " #N); evaluate<N, N, true><<<(nb + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps, 32 * EvalCfg<N, N>::warps>>>(ea); } \
-        { FineTimer t2_("eval split " #N); evalSplit<N, N><<<(nb * SplitGeo<N, N>::nsub + 3) / 4, 128>>>(ea); }  \
+        { FineTimer t2_("eval split " #N);                                                                     \
+          if (N >= 16) {                                                                                       \
+              evalSplit<N, N><<<(nb * 4 + 3) / 4, 128>>>(ea, 1);                                                \
+              evalSplit<N, N><<<(nb * 16 + 3) / 4, 128>>>(ea, 2);                                               \
+          } else evalSplit<N, N><<<(nb * SplitGeo<N, N>::nsub + 3) / 4, 128>>>(ea, 0); }                       \
         { FineTimer t3_("eval final " #N); evalFinal<N, N><<<(nb + 3) / 4, 128>>>(ea); }                        \
     } else                                                                                                     \
         evaluate<N, N><<<(s->cols[K] * s->rows[K] + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps,             \
@@ -2365,9 +2383,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     { FineTimer ft_("evaluate " #BW "x" #BH);                                                                   \
     const int nb = s->rcols[RK] * s->rrows[RK];                                                                \
     if (ea.recon2 && splitExternal) {                                                                          \
-        evaluate<BW, BH, true><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps, 32 * EvalCfg<BW, BH>::warps>>>(ea); \
-        evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(ea);                                 \
-        evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(ea);                                                          \
+        { FineTimer t1_("eval whole " #BW "x" #BH); evaluate<BW, BH, true><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps, 32 * EvalCfg<BW, BH>::warps>>>(ea); } \
+        { FineTimer t2_("eval split " #BW "x" #BH); evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(ea, 0); } \
+        { FineTimer t3_("eval final " #BW "x" #BH); evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(ea); }             \
     } else                                                                                                     \
         evaluate<BW, BH><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,                           \
                            32 * EvalCfg<BW, BH>::warps>>>(ea); }
