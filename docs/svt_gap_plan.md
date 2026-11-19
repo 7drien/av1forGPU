@@ -159,3 +159,28 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Motion-vector bits in the evaluation's RD cost were weighted 0.25; 0.5 is the new default (video_2 +55.4% → +54.5%,
   1.0: +56.3%; video_1 +18.8%).
 
+### T4: order hints and temporal motion vector prediction
+
+- Stage A: `--pframes` streams set `enable_order_hint` (7 bits) and `enable_ref_frame_mvs`; key frames carry
+  `order_hint` (base encoder, `av1g_set_video_order_hint`), inter frames `order_hint`, `ref_order_hint[]` (error
+  resilient mode), `frame_refs_short_signaling`, `use_ref_frame_mvs` and `skip_mode_present` when skip mode is
+  allowed. Extra-search candidates from references in the other direction are negated (RefFrameSignBias).
+- Stage B (`--persistent-cdf`; `--pf-no-tmvp` disables it): each referenced frame's motion field is stored per slot
+  from the decisions grid (7.19), the host projects it for the next frame (7.9, sequential: last writer wins), the
+  tile coder adds the temporal candidates (7.10.2.5 / 7.10.2.6) in all three entropy paths, and the GPU motion search
+  uses the block's projected vector as a start point and a second predictor. Bit-exact with dav1d and libaom.
+- Gain on video_2: +54.1% → +53.7%. 79% of blocks still code NEWMV: the search returns the SAD-optimal vector, which
+  rarely equals a candidate. A snap-to-neighbour pass (same-shape neighbours) did not help (+1.5% bytes); a mode
+  refinement on the final partition with the real candidate lists is the next step for vector bits.
+
+### Edge bug fixed (present since before this plan)
+
+- Frames whose last superblock row or column is partly outside the frame by more than the forced split size
+  (1080 rows: 56 visible rows; 64x16 / 64x32 blocks crossing the bottom) lost coefficient rows in `commit`: it looked up
+  the decisions grid at cells outside the frame, which are empty, and zeroed those levels. The stream decoded, but the
+  decoder's pictures drifted from the encoder's references. Now out-of-frame samples use the block of the last inside
+  cell. `tests/check_pframes.py` has 448x184 cases (56 visible rows) that fail without the fix.
+- `--pf-no-filters` streams did not decode since slow-preset key frames (enable_cdef in the sequence header without
+  CDEF parameters in inter frames); fixed.
+- After the fixes: video_2 +53.6% against SVT-AV1 preset 8 (+60.0% against libaom), video_1 +18.4% (+44.2%).
+

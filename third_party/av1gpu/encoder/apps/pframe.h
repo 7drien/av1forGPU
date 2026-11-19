@@ -74,6 +74,8 @@ struct EntropyIn {
     bool reducedTxSet = true;
     bool lrLuma = false;        // luma Wiener loop restoration (parameters in the grid)
     int signBias[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // RefFrameSignBias by reference frame
+    bool useTmvp = false;                // use_ref_frame_mvs
+    const Mv *motionField = nullptr;     // MotionFieldMvs[8][MiRows / 2][MiCols / 2] (host memory, used during the call)
     bool switchableFilter = false;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
@@ -117,6 +119,12 @@ public:
                 char *err, int errLen);
     // Copy the last frame's decisions and levels into host buffers (pinned memory recommended).
     int download(BlockInfo *info, int16_t *levels, char *err, int errLen);
+    // Copy the decisions grid only (after filter(): includes the loop restoration fields).
+    int downloadGrid(BlockInfo *info, char *err, int errLen);
+    // Projected motion field (MotionFieldMvs[8][MiRows / 2][MiCols / 2]) for the next analyze(): its candidates join
+    // the motion search. refName: AV1 reference of analyze()'s refs[0..2].
+    int setMotionField(const Mv *field, const int refName[3], char *err, int errLen);
+    int gridCols() const { return aw / 8; }
     size_t gridCount() const { return size_t(aw / 8) * (ah / 8); }
     size_t levelCount() const { return size_t(aw) * ah * 3 / 2; }
     // Deblocking and CDEF of the last analyzed frame's reconstruction (in place), choosing levels by SSE.

@@ -130,6 +130,7 @@ struct FrameSyntax {
     int switchable;       // is_filter_switchable
     int lrLuma;           // FrameRestorationType[0] = RESTORE_WIENER (64-sample units)
     int signBias[8];      // RefFrameSignBias by reference frame (order hints)
+    int useTmvp;          // use_ref_frame_mvs: temporal candidates from the projected motion field
     int width, height;    // FrameWidth, FrameHeight
     int miRows, miCols, aw, ah, gcols;
 };
@@ -178,6 +179,7 @@ struct TileCoder {
     // frame
     const FrameSyntax *fs;
     const pf::BlockInfo *grid;
+    const pf::Mv *mf;        // MotionFieldMvs[ref 0..7][MiRows / 2][MiCols / 2] (use_ref_frame_mvs), row -32768: none
     const int16_t *levels;   // spatial layout of the aligned planes
     MiInfo *mi;              // frame-sized mode info (this tile writes its own area)
     // tile
@@ -395,6 +397,48 @@ struct TileCoder {
             for (int k = s.num; k < 2; ++k) s.mv[k][0] = pf::Mv{0, 0};
         }
     }
+    // ---- temporal candidates (spec 7.10.2.5 / 7.10.2.6); global motion is zero ----
+    AV1G_HDI void addTpl(Stack &s, int miRow, int miCol, int dr, int dc, const RefPair &rp) {
+        const int mvRow = (miRow + dr) | 1, mvCol = (miCol + dc) | 1;
+        if (!inside(mvRow, mvCol)) return;
+        const int w8 = fs->miCols >> 1, h8 = fs->miRows >> 1, x8 = mvCol >> 1, y8 = mvRow >> 1;
+        const bool centre = dr == 0 && dc == 0;
+        if (centre) s.zeroMvCtx = 1;
+        pf::Mv c0 = mf[(size_t(rp.r0) * h8 + y8) * w8 + x8];
+        if (c0.row == -32768) return;
+        pf::Mv c1{0, 0};
+        if (rp.compound) {
+            c1 = mf[(size_t(rp.r1) * h8 + y8) * w8 + x8];
+            if (c1.row == -32768) return;
+            c1 = lowerPrecision(c1);
+        }
+        c0 = lowerPrecision(c0);
+        if (centre)
+            s.zeroMvCtx = iabs(c0.row) >= 16 || iabs(c0.col) >= 16 || (rp.compound && (iabs(c1.row) >= 16 || iabs(c1.col) >= 16));
+        int idx = 0;
+        for (; idx < s.num; ++idx)
+            if (mvEq(c0, s.mv[idx][0]) && (!rp.compound || mvEq(c1, s.mv[idx][1]))) break;
+        if (idx < s.num) {
+            s.weight[idx] += 2;
+        } else if (s.num < kStack) {
+            s.mv[s.num][0] = c0;
+            if (rp.compound) s.mv[s.num][1] = c1;
+            s.weight[s.num] = 2;
+            s.num++;
+        }
+    }
+    AV1G_HDI void temporalScan(Stack &s, int miRow, int miCol, int bw4, int bh4, const RefPair &rp) {
+        const int stepW4 = bw4 >= 16 ? 4 : 2, stepH4 = bh4 >= 16 ? 4 : 2;
+        for (int dr = 0; dr < imin(bh4, 16); dr += stepH4)
+            for (int dc = 0; dc < imin(bw4, 16); dc += stepW4) addTpl(s, miRow, miCol, dr, dc, rp);
+        if (bh4 >= 2 && bh4 < 16 && bw4 >= 2 && bw4 < 16) {
+            const int pos[3][2] = {{bh4, -2}, {bh4, bw4}, {bh4 - 2, bw4}};
+            for (int i = 0; i < 3; ++i) {
+                const int row = (miRow & 15) + pos[i][0], col = (miCol & 15) + pos[i][1];
+                if (row >= 0 && row < 16 && col >= 0 && col < 16) addTpl(s, miRow, miCol, pos[i][0], pos[i][1], rp);
+            }
+        }
+    }
     AV1G_HDI void findMvStack(Stack &s, int miRow, int miCol, int bw4, int bh4, const RefPair &rp) {
         s.num = 0; s.newCount = 0;
         s.foundMatch = false;
@@ -410,6 +454,7 @@ struct TileCoder {
         const int numNearest = s.num, numNew = s.newCount;
         for (int i = 0; i < numNearest; ++i) s.weight[i] += kRefCatLevel;
         s.zeroMvCtx = 0;
+        if (fs->useTmvp) temporalScan(s, miRow, miCol, bw4, bh4, rp);
         s.foundMatch = false;
         scanPoint(s, miRow, miCol, -1, -1, rp);
         if (s.foundMatch) foundAbove = true;

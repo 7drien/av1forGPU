@@ -61,6 +61,8 @@ struct Frame {
     int pitch[3];
     const uint8_t *ref[kMaxRefs];
     int w, h, aw, ah;
+    const Mv *tmv[kMaxRefs];   // projected motion field of each reference (8x8 cells, w8 per row), or null
+    int w8, h8;
 };
 
 __device__ __forceinline__ int round2(int x, int n) { return (x + (1 << (n - 1))) >> n; }
@@ -343,6 +345,20 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
         pred = pc.mvR[refIdx];
     }
     if (temporal) add(temporal[(y0 / 8) * tcols + x0 / 8].mv);
+    // the decoder's temporal candidate at the block's first 8x8 (use_ref_frame_mvs): a search start and a second
+    // predictor, so vectors equal to it cost what NEAREST / NEAR costs
+    Mv tpred{0, 0};
+    bool hasT = false;
+    if (f.tmv[refIdx] && y0 / 8 < f.h8 && x0 / 8 < f.w8) {
+        Mv t = f.tmv[refIdx][(y0 / 8) * f.w8 + x0 / 8];
+        if (t.row != -32768) {
+            if (t.row & 1) t.row += t.row > 0 ? -1 : 1;
+            if (t.col & 1) t.col += t.col > 0 ? -1 : 1;
+            tpred = t;
+            hasT = true;
+            add(t);
+        }
+    }
     constexpr int CL = BW * BH <= 1024 ? BW * BH / GR::G : 1;   // cached source samples per lane
     uint8_t sv[CL];
     if constexpr (BW * BH <= 1024) {
@@ -361,7 +377,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
             sad = groupSadCached<BW, BH>(sv, src, pitch, plane, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
         else
             sad = groupSadPlane<BW, BH>(src, pitch, plane, f.w, f.h, x0, y0, m.col >> 3, m.row >> 3);
-        return (float)sad + lambda * mvBits(m, pred);
+        return (float)sad + lambda * (hasT ? fminf(mvBits(m, pred), mvBits(m, tpred)) : mvBits(m, pred));
     };
     Mv bm{0, 0};
     float bc = kInf;
@@ -382,12 +398,15 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
         for (int k = 0; k < 9; k++)
             if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)});
     }
+    if (hasT) tryMv(tpred);
     if (GR::lane() == 0) {
         o.mvR[refIdx] = bm;
         o.costR[refIdx] = bc;
-        o.bitsR[refIdx] = mvBits(bm, pred);
+        o.bitsR[refIdx] = hasT ? fminf(mvBits(bm, pred), mvBits(bm, tpred)) : mvBits(bm, pred);
     }
 }
+
+
 
 // Choose single reference 0, single reference 1, or their compound average by SAD + motion cost on the phase planes.
 template <int BW, int BH>
@@ -1204,7 +1223,10 @@ __global__ void commit(CommitArgs a) {
     const int p = blockIdx.z, sub = p > 0;
     const int apw = a.aw >> sub, aph = a.ah >> sub;
     if (x >= apw || y >= aph) return;
-    const BlockInfo bi = a.grid[((y << sub) >> 3) * a.gcols + ((x << sub) >> 3)];
+    // samples beyond the frame (aligned area) belong to the block covering the last row / column of cells: their levels
+    // are coefficients of transforms that start inside the frame (the grid is only filled inside the frame)
+    const int gyc = min((y << sub) >> 3, (a.h + 7) / 8 - 1), gxc = min((x << sub) >> 3, (a.w + 7) / 8 - 1);
+    const BlockInfo bi = a.grid[gyc * a.gcols + gxc];
     const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
     const int s = bi.log2 - 3;
     const int shape = !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
@@ -1275,6 +1297,7 @@ __global__ void planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int 
 struct TileJob {
     pft2::FrameSyntax fs;
     const BlockInfo *grid;
+    const pf::Mv *mf;
     const int16_t *levels;
     pft2::MiInfo *mi;
     pft2::EntropyState *frameInit;       // default CDFs: symbol cdf ids and mode-choice costs
@@ -1321,6 +1344,7 @@ __device__ __host__ inline void setupCoder(pft2::TileCoder &t, const TileJob &j,
     tileOfSb(j, miRow, miCol, tr, tc);
     t.fs = &j.fs;
     t.grid = j.grid;
+    t.mf = j.mf;
     t.levels = j.levels;
     t.mi = j.mi;
     t.rowStart = j.rowStart[tr]; t.rowEnd = j.rowStart[tr + 1];
@@ -1678,6 +1702,8 @@ struct EntropySlot {
     int *error = nullptr;
     uint32_t *tileCount = nullptr;
     pft2::SymRec *recs = nullptr;    // records-only mode output
+    pf::Mv *mf = nullptr;            // motion field of the frame (use_ref_frame_mvs)
+    std::vector<pf::Mv> mfHost;      // staging copy (the caller's buffer may change before the upload runs)
     bool recordsOnly = false;
     cudaEvent_t staged = nullptr, done = nullptr;
     cudaStream_t fetch = nullptr;
@@ -1708,6 +1734,7 @@ struct State {
     bool tablesReady = false;
     void *pfScratch = nullptr;
     uint8_t *work = nullptr, *cdefOut = nullptr;
+    Mv *mfDev = nullptr; bool mfSet = false; int mfNames[kMaxRefs] = {1, 7, 6};
     float *lrCoef = nullptr; int8_t *lrQ = nullptr; unsigned long long *lrSse = nullptr; uint8_t *lrOut = nullptr;
     int lrUnitRows = 1, lrUnitCols = 1;
     unsigned long long *sse = nullptr;
@@ -1771,6 +1798,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->pfScratch);
     cudaFree(s->work);
     cudaFree(s->cdefOut);
+    cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
     cudaFree(s->sse);
     cudaFree(s->hphase);
@@ -1778,7 +1806,7 @@ Analyzer::~Analyzer() {
                     (void *)s->tileStats, (void *)s->ecBuf})
         cudaFree(p);
     for (auto &es : s->eslot) {
-        cudaFree(es.grid); cudaFree(es.levels); cudaFree(es.tileOut); cudaFree(es.packed); cudaFree(es.sizes); cudaFree(es.error); cudaFree(es.tileCount); cudaFree(es.recs);
+        cudaFree(es.grid); cudaFree(es.levels); cudaFree(es.tileOut); cudaFree(es.packed); cudaFree(es.sizes); cudaFree(es.error); cudaFree(es.tileCount); cudaFree(es.recs); cudaFree(es.mf);
         if (es.staged) cudaEventDestroy(es.staged);
         if (es.done) cudaEventDestroy(es.done);
         if (es.fetch) cudaStreamDestroy(es.fetch);
@@ -1864,6 +1892,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc((uint8_t **)&s->pfScratch, av1g_gpu_pf_scratch_size(&fp));
         alloc(&s->work, frame);
         alloc(&s->cdefOut, frame);
+        alloc(&s->mfDev, sizeof(Mv) * 8 * size_t((w + 7) >> 3) * ((h + 7) >> 3));
         s->lrUnitRows = std::max((h + 32) / 64, 1); s->lrUnitCols = std::max((w + 32) / 64, 1);
         const int nu = s->lrUnitRows * s->lrUnitCols;
         alloc(&s->lrCoef, sizeof(float) * 6 * nu); alloc(&s->lrQ, 6 * nu);
@@ -1910,6 +1939,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         for (auto &es : s->eslot) alloc(&es.recs, sizeof(pft2::SymRec) * s->recCap);
         for (auto &es : s->eslot) {
             alloc(&es.grid, gridCount() * sizeof(BlockInfo));
+            alloc(&es.mf, sizeof(pf::Mv) * 8 * size_t(miRows / 2) * (miCols / 2));
             alloc(&es.levels, levelCount() * sizeof(int16_t));
             alloc(&es.tileOut, s->ecCap * 2);
             alloc(&es.packed, s->ecCap * 2);
@@ -1975,6 +2005,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     Frame f{};
     for (int p = 0; p < 3; p++) { f.src[p] = src[p]; f.pitch[p] = pitch[p]; }
     for (int r = 0; r < refCount; r++) f.ref[r] = refs[r];
+    f.w8 = (w + 7) >> 3; f.h8 = (h + 7) >> 3;
+    for (int r = 0; r < refCount; r++) f.tmv[r] = s->mfSet ? s->mfDev + size_t(s->mfNames[r]) * f.h8 * f.w8 : nullptr;
+    s->mfSet = false;
     f.w = w; f.h = h; f.aw = aw; f.ah = ah;
     const float lambda = gp_lambda<8>(st.qindex, st.lambdaMul);
     const float lambdaSad = sqrtf(lambda);
@@ -2201,6 +2234,13 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.switchable = in.switchableFilter;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
     for (int k = 0; k < 8; k++) j.fs.signBias[k] = in.signBias[k];
+    j.fs.useTmvp = in.useTmvp && in.motionField;
+    j.mf = es.mf;
+    if (j.fs.useTmvp && e == cudaSuccess) {
+        const size_t n = 8 * size_t(miRows / 2) * (miCols / 2);
+        es.mfHost.assign(in.motionField, in.motionField + n);
+        e = cudaMemcpyAsync(es.mf, es.mfHost.data(), n * sizeof(pf::Mv), cudaMemcpyHostToDevice, s->entStream);
+    }
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2342,6 +2382,27 @@ int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLe
     return entropyLaunch(in, 0, err, errLen) ? -1 : entropyFetch(0, out, err, errLen);
 }
 
+int Analyzer::setMotionField(const Mv *field, const int refName[3], char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    const size_t n = 8 * size_t((w + 7) >> 3) * ((h + 7) >> 3);
+    const cudaError_t e = cudaMemcpy(s->mfDev, field, n * sizeof(Mv), cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "motion field upload: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    for (int r = 0; r < kMaxRefs; r++) s->mfNames[r] = refName[r];
+    s->mfSet = true;
+    return 0;
+}
+int Analyzer::downloadGrid(BlockInfo *info, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    const cudaError_t e = cudaMemcpy(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "grid download: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
 int Analyzer::download(BlockInfo *info, int16_t *levels, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     cudaError_t e = cudaMemcpy(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
@@ -2439,6 +2500,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.switchable = in.switchableFilter;
     fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
     for (int k = 0; k < 8; k++) fs.signBias[k] = in.signBias[k];
+    fs.useTmvp = in.useTmvp && in.motionField;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
     pft2::EntropyState &init = s->init;
@@ -2451,6 +2513,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     const int nSb = sbCols * sbRows;
     j.fs = fs;
     j.grid = grid;
+    j.mf = in.motionField;
     j.levels = levels;
     j.mi = s->mi.data();
     j.frameInit = &init;

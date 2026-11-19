@@ -5,6 +5,7 @@
 #include "pframe.h"
 #include "pframe_writer.h"
 #include "av1g/av1g.h"
+#include "pframe_mf.h"
 
 #include <cuda_runtime.h>
 
@@ -89,6 +90,10 @@ int main(int argc, char **argv) {
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
     int pfLrFrames = 0;
+    bool pfTmvp = true;          // temporal motion vector candidates (--pf-no-tmvp)
+    pfm::MotionField mfield;
+    std::vector<pf::BlockInfo> mfGrid;
+    int mfHints[8] = {0}, mfHint = 0;   // OrderHints / OrderHint of the frame being coded (for the storage)
     constexpr int kOrderHintBits = 7;   // --pframes streams: enable_order_hint with 7-bit hints
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -228,6 +233,8 @@ int main(int argc, char **argv) {
             pfCutQoffset = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pf-no-adaptive")) {
             pfAdaptive = false;
+        } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
+            pfTmvp = false;
         } else if (!strcmp(argv[i], "--pf-no-lr")) {
             pfLr = false;
         } else if (!strcmp(argv[i], "--pf-fast")) {
@@ -437,6 +444,7 @@ int main(int argc, char **argv) {
     GpEncoder encoder;
     std::string err;
     if (usePframes && !kfPresetSet) apply_preset(cfg, "slow");   // key frames carry much of the quality (--kf-preset)
+    if (usePframes && !pfFilters) cfg.fCdef = 0;   // enable_cdef follows the inter frames (they code no CDEF params)
     if (usePframes && pfFilters) {
         // keyframes: deblocking and CDEF searches; enable_cdef = 1 in the sequence header lets P frames use CDEF
         cfg.fLf = 2;
@@ -447,6 +455,8 @@ int main(int argc, char **argv) {
     if (usePframes) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+        mfield.init(2 * ((w + 7) >> 3), 2 * ((h + 7) >> 3), kOrderHintBits);
+        mfGrid.resize(pfAnalyzer.gridCount());
         const int sbCols = (w + 63) / 64, sbRows = (h + 63) / 64;
         // one tile compresses best; the tile coder runs off the critical path, overlapped with later analysis
         (void)sbCols; (void)sbRows;
@@ -510,6 +520,7 @@ int main(int argc, char **argv) {
             pfw::FrameParams fp;
             int buf = -1, slot0 = 0, outSlot = 8, showSlot = 0;
             std::vector<uint8_t> raw;
+            std::vector<pf::Mv> mf;   // projected motion field (kept with the job for the CPU entropy path)
             pf::EntropyOut tiles;
             bool endTU = false, resetSlots = false;
             uint64_t pts = 0;
@@ -658,6 +669,18 @@ int main(int argc, char **argv) {
             if (pfRefs < 3 || slot1 < 0) slot2 = -1;
             const uint8_t *refs[3] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr, slot2 >= 0 ? slotBuf[slot2] : nullptr};
             const int refCount = slot2 >= 0 ? 3 : slot1 >= 0 ? 2 : 1;
+            if (persistentCdf && pfTmvp) {
+                // projected motion field of this frame: the motion search aims at its candidates, the tile coder uses it
+                int rs[7];
+                for (int r = 0; r < 7; ++r) rs[r] = slot0;
+                if (slot1 >= 0) rs[pfw::ALTREF_FRAME - 1] = slot1;
+                if (slot2 >= 0) rs[pfw::ALTREF2_FRAME - 1] = slot2;
+                int oh[8] = {0};
+                for (int r = 0; r < 7; ++r) oh[r + 1] = slotHint[rs[r]];
+                const pf::Mv *field = mfield.estimate(rs, oh, int(frameOrder & ((1u << kOrderHintBits) - 1)));
+                const int names[3] = {pfw::LAST_FRAME, pfw::ALTREF_FRAME, pfw::ALTREF2_FRAME};
+                if (pfAnalyzer.setMotionField(field, names, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+            }
             pf::Settings st = pfSettings;
             st.qindex = qindex;
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
@@ -711,6 +734,18 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 8; ++k) fp.slotHint[k] = slotHint[k];
             for (int r = 0; r < 7; ++r)   // RefFrameSignBias for the tile coder's motion vector candidates
                 ein.signBias[r + 1] = pfw::relDist(slotHint[fp.refSlot[r]], fp.orderHint, kOrderHintBits) > 0;
+            int orderHints[8] = {0};
+            for (int r = 0; r < 7; ++r) orderHints[r + 1] = slotHint[fp.refSlot[r]];
+            for (int r = 0; r < 8; ++r) mfHints[r] = orderHints[r];
+            mfHint = fp.orderHint;
+            // temporal motion vector candidates (use_ref_frame_mvs needs error_resilient_mode = 0)
+            if (persistentCdf && pfTmvp) {
+                const pf::Mv *field = mfield.out.data();   // estimated before the analysis
+                job.mf.assign(field, field + mfield.out.size());
+                ein.useTmvp = true;
+                ein.motionField = job.mf.data();
+                fp.useRefFrameMvs = true;
+            }
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
             for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];
@@ -770,6 +805,11 @@ int main(int argc, char **argv) {
             if (outSlot < 8) {
                 slotValid[outSlot] = persistentCdf;
                 slotHint[outSlot] = int(frameOrder & ((1u << kOrderHintBits) - 1));
+                if (persistentCdf && pfTmvp) {
+                    if (pfAnalyzer.downloadGrid(mfGrid.data(), perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+                    const int names[3] = {pfw::LAST_FRAME, pfw::ALTREF_FRAME, pfw::ALTREF2_FRAME};
+                    mfield.store(outSlot, mfGrid.data(), pfAnalyzer.gridCols(), names, mfHints, mfHint);
+                }
                 std::swap(slotBuf[outSlot], spare);
             }
             return 0;
@@ -936,6 +976,7 @@ int main(int argc, char **argv) {
                 for (int k = 0; k < 8; ++k)
                     if (cudaMemcpy(slotBuf[k], reference, frameBytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
                 for (auto &v : slotValid) v = false;
+                mfield.keyFrame();
                 pfAnalyzer.resetTemporal();
                 dump(slotBuf[0]);
                 lastShown = 0;
