@@ -1175,41 +1175,118 @@ __global__ void packRecords(TileJob j) {
     const uint32_t src = j.sbOffset[e], dst = j.packOff[e], n = j.sbCount[e];
     for (uint32_t i = 0; i < n; i++) j.packed[dst + i] = j.recs[src + i];
 }
-// One CTA of one warp per tile: the warp prefetches records into shared memory, lane 0 range-codes them with the tile's
-// CDFs in shared memory.
-__global__ void __launch_bounds__(32) tileCode(TileJob j) {
+// Two warps per tile. Warp 0 gathers 32 records at a time and turns them into range-coder intervals: lanes whose
+// records share a CDF form a group (__match_any_sync) whose leader adapts that CDF in record order, so distinct
+// contexts adapt in parallel. Warp 1 lane 0 range-codes the previous chunk's intervals meanwhile (double buffer).
+struct CodeIv { uint16_t fl, fh; uint8_t s, n, type, pad; };
+constexpr int kCodeChunk = 256;
+__global__ void __launch_bounds__(64) tileCode(TileJob j) {
     __shared__ pft2::EntropyState es;
-    __shared__ pft2::SymRec buf[32];
-    const int t = blockIdx.x, lane = threadIdx.x;
+    __shared__ pft2::SymRec buf[kCodeChunk];
+    __shared__ CodeIv iv[2][kCodeChunk];
+    __shared__ int ivCount[2];
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     if (t >= j.tileCols * j.tileRows) return;
-    if (*j.error) { if (!lane) j.sizes[t] = -1; return; }
+    if (*j.error) { if (!tid) j.sizes[t] = -1; return; }
     {
         const uint32_t *src = reinterpret_cast<const uint32_t *>(j.coderInit);
         uint32_t *dst = reinterpret_cast<uint32_t *>(&es);
-        for (int i = lane; i < int(sizeof(es) / 4); i += 32) dst[i] = src[i];
+        for (int i = tid; i < int(sizeof(es) / 4); i += 64) dst[i] = src[i];
     }
-    __syncwarp();
+    if (!tid) ivCount[0] = ivCount[1] = 0;
+    __syncthreads();
     av1g_ec ec;
-    if (!lane) av1g_ec_init(&ec, j.ecBuf + j.ecCapPerTile * t, (uint32_t)j.ecCapPerTile);
+    if (tid == 32) av1g_ec_init(&ec, j.ecBuf + j.ecCapPerTile * t, (uint32_t)j.ecCapPerTile);
     const int tc = t % j.tileCols, tr = t / j.tileCols;
     uint16_t *base = reinterpret_cast<uint16_t *>(&es);
-    for (int r = j.rowStart[tr]; r < j.rowStart[tr + 1]; r += 16)
-        for (int c = j.colStart[tc]; c < j.colStart[tc + 1]; c += 16) {
+    // producer cursor (warp 0, warp-uniform): superblock position, entry, record
+    int r = j.rowStart[tr], c = j.colStart[tc];
+    uint32_t b = 0, k = 0, last = 0;
+    bool started = false, finished = false;
+    auto nextSegment = [&]() -> bool {   // advance to a non-empty segment; false at the end of the tile
+        for (;;) {
+            if (started) {
+                if (++b >= j.entryCount[(r / 16) * j.sbCols + c / 16]) {
+                    b = 0;
+                    c += 16;
+                    if (c >= j.colStart[tc + 1]) { c = j.colStart[tc]; r += 16; }
+                }
+            }
+            started = true;
+            if (r >= j.rowStart[tr + 1]) return false;
             const int sb = (r / 16) * j.sbCols + c / 16;
-            for (uint32_t b = 0; b < j.entryCount[sb]; b++) {
-                const uint32_t first = j.sbOffset[sb * 64 + b], last = first + j.sbCount[sb * 64 + b];
-                for (uint32_t k = first; k < last; k += 32) {
-                    if (k + lane < last) buf[lane] = j.recs[k + lane];
-                    __syncwarp();
-                    if (!lane) {
-                        const uint32_t m = min(32u, last - k);
-                        for (uint32_t i = 0; i < m; i++) pft2::codeRecord(&ec, base, buf[i]);
+            if (b >= j.entryCount[sb]) continue;
+            k = j.sbOffset[sb * 64 + b];
+            last = k + j.sbCount[sb * 64 + b];
+            if (k < last) return true;
+        }
+    };
+    for (int step = 0;; step++) {
+        const int cur = step & 1;
+        if (warp == 0) {
+            int n = 0;
+            while (!finished && n < kCodeChunk) {
+                if (k >= last && !nextSegment()) { finished = true; break; }
+                const int take = min(kCodeChunk - n, int(last - k));
+                for (int q = lane; q < take; q += 32) buf[n + q] = j.recs[k + q];
+                k += take;
+                n += take;
+            }
+            __syncwarp();
+            for (int s0 = 0; s0 < n; s0 += 32) {
+              if (s0 + lane < n) {
+                const pft2::SymRec rec = buf[s0 + lane];
+                const int type = rec.kind >> 5;
+                const uint32_t key = (type == 0 || type == 2) ? rec.cdf : 0x10000u + lane;
+                const unsigned grp = __match_any_sync(__activemask(), key);
+                if (lane == __ffs(grp) - 1) {
+                    for (unsigned m = grp; m; m &= m - 1) {
+                        const int i = s0 + __ffs(m) - 1;
+                        const pft2::SymRec q = buf[i];
+                        const int ty = q.kind >> 5, nn = q.kind & 31;
+                        CodeIv o;
+                        o.type = uint8_t(ty);
+                        o.pad = 0;
+                        if (ty == 0) {
+                            uint16_t *cdf = base + q.cdf;
+                            o.fl = uint16_t(q.sym > 0 ? 32768u - cdf[q.sym - 1] : 32768u);   // 32768 wraps to 0
+                            o.fh = uint16_t(32768u - cdf[q.sym]);
+                            o.s = q.sym; o.n = uint8_t(nn);
+                            if (q.sym == 0) o.pad = 1;   // fl == 32768
+                            av1g_update_cdf(cdf, q.sym, nn);
+                        } else if (ty == 2) {
+                            o.fl = uint16_t(av1g_split_or_psum(base + q.cdf, q.sym));
+                            o.fh = 0; o.s = 1; o.n = 2;
+                        } else if (ty == 1) {
+                            o.fl = q.sym ? 16384 : 0; o.pad = q.sym ? 0 : 1;
+                            o.fh = q.sym ? 0 : 16384; o.s = q.sym; o.n = 2;
+                        } else {
+                            o.fl = 0; o.fh = 0; o.s = q.sym; o.n = uint8_t(nn);
+                        }
+                        iv[cur][i] = o;
                     }
-                    __syncwarp();
+                }
+              }
+              __syncwarp();
+            }
+            if (!lane) ivCount[cur] = n;
+        } else if (tid == 32 && step > 0) {
+            const int prev = cur ^ 1, n = ivCount[prev];
+            for (int i = 0; i < n; i++) {
+                const CodeIv o = iv[prev][i];
+                if (o.type == 3) {
+                    for (int q = o.n - 1; q >= 0; q--) av1g_ec_bool(&ec, (o.s >> q) & 1);
+                } else {
+                    av1g_ec_encode_q15(&ec, o.pad ? 32768u : o.fl, o.fh, o.s, o.n);
                 }
             }
         }
-    if (!lane) {
+        __syncthreads();
+        const int produced = ivCount[cur];
+        __syncthreads();
+        if (produced == 0) break;   // the previous chunk is coded and nothing is left
+    }
+    if (tid == 32) {
         const int n = av1g_ec_done(&ec, j.out + j.ecCapPerTile * t);
         j.sizes[t] = n;
         if (n < 0) atomicMax(j.error, 6);
@@ -1874,7 +1951,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
         }
         return 0;
     }
-    tileCode<<<nTiles, 32, 0, st>>>(j);
+    tileCode<<<nTiles, 64, 0, st>>>(j);
     emark(4);
     if (s->profile) {
         cudaEventSynchronize(s->eev[4]);
