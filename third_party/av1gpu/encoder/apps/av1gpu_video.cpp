@@ -90,6 +90,7 @@ int main(int argc, char **argv) {
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
     int pfLrFrames = 0;
+    bool pfCutPreset = true;    // base-preset scene-cut key frames (--pf-slow-cuts keeps the main preset)
     bool pfTmvp = true;          // temporal motion vector candidates (--pf-no-tmvp)
     pfm::MotionField mfield;
     std::vector<pf::BlockInfo> mfGrid;
@@ -235,6 +236,8 @@ int main(int argc, char **argv) {
             pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
             pfTmvp = false;
+        } else if (!strcmp(argv[i], "--pf-slow-cuts")) {
+            pfCutPreset = false;
         } else if (!strcmp(argv[i], "--pf-no-lr")) {
             pfLr = false;
         } else if (!strcmp(argv[i], "--pf-fast")) {
@@ -452,6 +455,19 @@ int main(int argc, char **argv) {
         pfCdef = true;
     }
     if (encoder.init(cfg, err)) { fprintf(stderr, "encoder init: %s\n", err.c_str()); return 1; }
+    // scene-cut key frames: base-preset speed knobs (they are frequent on cut-heavy content and short-lived), with the
+    // sequence-level tools of the main key-frame encoder so the sequence header stays valid
+    GpEncoder cutEncoder;
+    bool haveCut = false;
+    if (usePframes && pfCutPreset) {
+        GpConfig cc = cfg;
+        apply_preset(cc, "base");
+        cc.P.filterIntra = cfg.P.filterIntra;
+        cc.fLf = cfg.fLf;
+        cc.fCdef = cfg.fCdef;
+        if (cutEncoder.init(cc, err)) { fprintf(stderr, "encoder init: %s\n", err.c_str()); return 1; }
+        haveCut = true;
+    }
     if (usePframes) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
@@ -931,7 +947,8 @@ int main(int argc, char **argv) {
                                                    : pfQoffset;
                 }
                 const bool restoreQ = cutNow || keyOffset != pfQoffset;
-                if (restoreQ && encoder.setQindex(std::max(1, std::min(255, pfSettings.qindex - keyOffset)), err)) {
+                GpEncoder &ke = cutNow && haveCut ? cutEncoder : encoder;
+                if (restoreQ && ke.setQindex(std::max(1, std::min(255, pfSettings.qindex - keyOffset)), err)) {
                     fprintf(stderr, "key frame: %s\n", err.c_str());
                     return 1;
                 }
@@ -951,7 +968,7 @@ int main(int argc, char **argv) {
                 GpDevRecords records;
                 av1g_set_video_order_hint(kOrderHintBits, int(frameCount & ((1u << kOrderHintBits) - 1)));
                 for (int &v : slotHint) v = int(frameCount & ((1u << kOrderHintBits) - 1));
-                if (encoder.encode(inputs, frames, times, err, 0, &records)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+                if (ke.encode(inputs, frames, times, err, 0, &records)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
                 std::vector<std::vector<std::vector<uint8_t>>> tiles;
                 double entropyMs = 0;
                 int status = gp_entropy_dev(records, 0, scratch, tiles, &entropyMs, err);
@@ -968,7 +985,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 if (submit(std::move(kj))) return 1;
-                if (restoreQ && encoder.setQindex(targetKbps > 0 ? std::max(1, std::min(255, pfSettings.qindex - pfQoffset)) : cfg.qindex, err)) {
+                if (restoreQ && &ke == &encoder && encoder.setQindex(targetKbps > 0 ? std::max(1, std::min(255, pfSettings.qindex - pfQoffset)) : cfg.qindex, err)) {
                     fprintf(stderr, "scene cut: %s\n", err.c_str());
                     return 1;
                 }

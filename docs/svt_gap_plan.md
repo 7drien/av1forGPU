@@ -184,3 +184,15 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
   CDEF parameters in inter frames); fixed.
 - After the fixes: video_2 +53.6% against SVT-AV1 preset 8 (+60.0% against libaom), video_1 +18.4% (+44.2%).
 
+### Speed on video_2 (main benchmark)
+
+- Evaluation dominates (57 to 62 ms of about 75 ms per 1080p frame). Transform-type search: 28 ms of it.
+- Type screening by forward-transform magnitude, quantizer estimate for the best 3 only: 61.6 → 57.3 ms, BD-rate
+  unchanged (+53.8%). Deciding the depth first and searching types on that depth only did not help (the chosen depth
+  carries most of the search) and was reverted.
+- Scene-cut key frames use a second key-frame encoder with base-preset speed knobs (and the main encoder's
+  sequence-level tools): +53.8% → +54.1%, 9 to 10% faster (`--pf-slow-cuts` keeps the slow preset).
+- `--pf-fast`: +55.1%, 12 to 17 fps. SVT-AV1 preset 8: 32 to 34 fps on this clip.
+- Next: restructure evaluation (several warps per block or batched same-size transforms; one warp per 64x64 block
+  gives only about 500 warps per frame).
+
