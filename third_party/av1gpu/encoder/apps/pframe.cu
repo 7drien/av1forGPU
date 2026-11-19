@@ -1983,7 +1983,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     auto mark = [&](int i) { if (s->profile) cudaEventRecord(s->ev[i]); };
     mark(0);
     downsample4<<<gds, t16>>>(src[0], pitch[0], w, h, s->ds[0], s->dw, s->dh);
-    const int R = std::min(kCoarseMaxR, std::max(2, st.searchRange / 4));
+    const int searchRange = getenv("AV1GPU_PF_RANGE") ? atoi(getenv("AV1GPU_PF_RANGE")) : st.searchRange;
+    const int R = std::min(kCoarseMaxR, std::max(2, searchRange / 4));
     const int nCoarse = s->ccols * s->crows;
     for (int r = 0; r < refCount; r++) {
         downsample4<<<gds, t16>>>(refs[r], w, w, h, s->ds[1 + r], s->dw, s->dh);

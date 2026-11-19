@@ -83,11 +83,12 @@ int main(int argc, char **argv) {
     bool interRdoq = false;
     bool usePframes = false;
     pf::Settings pfSettings;
-    int pfQindex = 0, pfQoffset = 130, pfGop = 32, pfAltrefBoost = 128, pfLeafOffset = 0;
+    int pfQindex = 0, pfQoffset = 90, pfGop = 32, pfAltrefBoost = 128, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
     bool pfLr = true;     // luma Wiener loop restoration (--pf-no-lr disables it)
     int pfLrFrames = 0;
+    bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
     uint64_t pfCuts = 0;
     double pfSceneCut = 15.0;
     int pfCutQoffset = 60;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
@@ -221,6 +222,8 @@ int main(int argc, char **argv) {
             pfSceneCut = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--pf-cut-qoffset") && i + 1 < argc) {
             pfCutQoffset = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--pf-no-adaptive")) {
+            pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-lr")) {
             pfLr = false;
         } else if (!strcmp(argv[i], "--pf-fast")) {
@@ -827,6 +830,22 @@ int main(int argc, char **argv) {
                 }
             return nb ? sum / nb : 0.0;
         };
+        // --pf-adaptive: interpolate a setting between its static-content value (motion <= 0.3) and its moving-content
+        // value (motion >= 1.5); motion is the mean blockMeanDiff of consecutive frames (independent of GOP length)
+        auto adaptive = [&](double motion, double still, double moving) {
+            const double t = std::min(1.0, std::max(0.0, (motion - 0.3) / 1.2));
+            return still + (moving - still) * t;
+        };
+        auto motionOf = [&](const std::vector<uint8_t> *first, size_t from, size_t to) {   // pending[from..to]
+            double sum = 0;
+            int k = 0;
+            const std::vector<uint8_t> *prev = first;
+            for (size_t i = from; i <= to && i < pending.size(); ++i) {
+                if (prev && !prev->empty()) { sum += blockMeanDiff(*prev, pending[i]); ++k; }
+                prev = &pending[i];
+            }
+            return k ? sum / k : 0.0;
+        };
         // index of the first pending frame (< limit) that starts a new scene, or limit: a large change that is not
         // followed by a comparable one (sustained motion changes every frame)
         auto firstCut = [&](size_t limit) -> size_t {
@@ -852,8 +871,18 @@ int main(int argc, char **argv) {
             if (cutNow) ++pfCuts;
             if (frameCount == 0 || frameCount - lastKeyIndex >= keyInterval || cutNow) {
                 // scene-cut key frames sit closer to the inter-frame quality than periodic ones
-                if (cutNow && encoder.setQindex(std::max(1, pfSettings.qindex - pfCutQoffset), err)) {
-                    fprintf(stderr, "scene cut: %s\n", err.c_str());
+                // periodic key frames: the offset adapts to the change over the next mini-GOP (static content profits
+                // from a much better key frame, moving content does not)
+                int keyOffset = pfCutQoffset;
+                if (!cutNow) {
+                    readMore(size_t(G));
+                    const size_t last = std::min(pending.size(), size_t(G)) - 1;
+                    keyOffset = pfAdaptive && last ? (int)std::lround(adaptive(motionOf(nullptr, 0, last), pfQoffset + 40, pfQoffset))
+                                                   : pfQoffset;
+                }
+                const bool restoreQ = cutNow || keyOffset != pfQoffset;
+                if (restoreQ && encoder.setQindex(std::max(1, std::min(255, pfSettings.qindex - keyOffset)), err)) {
+                    fprintf(stderr, "key frame: %s\n", err.c_str());
                     return 1;
                 }
                 // keyframe
@@ -861,7 +890,6 @@ int main(int argc, char **argv) {
                 pending.erase(pending.begin());
                 if (!upload(raw, inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
                 prevFrame = raw;
-                const bool restoreQ = cutNow;
                 GpFrameIn in;
                 in.deviceRecon = reference;
                 in.W = w; in.H = h; in.aw = aw; in.ah = ah;
@@ -961,11 +989,15 @@ int main(int argc, char **argv) {
                 return k;
             };
             auto release = [&](int k) { if (k >= 0) freeSlots.push_back(k); };
+            // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
+            const double gopBoost = pfAdaptive && !prevFrame.empty()
+                                        ? adaptive(motionOf(&prevFrame, 0, n - 1), pfAltrefBoost, 60)
+                                        : pfAltrefBoost;
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
             auto qAt = [&](int depth) {
                 const double frac = depthMax ? 1.0 - double(depth) / depthMax : 1.0;
-                return std::max(1, (int)std::lround(pfSettings.qindex - pfAltrefBoost * frac));
+                return std::max(1, (int)std::lround(pfSettings.qindex - gopBoost * frac));
             };
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();

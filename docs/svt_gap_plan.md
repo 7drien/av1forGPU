@@ -138,3 +138,15 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
   skipped blocks). Temporal motion vector candidates (T4, order hints) and a finer motion search are the main
   missing pieces for this kind of content.
 
+### Content-adaptive quality allocation (video_2 as the main benchmark)
+
+- Sweeps on video_2: ALTREF boost 128 → 80 with key offset 90 gave +61.7%, boost 60 +61.3%, boost 40 +63.6%;
+  λ 0.5 +79.3%, GOP 16 +80.3%. The same fixed setting cost video_1 5 points (+23.3%): static content wants a strong
+  ALTREF boost and a much better key frame, moving content does not.
+- `--pf-adaptive` (default; `--pf-no-adaptive` disables it): motion = mean block-mean difference of consecutive
+  frames over the mini-GOP (video_1 0.05 to 0.16, video_2 2.2 to 5.6). The ALTREF boost goes from 128 (motion
+  <= 0.3) to 60 (motion >= 1.5); periodic key frames use the inter quantizer minus 130 (static) to 90 (moving), from a
+  one-mini-GOP lookahead. The base `--pf-qoffset` is now 90.
+- Result: video_2 +80.5% → +59.1%, video_1 +18.6% (unchanged within noise). An end-point difference was tried
+  first and failed on video_2, whose cuts make short mini-GOPs (+77.3%).
+
