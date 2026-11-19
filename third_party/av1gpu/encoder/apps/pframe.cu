@@ -26,10 +26,12 @@ constexpr int kFullPelPasses = 6;
 __constant__ int16_t c_filter[6][16][8];
 
 struct Cand {
-    Mv mv;
-    uint8_t ref;
+    Mv mvR[kMaxRefs];     // best vector per reference (search)
+    float costR[kMaxRefs], bitsR[kMaxRefs];
+    Mv mv, mv2;           // chosen prediction
+    uint8_t ref;          // 0, 1: single reference; 2: compound
     uint8_t nz;           // coded option has nonzero levels
-    float searchCost;     // SAD + motion cost of the selected vector
+    float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
 };
 
@@ -92,6 +94,42 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
         out[i] = (uint8_t)min(max(round2(s, 11), 0), 255);
     }
     __syncwarp();
+}
+
+// Exact AV1 compound-average prediction (spec 7.11.3.1 with InterRound1 = 7 and InterPostRound = 4):
+// Clip1(Round2(p0 + p1, 5)). hp holds w * h int16 values.
+__device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, int pw, int ph, int x0, int y0, int w,
+                                    int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out) {
+    const int lane = threadIdx.x & 31;
+    const int fh = w <= 4 ? 4 : 0, fv = h <= 4 ? 4 : 0;
+    const int lastX = pw - 1, lastY = ph - 1;
+    const int ih = h + 7;
+    for (int k = 0; k < 2; k++) {
+        const uint8_t *ref = k ? ref1 : ref0;
+        const Mv mv = k ? mv1 : mv0;
+        const int X = (x0 << 4) + ((2 * mv.col) >> sub);
+        const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
+        const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
+        for (int i = lane; i < ih * w; i += 32) {
+            const int r = i / w, c = i - r * w;
+            const uint8_t *row = ref + min(max(iy + r - 3, 0), lastY) * pw;
+            int s = 0;
+#pragma unroll
+            for (int t = 0; t < 8; t++) s += c_filter[fh][fx][t] * row[min(max(ix + c + t - 3, 0), lastX)];
+            tmp[i] = (int16_t)round2(s, 3);
+        }
+        __syncwarp();
+        for (int i = lane; i < w * h; i += 32) {
+            const int r = i / w, c = i - r * w;
+            int s = 0;
+#pragma unroll
+            for (int t = 0; t < 8; t++) s += c_filter[fv][fy][t] * tmp[(r + t) * w + c];
+            const int v = round2(s, 7);
+            if (!k) hp[i] = (int16_t)v;
+            else out[i] = (uint8_t)min(max(round2(hp[i] + v, 5), 0), 255);
+        }
+        __syncwarp();
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -214,7 +252,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
     const int bx = b % cols, by = b / cols, x0 = bx * N, y0 = by * N;
     Cand &o = out[b];
     if (x0 >= f.w || y0 >= f.h) {
-        if (refIdx == 0 && (threadIdx.x & 31) == 0) { o = Cand{}; o.searchCost = kInf; }
+        if ((threadIdx.x & 31) == 0) { o.mvR[refIdx] = Mv{0, 0}; o.costR[refIdx] = kInf; o.bitsR[refIdx] = 0.f; }
         return;
     }
     const uint8_t *src = f.src[0];
@@ -237,8 +275,8 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
     Mv pred = center;
     if (parent) {
         const Cand &p = parent[(y0 / (2 * N)) * pcols + x0 / (2 * N)];
-        add(p.mv);
-        pred = p.mv;
+        add(p.mvR[refIdx]);
+        pred = p.mvR[refIdx];
     }
     if (temporal) add(temporal[(y0 / 8) * tcols + x0 / 8].mv);
     auto costOf = [&](Mv m) {
@@ -266,11 +304,53 @@ __global__ void __launch_bounds__(32 * RefineCfg<N>::warps) refine(Frame f, int 
             if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * step), (int16_t)(c0.col + (k % 3 - 1) * step)});
     }
     if ((threadIdx.x & 31) == 0) {
-        if (refIdx == 0 || bc + lambda * 1.5f < o.searchCost) {
-            o.mv = bm;
-            o.ref = (uint8_t)refIdx;
-            o.searchCost = bc + (refIdx ? lambda * 1.5f : 0.f);
+        o.mvR[refIdx] = bm;
+        o.costR[refIdx] = bc;
+        o.bitsR[refIdx] = mvBits(bm, pred);
+    }
+}
+
+// Choose single reference 0, single reference 1, or their compound average by SAD + motion cost on the phase planes.
+template <int N>
+__global__ void __launch_bounds__(32 * RefineCfg<N>::warps) chooseInter(Frame f, int refCount, const uint8_t *phases0,
+                                                                       const uint8_t *phases1, Cand *cand, int cols,
+                                                                       int rows, float lambda, float compoundBias) {
+    constexpr int W = RefineCfg<N>::warps;
+    constexpr int L = N == 8 ? 3 : N == 16 ? 4 : N == 32 ? 5 : 6;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int b = blockIdx.x * W + warp;
+    if (b >= cols * rows) return;
+    Cand &c = cand[b];
+    const int x0 = (b % cols) * N, y0 = (b / cols) * N;
+    int choice = 0;
+    float bits = c.bitsR[0];
+    if (refCount > 1 && x0 < f.w && y0 < f.h) {
+        // reference signalling: about one more bit for the second reference, two for compound
+        const float c0 = c.costR[0], c1 = c.costR[1] + lambda * 1.0f;
+        const Mv m0 = c.mvR[0], m1 = c.mvR[1];
+        const size_t planeSize = size_t(f.w) * f.h;
+        const uint8_t *p0 = phases0 + ((((2 * m0.row) & 15) >> 2) * 4 + (((2 * m0.col) & 15) >> 2)) * planeSize;
+        const uint8_t *p1 = phases1 + ((((2 * m1.row) & 15) >> 2) * 4 + (((2 * m1.col) & 15) >> 2)) * planeSize;
+        const int dx0 = m0.col >> 3, dy0 = m0.row >> 3, dx1 = m1.col >> 3, dy1 = m1.row >> 3;
+        int sad = 0;
+        for (int i = lane; i < N * N; i += 32) {
+            const int r = i >> L, col = i & (N - 1);
+            const int x = x0 + col, y = y0 + r;
+            if (x >= f.w || y >= f.h) continue;
+            const int a = p0[size_t(min(max(y + dy0, 0), f.h - 1)) * f.w + min(max(x + dx0, 0), f.w - 1)];
+            const int bb = p1[size_t(min(max(y + dy1, 0), f.h - 1)) * f.w + min(max(x + dx1, 0), f.w - 1)];
+            sad += abs((int)f.src[0][y * f.pitch[0] + x] - ((a + bb + 1) >> 1));
         }
+        sad = warp_sumi(sad);
+        const float cc = (float)sad + lambda * (c.bitsR[0] + c.bitsR[1] + compoundBias);
+        if (c1 < c0 && c1 <= cc) { choice = 1; bits = c.bitsR[1] + 1.0f; }
+        else if (cc < c0) { choice = 2; bits = c.bitsR[0] + c.bitsR[1] + compoundBias; }
+    }
+    if (!lane) {
+        c.ref = (uint8_t)choice;
+        c.mv = choice == 1 ? c.mvR[1] : c.mvR[0];
+        c.mv2 = c.mvR[1];
+        c.mvBits = bits;
     }
 }
 
@@ -318,6 +398,7 @@ struct EvalArgs {
     int16_t *levels;          // per-size tile-layout levels (aligned planes)
     int qindex, qctx;
     float lambda, rnd, zbin;
+    float mvWeight;
 };
 
 // Evaluate skip and coded options of every block of size N.
@@ -328,6 +409,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
     constexpr bool coded = N <= 32;
     constexpr int TN = coded ? N : 1, TC = coded ? NC : 1;
     __shared__ int16_t interp[W][(N + 7) * N];
+    __shared__ int16_t hpS[W][N * N];
     __shared__ uint8_t predS[W][N * N + 2 * NC * NC];
     __shared__ uint8_t recS[W][coded ? N * N : 1];
     __shared__ int16_t resS[W][TN * TN];
@@ -343,7 +425,8 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; }
         return;
     }
-    const uint8_t *ref = c.ref ? f.ref[1] : f.ref[0];
+    const uint8_t *ref = c.ref == 1 ? f.ref[1] : f.ref[0];
+    const uint8_t *ref2 = f.ref[1];
     const int cw = f.w >> 1, chh = f.h >> 1;
     const size_t ysz = size_t(f.w) * f.h, csz = size_t(cw) * chh;
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
@@ -356,7 +439,11 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
         const int px = x0 >> sub, py = y0 >> sub;
         uint8_t *pred = predS[warp] + (p ? N * N + (p - 1) * NC * NC : 0);
         const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
-        warpPredict(refP, pw, ph, px, py, n, n, c.mv, sub, interp[warp], pred);
+        if (c.ref == 2)
+            warpPredictCompound(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, n, n, c.mv, c.mv2, sub,
+                                interp[warp], hpS[warp], pred);
+        else
+            warpPredict(refP, pw, ph, px, py, n, n, c.mv, sub, interp[warp], pred);
         const uint8_t *src = f.src[p];
         const int pitch = f.pitch[p];
         int sse = 0;
@@ -430,7 +517,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<N>::warps) evaluate(EvalArgs a) {
     }
     if (!lane) {
         // mode + vector bits: the search cost already holds lambda_sad * mv bits; approximate in bits here
-        const float modeBits = 4.f;
+        const float modeBits = 2.f + c.mvBits * a.mvWeight;
         const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
         c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
         c.costCoded = coded ? dCoded + a.lambda * (modeBits + skipFlag0 + bits) : kInf;
@@ -491,6 +578,7 @@ __global__ void decideGrid(DecideArgs a) {
             if (m || s == 0) {
                 const Cand &c = a.cand[s][idx];
                 bi.mv = c.mv;
+                bi.mv2 = c.mv2;
                 bi.log2 = (uint8_t)(3 + s);
                 bi.skip = (uint8_t)(m != 2);
                 bi.ref = c.ref;
@@ -593,7 +681,7 @@ struct State {
     float *best[kSizes] = {};
     uint8_t *mode[kSizes] = {};
     int16_t *hphase = nullptr;
-    uint8_t *phases = nullptr;
+    uint8_t *phases[kMaxRefs] = {};
     bool profile = false;
     cudaEvent_t ev[8] = {};
     double stageMs[8] = {};
@@ -621,7 +709,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->hphase);
     for (auto *p : s->best) cudaFree(p);
     for (auto *p : s->mode) cudaFree(p);
-    cudaFree(s->phases);
+    for (auto *p : s->phases) cudaFree(p);
     if (s->profile && s->frames) {
         const char *names[] = {"downsample+coarse", "refine", "evaluate", "decide", "commit", "download"};
         for (int i = 0; i < 6; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
@@ -673,7 +761,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->cdefOut, frame);
         alloc(&s->sse, sizeof(unsigned long long) * 64);
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
-        alloc(&s->phases, 16 * size_t(w) * h);
+        for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
     if (e != cudaSuccess) {
@@ -718,10 +806,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
     for (int r = 0; r < refCount; r++) {
         horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8)>>>(refs[r], w, h, s->hphase);
-        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases);
+        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases[r]);
 #define PF_REFINE(K, N)                                                                                         \
     refine<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                      \
-                32 * RefineCfg<N>::warps>>>(f, r, s->phases, s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
+                32 * RefineCfg<N>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows, K == 3 ? nullptr : s->cand[K + 1], \
                                             K == 3 ? 0 : s->cols[K + 1], temporal, s->gcols, s->cand[K], s->cols[K],  \
                                             s->rows[K], lambdaSad)
         PF_REFINE(3, 64);
@@ -730,13 +818,24 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         PF_REFINE(0, 8);
 #undef PF_REFINE
     }
+#define PF_CHOOSE(K, N)                                                                                         \
+    chooseInter<N><<<(s->cols[K] * s->rows[K] + RefineCfg<N>::warps - 1) / RefineCfg<N>::warps,                 \
+                     32 * RefineCfg<N>::warps>>>(f, refCount, s->phases[0], s->phases[1], s->cand[K], s->cols[K], \
+                                                 s->rows[K], lambdaSad, st.compoundBias)
+    PF_CHOOSE(3, 64);
+    PF_CHOOSE(2, 32);
+    PF_CHOOSE(1, 16);
+    PF_CHOOSE(0, 8);
+#undef PF_CHOOSE
     mark(2);
     EvalArgs ea{};
     ea.f = f;
     ea.qindex = st.qindex;
     ea.qctx = av1g_coeff_cdf_q_ctx(st.qindex);
     ea.lambda = lambda;
-    ea.rnd = st.rnd; ea.zbin = st.zbin;
+    ea.rnd = getenv("AV1GPU_PF_RND") ? (float)atof(getenv("AV1GPU_PF_RND")) : st.rnd;
+    ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
+    ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.25f;
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
     ea.pred = s->pred[K]; ea.recon = K < 3 ? s->recon[K] : nullptr; ea.levels = K < 3 ? s->levels[K] : nullptr; \

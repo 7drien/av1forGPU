@@ -21,10 +21,11 @@ inline bool operator==(Mv a, Mv b) { return a.row == b.row && a.col == b.col; }
 
 // Decision for each 8x8 luma unit (raster order, ceil(W/8) x ceil(H/8)).
 struct BlockInfo {
-    Mv mv;
+    Mv mv;          // vector of the first (or only) reference
+    Mv mv2;         // vector of the second reference of a compound block
     uint8_t log2;   // log2 of the block size containing this unit (3..6)
     uint8_t skip;   // 1: no residual coded
-    uint8_t ref;    // reference index (0 = LAST, 1 = second reference)
+    uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both
     uint8_t pad;
 };
 
@@ -33,7 +34,7 @@ struct Settings {
     float lambdaMul = 1.0f;
     int searchRange = 64;    // full-pel coarse search radius
     float rnd = 0.33f, zbin = 0.70f;
-    int refs = 1;            // number of reference frames searched (1 or 2)
+    float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
 };
 
 // In-loop filter parameters chosen for a P frame (the reconstruction already includes them).

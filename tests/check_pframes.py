@@ -65,6 +65,10 @@ if __name__ == "__main__":
     if len(sys.argv) > 4:
         run(b, int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
     else:
-        run(b, 256, 128, 6)
-        run(b, 200, 136, 6, ["--qindex", "60"])
-        run(b, 448, 256, 8, ["--persistent-cdf"])
+        run(b, 256, 128, 6, ["--pf-gop", "1"])
+        run(b, 200, 136, 6, ["--qindex", "60", "--pf-gop", "1"])
+        run(b, 448, 256, 8, ["--persistent-cdf", "--pf-gop", "1"])
+        run(b, 256, 128, 12)
+        run(b, 200, 136, 11, ["--qindex", "60", "--pf-gop", "4"])
+        run(b, 448, 256, 20, ["--persistent-cdf", "--pf-gop", "8", "--keyint", "9"])
+        run(b, 320, 192, 18, ["--persistent-cdf", "--pf-gop", "16", "--qindex", "140"])

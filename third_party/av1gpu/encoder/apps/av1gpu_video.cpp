@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -75,7 +77,7 @@ int main(int argc, char **argv) {
     bool interRdoq = false;
     bool usePframes = false;
     pf::Settings pfSettings;
-    int pfQindex = 0, pfQoffset = 0;
+    int pfQindex = 0, pfQoffset = 60, pfGop = 16, pfAltrefBoost = 100, pfLeafOffset = 0;
     bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
@@ -159,6 +161,15 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "P-frame qindex offset must be in -100..100\n");
                 return 2;
             }
+        } else if (!strcmp(argv[i], "--pf-gop") && i + 1 < argc) {
+            pfGop = atoi(argv[++i]);
+            if (pfGop < 1 || pfGop > 32) { fprintf(stderr, "--pf-gop must be 1..32\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-altref-boost") && i + 1 < argc) {
+            pfAltrefBoost = atoi(argv[++i]);
+            if (pfAltrefBoost < 0 || pfAltrefBoost > 128) { fprintf(stderr, "--pf-altref-boost must be 0..128\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-leaf-offset") && i + 1 < argc) {
+            pfLeafOffset = atoi(argv[++i]);
+            if (pfLeafOffset < 0 || pfLeafOffset > 100) { fprintf(stderr, "--pf-leaf-offset must be 0..100\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-no-filters")) {
             pfFilters = false;
         } else if (!strcmp(argv[i], "--pf-lambda") && i + 1 < argc) {
@@ -293,11 +304,10 @@ int main(int argc, char **argv) {
     FILE *reconDump = getenv("AV1GPU_DUMP_RECON") ? fopen(getenv("AV1GPU_DUMP_RECON"), "wb") : nullptr;
     pf::Analyzer pfAnalyzer;
     std::unique_ptr<pfw::Writer> pfWriter;
-    pfw::EntropyState pfEntropy;
     std::vector<pf::BlockInfo> pfInfo;
     std::vector<int16_t> pfLevels;
     double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0;
-    uint64_t pfModes[4] = {};
+    uint64_t pfModes[4] = {}, pfCompound = 0;
     if (usePframes) {
         if (!reference && cudaMalloc(&reference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
         if (!nextReference && cudaMalloc(&nextReference, ySize*3/2) != cudaSuccess) { fprintf(stderr, "reference allocation failed\n"); return 1; }
@@ -362,6 +372,255 @@ int main(int argc, char **argv) {
     double gpuMs = 0;
     const auto wallStart = std::chrono::steady_clock::now();
     GpEntScratch scratch;
+    // ---- CUDA P/ALTREF frame path ----
+    auto runPframes = [&]() -> int {
+        const int G = std::max(1, pfGop);
+        const size_t frameBytes = ySize * 3 / 2;
+        uint8_t *slotBuf[8] = {}, *spare = nullptr;
+        for (int k = 0; k < 8; ++k)
+            if (cudaMalloc(&slotBuf[k], frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
+        if (cudaMalloc(&spare, frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
+        std::vector<std::array<uint8_t *, 3>> inBuf(G);
+        for (auto &fb : inBuf)
+            for (int p = 0; p < 3; ++p)
+                if (cudaMalloc(&fb[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "input allocation failed\n"); return 1; }
+        pfw::EntropyState slotState[8];
+        std::vector<std::vector<uint8_t>> pending;   // raw frames read ahead
+        bool eof = false;
+        auto readMore = [&](size_t want) {
+            while (!eof && pending.size() < want) {
+                std::vector<uint8_t> raw;
+                if (!read_frame(stdin, w, h, raw)) { eof = true; break; }
+                pending.push_back(std::move(raw));
+            }
+        };
+        auto upload = [&](const std::vector<uint8_t> &raw, std::array<uint8_t *, 3> &fb) -> bool {
+            const uint8_t *planes[3] = {raw.data(), raw.data() + (size_t)w * h, raw.data() + (size_t)w * h + (size_t)cw * ch};
+            const int widths[3] = {w, cw, cw}, heights[3] = {h, ch, ch};
+            const int paddedWidths[3] = {aw, acw, acw}, paddedHeights[3] = {ah, ach, ach};
+            for (int p = 0; p < 3; ++p) {
+                pad_plane(planes[p], widths[p], heights[p], widths[p], paddedWidths[p], paddedHeights[p], padded[p]);
+                if (cudaMemcpy(fb[p], padded[p].data(), sizes[p], cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            }
+            return true;
+        };
+        auto dump = [&](const uint8_t *dev) {
+            if (!reconDump) return;
+            std::vector<uint8_t> host(frameBytes);
+            cudaMemcpy(host.data(), dev, frameBytes, cudaMemcpyDeviceToHost);
+            fwrite(host.data(), 1, host.size(), reconDump);
+        };
+        const int pitches[3] = {aw, acw, acw};
+        char perr[256];
+        // Analyze, filter and write one inter frame. refSlots: slots of the AV1 references used by BlockInfo::ref
+        // 0 and 1 (second < 0: single reference). The reconstruction goes to outSlot.
+        auto interFrame = [&](std::array<uint8_t *, 3> &fb, int slot0, int slot1, int outSlot, int qindex, bool show,
+                              bool td, std::vector<uint8_t> &obu) -> int {
+            const uint8_t *refs[2] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr};
+            const int refCount = slot1 >= 0 ? 2 : 1;
+            pf::Settings st = pfSettings;
+            st.qindex = qindex;
+            const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
+            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, pfInfo, pfLevels, perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
+            pfMs += pfAnalyzer.lastMs();
+            const auto tf0 = std::chrono::steady_clock::now();
+            pf::FilterParams flt;
+            if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, true, flt, perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
+            const auto tw0 = std::chrono::steady_clock::now();
+            pfFilterMs += std::chrono::duration<double, std::milli>(tw0 - tf0).count();
+            pfw::FrameParams fp;
+            fp.qindex = qindex;
+            for (int r = 0; r < 7; ++r) fp.refSlot[r] = slot0;
+            if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
+            fp.refName[0] = pfw::LAST_FRAME;
+            fp.refName[1] = pfw::ALTREF_FRAME;
+            fp.referenceSelect = refCount == 2;
+            fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
+            fp.showFrame = show;
+            fp.temporalDelimiter = td;
+            fp.persistent = persistentCdf;
+            fp.grain = grain;
+            fp.grainSeed = uint16_t(7391 + frameCount * 31847);
+            for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];
+            fp.lfSharpness = flt.sharpness;
+            fp.cdef = pfCdef;
+            fp.cdefDamping = flt.damping;
+            fp.cdefY = flt.yPri; fp.cdefYSec = flt.ySec; fp.cdefUV = flt.uvPri; fp.cdefUVSec = flt.uvSec;
+            pfw::EntropyState out;
+            try {
+                obu = pfWriter->frame(fp, pfInfo, pfLevels, &slotState[slot0], out);
+            } catch (const std::exception &ex) {
+                fprintf(stderr, "P-frame syntax: %s\n", ex.what());
+                return 1;
+            }
+            pfWriteMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+            for (int k = 0; k < 4; ++k) pfModes[k] += pfWriter->modeCount[k];
+            pfCompound += pfWriter->compoundBlocks;
+            if (outSlot < 8) {
+                slotState[outSlot] = out;
+                std::swap(slotBuf[outSlot], spare);
+            }
+            return 0;
+        };
+        int lastShown = 0;
+        uint64_t lastKeyIndex = 0;
+        for (;;) {
+            readMore(1);
+            if (pending.empty()) break;
+            if (frameCount == 0 || frameCount - lastKeyIndex >= keyInterval) {
+                // keyframe
+                std::vector<uint8_t> raw = std::move(pending.front());
+                pending.erase(pending.begin());
+                if (!upload(raw, inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
+                GpFrameIn in;
+                in.deviceRecon = reference;
+                in.W = w; in.H = h; in.aw = aw; in.ah = ah;
+                in.colorMatrix = 1;
+                for (int p = 0; p < 3; ++p) { in.dsrc[p] = inBuf[0][p]; in.spitch[p] = pitches[p]; }
+                std::vector<GpFrameIn> inputs{in};
+                std::vector<GpFrameOut> frames;
+                GpTimes times;
+                GpDevRecords records;
+                if (encoder.encode(inputs, frames, times, err, 0, &records)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+                std::vector<std::vector<std::vector<uint8_t>>> tiles;
+                double entropyMs = 0;
+                int status = gp_entropy_dev(records, 0, scratch, tiles, &entropyMs, err);
+                gp_dev_records_free(records, 0);
+                if (status) { fprintf(stderr, "entropy: %s\n", err.c_str()); return 1; }
+                std::vector<uint8_t> obu;
+                if (gp_assemble_obus(&frames[0].fp, tiles[0], true, obu, err, true, frameCount == 0, grain,
+                                     uint16_t(7391 + frameCount * 31847)) ||
+                    !write_ivf_frame(outFile, obu, frameCount)) {
+                    fprintf(stderr, "write frame: %s\n", err.c_str());
+                    return 1;
+                }
+                gpuMs += times.total + entropyMs;
+                for (int k = 0; k < 8; ++k)
+                    if (cudaMemcpy(slotBuf[k], reference, frameBytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
+                for (auto &st : slotState) st = pfw::EntropyState{};
+                pfAnalyzer.resetTemporal();
+                dump(slotBuf[0]);
+                lastShown = 0;
+                lastKeyIndex = frameCount;
+                ++frameCount;
+                continue;
+            }
+            const uint64_t untilKey = keyInterval - (frameCount - lastKeyIndex);
+            const size_t g = std::min<size_t>(G, untilKey);
+            readMore(g);
+            const size_t n = std::min(g, pending.size());
+            if (n == 1) {
+                // single P frame from the last shown picture
+                if (!upload(pending[0], inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
+                std::vector<uint8_t> obu;
+                if (interFrame(inBuf[0], lastShown, -1, 0, pfSettings.qindex, true, true, obu)) return 1;
+                if (!write_ivf_frame(outFile, obu, frameCount)) return 1;
+                dump(slotBuf[0]);
+                lastShown = 0;
+                ++predicted; ++frameCount;
+                pending.erase(pending.begin());
+                continue;
+            }
+            // Mini-GOP pyramid: the last frame is coded first as a hidden ALTREF; each interval (lo, hi) codes its middle
+            // frame from lo (LAST) and hi (ALTREF), hidden unless it is the next frame to display, and shows coded
+            // frames with show_existing_frame when their turn comes.
+            for (size_t i = 0; i < n; ++i)
+                if (!upload(pending[i], inBuf[i])) { fprintf(stderr, "upload failed\n"); return 1; }
+            std::vector<int> freeSlots;
+            for (int k = 7; k >= 0; --k)
+                if (k != lastShown) freeSlots.push_back(k);
+            auto allocSlot = [&]() {
+                if (freeSlots.empty()) throw std::runtime_error("no free reference slot");
+                int k = freeSlots.back();
+                freeSlots.pop_back();
+                return k;
+            };
+            auto release = [&](int k) { if (k >= 0) freeSlots.push_back(k); };
+            int depthMax = 0;
+            while ((size_t(1) << depthMax) < n) ++depthMax;
+            auto qAt = [&](int depth) {
+                const double frac = depthMax ? 1.0 - double(depth) / depthMax : 1.0;
+                return std::max(1, (int)std::lround(pfSettings.qindex - pfAltrefBoost * frac));
+            };
+            std::vector<uint8_t> tu;   // OBUs of the temporal unit being assembled
+            auto emitShown = [&](std::vector<uint8_t> &obu) -> bool {
+                tu.insert(tu.end(), obu.begin(), obu.end());
+                const bool ok = write_ivf_frame(outFile, tu, frameCount);
+                tu.clear();
+                return ok;
+            };
+            const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
+            int hiSlot = allocSlot();
+            {
+                std::vector<uint8_t> obu;
+                if (interFrame(inBuf[n - 1], lastShown, -1, hiSlot, qAt(0), false, tu.empty(), obu)) return 1;
+                tu.insert(tu.end(), obu.begin(), obu.end());
+            }
+            std::function<int(uint64_t, uint64_t, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
+                                                                            int hiSlotL, int depth) -> int {
+                if (hi == lo + 1) {
+                    pfw::FrameParams se;
+                    se.showExisting = true;
+                    se.showExistingSlot = hiSlotL;
+                    se.temporalDelimiter = tu.empty();
+                    std::vector<pf::BlockInfo> none;
+                    std::vector<int16_t> noLevels;
+                    pfw::EntropyState unused;
+                    auto obu = pfWriter->frame(se, none, noLevels, nullptr, unused);
+                    if (!emitShown(obu)) return 1;
+                    dump(slotBuf[hiSlotL]);
+                    ++predicted; ++frameCount;
+                    release(loSlot);
+                    return 0;
+                }
+                const uint64_t mid = (lo + hi) / 2;
+                std::vector<uint8_t> obu;
+                if (mid == lo + 1) {
+                    const bool referenced = hi - mid > 1;
+                    const int midSlot = referenced ? allocSlot() : -1;
+                    // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
+                    if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
+                                   referenced ? qAt(depth) : std::min(255, pfSettings.qindex + pfLeafOffset), true,
+                                   tu.empty(), obu))
+                        return 1;
+                    if (!emitShown(obu)) return 1;
+                    dump(referenced ? slotBuf[midSlot] : spare);
+                    ++predicted; ++frameCount;
+                    release(loSlot);
+                    return rec(mid, hi, midSlot, hiSlotL, depth + 1);
+                }
+                const int midSlot = allocSlot();
+                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, tu.empty(), obu))
+                    return 1;
+                tu.insert(tu.end(), obu.begin(), obu.end());
+                if (rec(lo, mid, loSlot, midSlot, depth + 1)) return 1;
+                return rec(mid, hi, midSlot, hiSlotL, depth + 1);
+            };
+            try {
+                if (rec(base, base + n, lastShown, hiSlot, 1)) return 1;
+            } catch (const std::exception &ex) {
+                fprintf(stderr, "mini-GOP: %s\n", ex.what());
+                return 1;
+            }
+            lastShown = hiSlot;
+            pending.erase(pending.begin(), pending.begin() + n);
+        }
+        for (auto &fb : inBuf)
+            for (auto *p : fb) cudaFree(p);
+        for (auto *p : slotBuf) cudaFree(p);
+        cudaFree(spare);
+        return 0;
+    };
+    if (usePframes) {
+        int status = runPframes();
+        if (status) return status;
+    } else
     for (;;) {
         std::vector<GpFrameIn> inputs;
         while (inputs.size() < (temporal ? size_t(1) : size_t(batchSize)) && read_frame(stdin, w, h, src)) {
@@ -382,56 +641,6 @@ int main(int argc, char **argv) {
             inputs.push_back(in);
         }
         if (inputs.empty()) break;
-        if (usePframes && frameCount && frameCount - lastKey < keyInterval) {
-            const uint8_t *refs[1] = {reference};
-            const int pitches[3] = {aw, acw, acw};
-            char perr[256];
-            if (pfAnalyzer.analyze(inputs[0].dsrc, pitches, refs, 1, pfSettings, nextReference, pfInfo, pfLevels,
-                                   perr, sizeof perr)) {
-                fprintf(stderr, "%s\n", perr);
-                return 1;
-            }
-            pfMs += pfAnalyzer.lastMs();
-            const auto tf0 = std::chrono::steady_clock::now();
-            pf::FilterParams flt;
-            if (pfFilters && pfAnalyzer.filter(inputs[0].dsrc, pitches, nextReference, pfSettings.qindex, pfCdef, true,
-                                               flt, perr, sizeof perr)) {
-                fprintf(stderr, "%s\n", perr);
-                return 1;
-            }
-            pfw::FrameParams fp;
-            for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];
-            fp.lfSharpness = flt.sharpness;
-            fp.cdef = pfCdef;
-            fp.cdefDamping = flt.damping;
-            fp.cdefY = flt.yPri; fp.cdefYSec = flt.ySec; fp.cdefUV = flt.uvPri; fp.cdefUVSec = flt.uvSec;
-            fp.qindex = pfSettings.qindex;
-            fp.refreshFlags = 1;
-            fp.persistent = persistentCdf;
-            fp.grain = grain;
-            fp.grainSeed = uint16_t(7391 + frameCount * 31847);
-            const auto tw0 = std::chrono::steady_clock::now();
-            pfFilterMs += std::chrono::duration<double, std::milli>(tw0 - tf0).count();
-            std::vector<uint8_t> obu;
-            try {
-                obu = pfWriter->frame(fp, pfInfo, pfLevels, pfEntropy);
-                pfWriteMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
-            } catch (const std::exception &ex) {
-                fprintf(stderr, "P-frame syntax: %s\n", ex.what());
-                return 1;
-            }
-            for (int k = 0; k < 4; ++k) pfModes[k] += pfWriter->modeCount[k];
-            if (!write_ivf_frame(outFile, obu, frameCount)) return 1;
-            std::swap(reference, nextReference);
-            if (reconDump) {
-                std::vector<uint8_t> host(ySize * 3 / 2);
-                cudaMemcpy(host.data(), reference, host.size(), cudaMemcpyDeviceToHost);
-                fwrite(host.data(), 1, host.size(), reconDump);
-            }
-            lastWritten = frameCount;
-            ++predicted; ++frameCount;
-            continue;
-        }
         if (canPredict && frameCount && frameCount-lastKey < keyInterval) {
             if (autoMotionStep) {
                 auto status = chooseMotionStep(inputs[0].dsrc[0], reference, anchor, w, h, aw,
@@ -547,16 +756,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "write frame: %s\n", err.c_str());
                 return 1;
             }
-            if (usePframes) {
-                lastWritten = lastKey = frameCount;
-                pfEntropy.ready = false;
-                pfAnalyzer.resetTemporal();
-                if (reconDump) {
-                    std::vector<uint8_t> host(ySize * 3 / 2);
-                    cudaMemcpy(host.data(), reference, host.size(), cudaMemcpyDeviceToHost);
-                    fwrite(host.data(), 1, host.size(), reconDump);
-                }
-            }
             if(canPredict) {
                 if (useAnchor && cudaMemcpy(anchor, reference, ySize*3/2, cudaMemcpyDeviceToDevice) != cudaSuccess) {
                     fprintf(stderr, "anchor reference copy failed\n");
@@ -580,8 +779,11 @@ int main(int argc, char **argv) {
     if(temporal) fprintf(stderr,"inter frames %llu, keyframes %llu\n",(unsigned long long)predicted,
                          (unsigned long long)(frameCount-predicted));
     if (usePframes)
+        fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
+                pfWriter->bits[0], pfWriter->bits[1], pfWriter->bits[2], pfWriter->bits[3]),
         fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms\n", pfFilterMs, pfWriteMs),
-        fprintf(stderr, "P-frame analysis %.1f ms; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
+        fprintf(stderr, "P-frame analysis %.1f ms; compound blocks %llu; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
+                (unsigned long long)pfCompound,
                 (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],
                 (unsigned long long)pfModes[3]);
     if (adaptiveTx)

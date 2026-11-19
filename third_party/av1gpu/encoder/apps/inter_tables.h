@@ -6,7 +6,10 @@ namespace pft {
 constexpr int BLOCK_SIZE_GROUPS = 4;
 constexpr int BWD_REFS = 3;
 constexpr int CLASS0_SIZE = 2;
+constexpr int COMPOUND_MODES = 8;
+constexpr int COMPOUND_MODE_CONTEXTS = 8;
 constexpr int COMP_INTER_CONTEXTS = 5;
+constexpr int COMP_REF_TYPE_CONTEXTS = 5;
 constexpr int DRL_MODE_CONTEXTS = 3;
 constexpr int FWD_REFS = 4;
 constexpr int INTRA_MODES = 13;
@@ -153,6 +156,23 @@ inline constexpr uint16_t Default_Comp_Bwd_Ref_Cdf[REF_CONTEXTS][BWD_REFS - 1][3
   { {  2235, 32768, 0 }, {  1423, 32768, 0 } },
   { { 17182, 32768, 0 }, { 15175, 32768, 0 } },
   { { 30606, 32768, 0 }, { 30489, 32768, 0 } }
+};
+inline constexpr uint16_t Default_Comp_Ref_Type_Cdf[COMP_REF_TYPE_CONTEXTS][3] = {
+  { 1198, 32768, 0 },
+  { 2070, 32768, 0 },
+  { 9166, 32768, 0 },
+  { 7499, 32768, 0 },
+  { 22475, 32768, 0 }
+};
+inline constexpr uint16_t Default_Compound_Mode_Cdf[COMPOUND_MODE_CONTEXTS][COMPOUND_MODES + 1] = {
+  { 7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768, 0 },
+  { 10730, 19452, 21145, 22749, 24039, 25131, 28724, 32768, 0 },
+  { 10664, 20221, 21588, 22906, 24295, 25387, 28436, 32768, 0 },
+  { 13298, 16984, 20471, 24182, 25067, 25736, 26422, 32768, 0 },
+  { 18904, 23325, 25242, 27432, 27898, 28258, 30758, 32768, 0 },
+  { 10725, 17454, 20124, 22820, 24195, 25168, 26046, 32768, 0 },
+  { 17125, 24273, 25814, 27492, 28214, 28704, 30592, 32768, 0 },
+  { 13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0 }
 };
 inline constexpr int16_t Subpel_Filters[6][16][8] = {
       {

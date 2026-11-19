@@ -29,7 +29,8 @@ using inter::emitCoeffPayload;   // shared coefficient syntax (inter_packet.h)
 
 // AV1 reference frame names
 enum { INTRA_FRAME = 0, LAST_FRAME = 1, LAST2_FRAME, LAST3_FRAME, GOLDEN_FRAME, BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME };
-enum { NEARESTMV = 13, NEARMV, GLOBALMV, NEWMV };
+enum { NEARESTMV = 14, NEARMV, GLOBALMV, NEWMV, NEAREST_NEARESTMV, NEAR_NEARMV, NEAREST_NEWMV, NEW_NEARESTMV,
+       NEAR_NEWMV, NEW_NEARMV, GLOBAL_GLOBALMV, NEW_NEWMV };
 
 // Inter-specific adaptive CDFs (spec format: increasing, 32768 terminator, adaptation counter).
 struct InterCdfs {
@@ -39,7 +40,13 @@ struct InterCdfs {
     uint16_t mvJoint[5];
     uint16_t mvSign[2][3], mvClass[2][12], class0Bit[2][3], class0Fr[2][2][5], mvFr[2][5], mvBit[2][10][3];
     uint16_t txSet3[4][3];
+    uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     void init() {
+        memcpy(compMode, pft::Default_Comp_Mode_Cdf, sizeof compMode);
+        memcpy(compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof compRefType);
+        memcpy(compRef, pft::Default_Comp_Ref_Cdf, sizeof compRef);
+        memcpy(compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof compBwdRef);
+        memcpy(compoundMode, pft::Default_Compound_Mode_Cdf, sizeof compoundMode);
         memcpy(isInter, pft::Default_Is_Inter_Cdf, sizeof isInter);
         memcpy(singleRef, pft::Default_Single_Ref_Cdf, sizeof singleRef);
         memcpy(newMv, pft::Default_New_Mv_Cdf, sizeof newMv);
@@ -84,7 +91,8 @@ struct FrameParams {
     int qindex = 100;
     int refSlot[7] = {0, 0, 0, 1, 0, 0, 2};   // ref_frame_idx for LAST .. ALTREF
     int refreshFlags = 1;
-    int refName[2] = {LAST_FRAME, GOLDEN_FRAME};   // AV1 reference used by BlockInfo::ref 0 and 1
+    int refName[2] = {LAST_FRAME, ALTREF_FRAME};   // AV1 reference used by BlockInfo::ref 0 and 1
+    bool referenceSelect = false;                    // compound prediction allowed
     bool persistent = false;                         // carry CDFs (error_resilient_mode = 0)
     int grain = 0;
     uint16_t grainSeed = 0;
@@ -108,21 +116,27 @@ public:
         mi.resize(n);
     }
 
+    // primary: the CDFs saved with the LAST reference (ref_frame_idx[0]), or null for default CDFs.
+    // state receives this frame's frame-end CDFs.
     std::vector<uint8_t> frame(const FrameParams &fp, const std::vector<pf::BlockInfo> &grid,
-                               const std::vector<int16_t> &levels, EntropyState &state) {
+                               const std::vector<int16_t> &levels, const EntropyState *primaryState,
+                               EntropyState &state) {
         if (fp.showExisting) {
             // show_existing_frame of a non-key frame: header only
             av1g::BitWriter b;
             b.bit(1);
             b.put(fp.showExistingSlot, 3);
+            b.bit(1);   // trailing_bits()
             b.byte_align();
             std::vector<uint8_t> obu = {0x12, 0, 0x1A};   // temporal delimiter, OBU_FRAME_HEADER
             av1g::put_leb128(obu, b.buf.size());
             obu.insert(obu.end(), b.buf.begin(), b.buf.end());
             return obu;
         }
-        const bool primary = fp.persistent && state.ready;
-        if (!primary) {
+        const bool primary = fp.persistent && primaryState && primaryState->ready;
+        if (primary) {
+            state = *primaryState;
+        } else {
             state = EntropyState{};
             av1g_cdfs_init(&state.cdf, fp.qindex);
             state.inter.init();
@@ -137,7 +151,9 @@ public:
         const size_t capacity = size_t(aw) * ah * 4 + 4096;
         std::unique_ptr<uint16_t[]> scratch(new uint16_t[capacity]);
         av1g_ec_init(&ec, scratch.get(), capacity);
+        const double before[4] = {bits[0], bits[1], bits[2], bits[3]};
         tile(grid, levels);
+        bits[0] += tell() - (bits[1] - before[1]) - (bits[2] - before[2]) - (bits[3] - before[3]);
         std::vector<uint8_t> data(ec.offs + 8);
         const int n = av1g_ec_done(&ec, data.data());
         if (n < 0) throw std::runtime_error("inter tile overflow");
@@ -154,6 +170,8 @@ public:
 
     // statistics of the last frame
     int modeCount[4] = {};   // NEAREST, NEAR, GLOBAL, NEW
+    int compoundBlocks = 0;
+    double bits[4] = {};     // cumulative: partition + mode info, motion vectors, luma coefficients, chroma coefficients
 
 private:
     struct MiInfo {
@@ -172,6 +190,7 @@ private:
     av1g_ec ec{};
     std::vector<uint8_t> aboveLevel[3], aboveDc[3], leftLevel[3], leftDc[3];
 
+    double tell() const { return ec.offs * 8.0 + ec.cnt + 16 - std::log2((double)ec.rng); }
     MiInfo &at(int r, int c) { return mi[size_t(r) * miCols + c]; }
     bool inside(int r, int c) const { return r >= 0 && c >= 0 && r < miRows && c < miCols; }
 
@@ -226,48 +245,68 @@ private:
             b.put(fp.cdefUVSec == 4 ? 3 : fp.cdefUVSec, 2);
         }
         b.bit(0);   // tx_mode_select = 0: TX_MODE_LARGEST
-        b.bit(0);   // reference_select
+        b.bit(fp.referenceSelect);   // reference_select
         b.bit(1);   // reduced_tx_set
         for (int r = 0; r < 7; ++r) b.bit(0);   // is_global
         av1g::write_video_grain(b, fp.grain, fp.grainSeed, true);
     }
 
-    // ---- motion vector prediction (spec 7.10.2) ----
+    // ---- motion vector prediction (spec 7.10.2; global motion is identity, RefFrameSignBias is 0) ----
     struct Stack {
         int num = 0, newCount = 0;
-        pf::Mv mv[pft::MAX_REF_MV_STACK_SIZE];
-        int weight[pft::MAX_REF_MV_STACK_SIZE];
+        pf::Mv mv[pft::MAX_REF_MV_STACK_SIZE + 1][2];
+        int weight[pft::MAX_REF_MV_STACK_SIZE + 1];
         bool foundMatch = false;
         int closeMatches = 0, totalMatches = 0;
         int newMvCtx = 0, refMvCtx = 0, zeroMvCtx = 0;
-        int drlCtx[pft::MAX_REF_MV_STACK_SIZE];
+        int drlCtx[pft::MAX_REF_MV_STACK_SIZE + 1];
     };
-    static bool hasNewmv(int mode) { return mode == NEWMV; }
+    struct RefPair { int r0, r1; bool compound; };
+    static bool hasNewmv(int mode) {
+        return mode == NEWMV || mode == NEW_NEWMV || mode == NEAR_NEWMV || mode == NEW_NEARMV ||
+               mode == NEAREST_NEWMV || mode == NEW_NEARESTMV;
+    }
     static pf::Mv lowerPrecision(pf::Mv m) {
         if (m.row & 1) m.row += m.row > 0 ? -1 : 1;
         if (m.col & 1) m.col += m.col > 0 ? -1 : 1;
         return m;
     }
-    void addRefMv(Stack &st, int mvRow, int mvCol, int refFrame, int weight) {
+    void addRefMv(Stack &st, int mvRow, int mvCol, const RefPair &rp, int weight) {
         const MiInfo &cand = at(mvRow, mvCol);
         if (!cand.isInter) return;
-        for (int list = 0; list < 2; ++list) {
-            if (cand.ref[list] != refFrame) continue;
-            const pf::Mv candMv = lowerPrecision(cand.mv[list]);
-            if (hasNewmv(cand.mode)) st.newCount++;
+        if (!rp.compound) {
+            for (int list = 0; list < 2; ++list) {
+                if (cand.ref[list] != rp.r0) continue;
+                const pf::Mv candMv = lowerPrecision(cand.mv[list]);
+                if (hasNewmv(cand.mode)) st.newCount++;
+                st.foundMatch = true;
+                int idx = 0;
+                for (; idx < st.num; ++idx)
+                    if (st.mv[idx][0] == candMv) break;
+                if (idx < st.num) st.weight[idx] += weight;
+                else if (st.num < pft::MAX_REF_MV_STACK_SIZE) {
+                    st.mv[st.num][0] = candMv;
+                    st.weight[st.num] = weight;
+                    st.num++;
+                }
+            }
+        } else if (cand.ref[0] == rp.r0 && cand.ref[1] == rp.r1) {
+            const pf::Mv c0 = lowerPrecision(cand.mv[0]), c1 = lowerPrecision(cand.mv[1]);
             st.foundMatch = true;
             int idx = 0;
             for (; idx < st.num; ++idx)
-                if (st.mv[idx] == candMv) break;
+                if (st.mv[idx][0] == c0 && st.mv[idx][1] == c1) break;
             if (idx < st.num) st.weight[idx] += weight;
             else if (st.num < pft::MAX_REF_MV_STACK_SIZE) {
-                st.mv[st.num] = candMv;
+                st.mv[st.num][0] = c0;
+                st.mv[st.num][1] = c1;
                 st.weight[st.num] = weight;
                 st.num++;
             }
+            if (hasNewmv(cand.mode)) st.newCount++;
         }
     }
-    void scanRow(Stack &st, int miRow, int miCol, int bw4, int deltaRow, int refFrame) {
+    void scanRow(Stack &st, int miRow, int miCol, int bw4, int deltaRow, const RefPair &rp) {
         const int end4 = std::min(std::min(bw4, miCols - miCol), 16);
         int deltaCol = 0;
         const bool useStep16 = bw4 >= 16;
@@ -281,11 +320,11 @@ private:
             int len = std::min(bw4, 1 << (at(r, c).size - 2));
             if (std::abs(deltaRow) > 1) len = std::max(2, len);
             if (useStep16) len = std::max(4, len);
-            addRefMv(st, r, c, refFrame, len * 2);
+            addRefMv(st, r, c, rp, len * 2);
             i += len;
         }
     }
-    void scanCol(Stack &st, int miRow, int miCol, int bh4, int deltaCol, int refFrame) {
+    void scanCol(Stack &st, int miRow, int miCol, int bh4, int deltaCol, const RefPair &rp) {
         const int end4 = std::min(std::min(bh4, miRows - miRow), 16);
         int deltaRow = 0;
         const bool useStep16 = bh4 >= 16;
@@ -299,13 +338,13 @@ private:
             int len = std::min(bh4, 1 << (at(r, c).size - 2));
             if (std::abs(deltaCol) > 1) len = std::max(2, len);
             if (useStep16) len = std::max(4, len);
-            addRefMv(st, r, c, refFrame, len * 2);
+            addRefMv(st, r, c, rp, len * 2);
             i += len;
         }
     }
-    void scanPoint(Stack &st, int miRow, int miCol, int deltaRow, int deltaCol, int refFrame) {
+    void scanPoint(Stack &st, int miRow, int miCol, int deltaRow, int deltaCol, const RefPair &rp) {
         const int r = miRow + deltaRow, c = miCol + deltaCol;
-        if (inside(r, c) && at(r, c).written) addRefMv(st, r, c, refFrame, 4);
+        if (inside(r, c) && at(r, c).written) addRefMv(st, r, c, rp, 4);
     }
     static void sortStack(Stack &st, int start, int end) {
         while (end > start) {
@@ -313,50 +352,49 @@ private:
             for (int idx = start + 1; idx < end; ++idx) {
                 if (st.weight[idx - 1] < st.weight[idx]) {
                     std::swap(st.weight[idx - 1], st.weight[idx]);
-                    std::swap(st.mv[idx - 1], st.mv[idx]);
+                    std::swap(st.mv[idx - 1][0], st.mv[idx][0]);
+                    std::swap(st.mv[idx - 1][1], st.mv[idx][1]);
                     newEnd = idx;
                 }
             }
             end = newEnd;
         }
     }
-    void findMvStack(Stack &st, int miRow, int miCol, int size, int refFrame) {
+    void findMvStack(Stack &st, int miRow, int miCol, int size, const RefPair &rp) {
         const int bw4 = 1 << (size - 2), bh4 = bw4;
         st = Stack{};
-        const pf::Mv globalMv{0, 0};
         st.foundMatch = false;
-        scanRow(st, miRow, miCol, bw4, -1, refFrame);
+        scanRow(st, miRow, miCol, bw4, -1, rp);
         bool foundAbove = st.foundMatch;
         st.foundMatch = false;
-        scanCol(st, miRow, miCol, bh4, -1, refFrame);
+        scanCol(st, miRow, miCol, bh4, -1, rp);
         bool foundLeft = st.foundMatch;
         st.foundMatch = false;
-        if (std::max(bw4, bh4) <= 16) scanPoint(st, miRow, miCol, -1, bw4, refFrame);
+        if (std::max(bw4, bh4) <= 16) scanPoint(st, miRow, miCol, -1, bw4, rp);
         if (st.foundMatch) foundAbove = true;
         st.closeMatches = foundAbove + foundLeft;
         const int numNearest = st.num, numNew = st.newCount;
         for (int i = 0; i < numNearest; ++i) st.weight[i] += pft::REF_CAT_LEVEL;
         st.zeroMvCtx = 0;
         st.foundMatch = false;
-        scanPoint(st, miRow, miCol, -1, -1, refFrame);
+        scanPoint(st, miRow, miCol, -1, -1, rp);
         if (st.foundMatch) foundAbove = true;
         st.foundMatch = false;
-        scanRow(st, miRow, miCol, bw4, -3, refFrame);
+        scanRow(st, miRow, miCol, bw4, -3, rp);
         if (st.foundMatch) foundAbove = true;
         st.foundMatch = false;
-        scanCol(st, miRow, miCol, bh4, -3, refFrame);
+        scanCol(st, miRow, miCol, bh4, -3, rp);
         if (st.foundMatch) foundLeft = true;
         st.foundMatch = false;
-        if (bh4 > 1) scanRow(st, miRow, miCol, bw4, -5, refFrame);
+        if (bh4 > 1) scanRow(st, miRow, miCol, bw4, -5, rp);
         if (st.foundMatch) foundAbove = true;
         st.foundMatch = false;
-        if (bw4 > 1) scanCol(st, miRow, miCol, bh4, -5, refFrame);
+        if (bw4 > 1) scanCol(st, miRow, miCol, bh4, -5, rp);
         if (st.foundMatch) foundLeft = true;
         st.totalMatches = foundAbove + foundLeft;
         sortStack(st, 0, numNearest);
         sortStack(st, numNearest, st.num);
-        if (st.num < 2) extraSearch(st, miRow, miCol, bw4, bh4, refFrame);
-        for (int idx = st.num; idx < 2; ++idx) st.mv[idx] = globalMv;
+        if (st.num < 2) extraSearch(st, miRow, miCol, bw4, bh4, rp);
         // context and clamping
         for (int idx = 0; idx < st.num; ++idx) {
             int z = 0;
@@ -371,13 +409,15 @@ private:
             st.drlCtx[idx] = z;
         }
         const int bw = 4 * bw4, bh = 4 * bh4;
-        for (int idx = 0; idx < st.num; ++idx) {
-            const int top = -((miRow * 4) * 8), bottom = ((miRows - bh4 - miRow) * 4) * 8;
-            const int left = -((miCol * 4) * 8), right = ((miCols - bw4 - miCol) * 4) * 8;
-            const int br = pft::MV_BORDER + bh * 8, bc = pft::MV_BORDER + bw * 8;
-            st.mv[idx].row = (int16_t)std::min(std::max((int)st.mv[idx].row, top - br), bottom + br);
-            st.mv[idx].col = (int16_t)std::min(std::max((int)st.mv[idx].col, left - bc), right + bc);
-        }
+        const int top = -((miRow * 4) * 8), bottom = ((miRows - bh4 - miRow) * 4) * 8;
+        const int left = -((miCol * 4) * 8), right = ((miCols - bw4 - miCol) * 4) * 8;
+        const int br = pft::MV_BORDER + bh * 8, bc = pft::MV_BORDER + bw * 8;
+        for (int list = 0; list < 1 + rp.compound; ++list)
+            for (int idx = 0; idx < st.num; ++idx) {
+                pf::Mv &m = st.mv[idx][list];
+                m.row = (int16_t)std::min(std::max((int)m.row, top - br), bottom + br);
+                m.col = (int16_t)std::min(std::max((int)m.col, left - bc), right + bc);
+            }
         if (st.closeMatches == 0) {
             st.newMvCtx = std::min(st.totalMatches, 1);
             st.refMvCtx = st.totalMatches;
@@ -389,11 +429,14 @@ private:
             st.refMvCtx = 5;
         }
     }
-    void extraSearch(Stack &st, int miRow, int miCol, int bw4, int bh4, int refFrame) {
+    void extraSearch(Stack &st, int miRow, int miCol, int bw4, int bh4, const RefPair &rp) {
+        pf::Mv idMvs[2][2], diffMvs[2][2];
+        int idCount[2] = {0, 0}, diffCount[2] = {0, 0};
         int w4 = std::min(16, bw4), h4 = std::min(16, bh4);
         w4 = std::min(w4, miCols - miCol);
         h4 = std::min(h4, miRows - miRow);
         const int num4x4 = std::min(w4, h4);
+        const int refs[2] = {rp.r0, rp.r1};
         for (int pass = 0; pass < 2; ++pass) {
             int idx = 0;
             while (idx < num4x4 && st.num < 2) {
@@ -402,25 +445,54 @@ private:
                 else { r = miRow + idx; c = miCol - 1; }
                 if (!inside(r, c)) break;
                 const MiInfo &cand = at(r, c);
-                for (int list = 0; list < 2; ++list) {
-                    const int candRef = cand.ref[list];
-                    if (candRef > INTRA_FRAME) {
-                        // RefFrameSignBias is 0 for every reference (enable_order_hint = 0)
-                        const pf::Mv candMv = cand.mv[list];
+                for (int candList = 0; candList < 2; ++candList) {
+                    const int candRef = cand.ref[candList];
+                    if (candRef <= INTRA_FRAME) continue;
+                    const pf::Mv candMv = cand.mv[candList];
+                    if (rp.compound) {
+                        for (int list = 0; list < 2; ++list) {
+                            if (candRef == refs[list] && idCount[list] < 2) idMvs[list][idCount[list]++] = candMv;
+                            else if (diffCount[list] < 2) diffMvs[list][diffCount[list]++] = candMv;
+                        }
+                    } else {
                         int k = 0;
                         for (; k < st.num; ++k)
-                            if (candMv == st.mv[k]) break;
+                            if (candMv == st.mv[k][0]) break;
                         if (k == st.num) {
-                            st.mv[k] = candMv;
+                            st.mv[k][0] = candMv;
                             st.weight[k] = 2;
                             st.num++;
                         }
                     }
                 }
-                idx += pass == 0 ? (1 << (cand.size - 2)) : (1 << (cand.size - 2));
+                idx += 1 << (cand.size - 2);
             }
         }
-        (void)refFrame;
+        if (rp.compound) {
+            pf::Mv combined[2][2];
+            for (int list = 0; list < 2; ++list) {
+                int n = 0;
+                for (int i = 0; i < idCount[list]; ++i) combined[n++][list] = idMvs[list][i];
+                for (int i = 0; i < diffCount[list] && n < 2; ++i) combined[n++][list] = diffMvs[list][i];
+                while (n < 2) combined[n++][list] = pf::Mv{0, 0};
+            }
+            if (st.num == 1) {
+                const int k = (combined[0][0] == st.mv[0][0] && combined[0][1] == st.mv[0][1]) ? 1 : 0;
+                st.mv[1][0] = combined[k][0];
+                st.mv[1][1] = combined[k][1];
+                st.weight[1] = 2;
+                st.num = 2;
+            } else {
+                for (int i = 0; i < 2; ++i) {
+                    st.mv[st.num][0] = combined[i][0];
+                    st.mv[st.num][1] = combined[i][1];
+                    st.weight[st.num] = 2;
+                    st.num++;
+                }
+            }
+        } else {
+            for (int k = st.num; k < 2; ++k) st.mv[k][0] = pf::Mv{0, 0};
+        }
     }
 
     // ---- symbol helpers ----
@@ -558,102 +630,206 @@ private:
     }
 
     // ---- block / partition ----
+    // comp_mode / comp_ref_type contexts (spec 8.3.2)
+    static bool checkBackward(int r) { return r >= BWDREF_FRAME && r <= ALTREF_FRAME; }
+    static bool sameDir(int a, int b) { return (a >= BWDREF_FRAME) == (b >= BWDREF_FRAME); }
+    int compModeCtx(bool availU, bool availL, const MiInfo *above, const MiInfo *left) const {
+        const int a0 = availU ? above->ref[0] : INTRA_FRAME, l0 = availL ? left->ref[0] : INTRA_FRAME;
+        const bool aSingle = !availU || above->ref[1] <= INTRA_FRAME, lSingle = !availL || left->ref[1] <= INTRA_FRAME;
+        const bool aIntra = a0 <= INTRA_FRAME, lIntra = l0 <= INTRA_FRAME;
+        if (availU && availL) {
+            if (aSingle && lSingle) return checkBackward(a0) ^ checkBackward(l0);
+            if (aSingle) return 2 + (checkBackward(a0) || aIntra);
+            if (lSingle) return 2 + (checkBackward(l0) || lIntra);
+            return 4;
+        }
+        if (availU) return aSingle ? checkBackward(a0) : 3;
+        if (availL) return lSingle ? checkBackward(l0) : 3;
+        return 1;
+    }
+    int compRefTypeCtx(bool availU, bool availL, const MiInfo *above, const MiInfo *left) const {
+        const int a0 = availU ? above->ref[0] : INTRA_FRAME, a1 = availU ? above->ref[1] : -1;
+        const int l0 = availL ? left->ref[0] : INTRA_FRAME, l1 = availL ? left->ref[1] : -1;
+        const bool aIntra = a0 <= INTRA_FRAME, lIntra = l0 <= INTRA_FRAME;
+        const bool aSingle = a1 <= INTRA_FRAME, lSingle = l1 <= INTRA_FRAME;
+        const bool aComp = availU && !aIntra && !aSingle, lComp = availL && !lIntra && !lSingle;
+        const bool aUni = aComp && sameDir(a0, a1), lUni = lComp && sameDir(l0, l1);
+        if (availU && !aIntra && availL && !lIntra) {
+            const int samedir = sameDir(a0, l0);
+            if (!aComp && !lComp) return 1 + 2 * samedir;
+            if (!aComp) return lUni ? 3 + samedir : 1;
+            if (!lComp) return aUni ? 3 + samedir : 1;
+            if (!aUni && !lUni) return 0;
+            if (!aUni || !lUni) return 2;
+            return 3 + ((a0 == BWDREF_FRAME) == (l0 == BWDREF_FRAME));
+        }
+        if (availU && availL) {
+            if (aComp) return 1 + 2 * aUni;
+            if (lComp) return 1 + 2 * lUni;
+            return 2;
+        }
+        if (aComp) return 4 * aUni;
+        if (lComp) return 4 * lUni;
+        return 2;
+    }
+    static int modeOfList(int yMode, int list) {   // get_mode()
+        if (yMode < NEAREST_NEARESTMV) return yMode;
+        if (list == 0) {
+            if (yMode == NEW_NEWMV || yMode == NEW_NEARESTMV || yMode == NEW_NEARMV) return NEWMV;
+            if (yMode == NEAREST_NEARESTMV || yMode == NEAREST_NEWMV) return NEARESTMV;
+            if (yMode == NEAR_NEARMV || yMode == NEAR_NEWMV) return NEARMV;
+            return GLOBALMV;
+        }
+        if (yMode == NEW_NEWMV || yMode == NEAREST_NEWMV || yMode == NEAR_NEWMV) return NEWMV;
+        if (yMode == NEAREST_NEARESTMV || yMode == NEW_NEARESTMV) return NEARESTMV;
+        if (yMode == NEAR_NEARMV || yMode == NEW_NEARMV) return NEARMV;
+        return GLOBALMV;
+    }
+    static bool isNewType(int yMode) { return yMode == NEWMV || yMode == NEW_NEWMV; }
+    static bool hasNearmv(int yMode) {
+        return yMode == NEARMV || yMode == NEAR_NEARMV || yMode == NEAR_NEWMV || yMode == NEW_NEARMV;
+    }
+    // Cost of coding (yMode, refMvIdx) for target vectors; < 0 when the pair cannot reproduce them.
+    float modeCost(const Stack &st, bool compound, int yMode, int refMvIdx, const pf::Mv *target,
+                   pf::Mv *pred) const {
+        float c = 0.f;
+        if (compound) {
+            const int ctx = kCompoundModeCtxMap[st.refMvCtx >> 1][std::min(st.newMvCtx, 4)];
+            c += symCost(ic->compoundMode[ctx], yMode - NEAREST_NEARESTMV);
+        } else if (yMode == NEWMV) {
+            c += symCost(ic->newMv[st.newMvCtx], 0);
+        } else {
+            c += symCost(ic->newMv[st.newMvCtx], 1);
+            if (yMode == GLOBALMV) c += symCost(ic->zeroMv[st.zeroMvCtx], 0);
+            else c += symCost(ic->zeroMv[st.zeroMvCtx], 1) + symCost(ic->refMv[st.refMvCtx], yMode == NEARMV);
+        }
+        // drl
+        if (isNewType(yMode)) {
+            for (int idx = 0; idx < 2; ++idx)
+                if (st.num > idx + 1) {
+                    const int d = idx < refMvIdx;
+                    c += symCost(ic->drl[st.drlCtx[idx]], d);
+                    if (!d) break;
+                }
+        } else if (hasNearmv(yMode)) {
+            for (int idx = 1; idx < 3; ++idx)
+                if (st.num > idx + 1) {
+                    const int d = idx < refMvIdx;
+                    c += symCost(ic->drl[st.drlCtx[idx]], d);
+                    if (!d) break;
+                }
+        }
+        for (int i = 0; i < 1 + compound; ++i) {
+            const int cm = modeOfList(yMode, i);
+            pf::Mv p{0, 0};
+            if (cm != GLOBALMV) {
+                int pos = cm == NEARESTMV ? 0 : refMvIdx;
+                if (cm == NEWMV && st.num <= 1) pos = 0;
+                p = st.mv[pos][i];
+            }
+            pred[i] = p;
+            if (cm == NEWMV) {
+                c += mvCost(target[i], p);
+            } else if (!(target[i] == p)) {
+                return -1.f;
+            }
+        }
+        return c;
+    }
+    static constexpr int kCompoundModeCtxMap[3][5] = {{0, 1, 1, 1, 1}, {1, 2, 3, 4, 4}, {4, 4, 5, 6, 7}};
+
     void block(int miRow, int miCol, int size, const pf::BlockInfo &bi, const std::vector<int16_t> &levels,
                const pf::Analyzer *) {
         const int bw4 = 1 << (size - 2), bh4 = bw4;
         const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
         const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
         const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
-        // skip
-        int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
+        const int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
         const int skip = bi.skip;
         sym(cdf->skip[skipCtx], skip, 2);
-        // is_inter
         const bool aboveIntra = availU && !above->isInter, leftIntra = availL && !left->isInter;
         int interCtx;
         if (availU && availL) interCtx = (leftIntra && aboveIntra) ? 3 : (leftIntra || aboveIntra);
         else if (availU || availL) interCtx = 2 * (availU ? aboveIntra : leftIntra);
         else interCtx = 0;
         sym(ic->isInter[interCtx], 1, 2);
-        const int refFrame = params->refName[bi.ref];
-        writeRefFrame(refFrame, availU, availL, above, left);
+        // reference frames
+        const bool compound = bi.ref == 2;
+        RefPair rp{params->refName[bi.ref == 1 ? 1 : 0], compound ? params->refName[1] : -1, compound};
+        if (params->referenceSelect) sym(ic->compMode[compModeCtx(availU, availL, above, left)], compound, 2);
+        auto cnt = [&](int f) { return countRefs(f, availU, availL, above, left); };
+        if (compound) {
+            if (rp.r0 != LAST_FRAME || rp.r1 != ALTREF_FRAME) throw std::runtime_error("unsupported compound pair");
+            sym(ic->compRefType[compRefTypeCtx(availU, availL, above, left)], 1, 2);   // BIDIR_COMP_REFERENCE
+            sym(ic->compRef[refCountCtx(cnt(LAST_FRAME) + cnt(LAST2_FRAME), cnt(LAST3_FRAME) + cnt(GOLDEN_FRAME))][0], 0, 2);
+            sym(ic->compRef[refCountCtx(cnt(LAST_FRAME), cnt(LAST2_FRAME))][1], 0, 2);   // LAST_FRAME
+            sym(ic->compBwdRef[refCountCtx(cnt(BWDREF_FRAME) + cnt(ALTREF2_FRAME), cnt(ALTREF_FRAME))][0], 1, 2);   // ALTREF
+        } else {
+            writeRefFrame(rp.r0, availU, availL, above, left);
+        }
         Stack st;
-        findMvStack(st, miRow, miCol, size, refFrame);
-        // choose the cheapest mode that reproduces the vector
-        const pf::Mv mv = bi.mv;
+        findMvStack(st, miRow, miCol, size, rp);
+        const pf::Mv target[2] = {bi.mv, bi.mv2};
         float best = 1e30f;
-        int bestMode = NEWMV, bestIdx = 0;
-        const float newmv0 = symCost(ic->newMv[st.newMvCtx], 0), newmv1 = symCost(ic->newMv[st.newMvCtx], 1);
-        if (mv.row == 0 && mv.col == 0) {
-            const float c = newmv1 + symCost(ic->zeroMv[st.zeroMvCtx], 0);
-            if (c < best) { best = c; bestMode = GLOBALMV; }
-        }
-        const float zero1 = symCost(ic->zeroMv[st.zeroMvCtx], 1);
-        if (mv == st.mv[0]) {
-            const float c = newmv1 + zero1 + symCost(ic->refMv[st.refMvCtx], 0);
-            if (c < best) { best = c; bestMode = NEARESTMV; }
-        }
-        for (int k = 1; k <= 3; ++k) {
-            if (k > 1 && st.num <= k) break;
-            if (!(mv == st.mv[k])) continue;
-            float c = newmv1 + zero1 + symCost(ic->refMv[st.refMvCtx], 1);
-            for (int idx = 1; idx < 3; ++idx) {
-                if (st.num > idx + 1) {
-                    const int d = idx < k ? 1 : 0;
-                    c += symCost(ic->drl[st.drlCtx[idx]], d);
-                    if (!d) break;
-                }
+        int bestMode = -1, bestIdx = 0;
+        pf::Mv bestPred[2] = {}, pred[2];
+        auto consider = [&](int mode, int idx) {
+            const float c = modeCost(st, compound, mode, idx, target, pred);
+            if (c >= 0.f && c < best) {
+                best = c; bestMode = mode; bestIdx = idx;
+                bestPred[0] = pred[0]; bestPred[1] = pred[1];
             }
-            if (c < best) { best = c; bestMode = NEARMV; bestIdx = k; }
-        }
-        for (int k = 0; k <= 2; ++k) {
-            if (k > 0 && st.num <= k) break;
-            float c = newmv0;
-            for (int idx = 0; idx < 2; ++idx) {
-                if (st.num > idx + 1) {
-                    const int d = idx < k ? 1 : 0;
-                    c += symCost(ic->drl[st.drlCtx[idx]], d);
-                    if (!d) break;
-                }
+        };
+        const int first = compound ? NEAREST_NEARESTMV : NEARESTMV, last = compound ? NEW_NEWMV : NEWMV;
+        for (int mode = first; mode <= last; ++mode) {
+            if (isNewType(mode)) {
+                for (int k = 0; k <= 2 && (k == 0 || st.num > k); ++k) consider(mode, k);
+            } else if (hasNearmv(mode)) {
+                for (int k = 1; k <= 3 && (k == 1 || st.num > k); ++k) consider(mode, k);
+            } else {
+                consider(mode, 0);
             }
-            const pf::Mv pred = st.mv[st.num <= 1 ? 0 : k];
-            c += mvCost(mv, pred);
-            if (c < best) { best = c; bestMode = NEWMV; bestIdx = k; }
+        }
+        if (bestMode < 0) {
+            throw std::runtime_error("no inter mode reproduces the motion vector");
         }
         // write the mode
-        if (bestMode == NEWMV) {
+        if (compound) {
+            const int ctx = kCompoundModeCtxMap[st.refMvCtx >> 1][std::min(st.newMvCtx, 4)];
+            sym(ic->compoundMode[ctx], bestMode - NEAREST_NEARESTMV, 8);
+        } else if (bestMode == NEWMV) {
             sym(ic->newMv[st.newMvCtx], 0, 2);
-            modeCount[3]++;
         } else {
             sym(ic->newMv[st.newMvCtx], 1, 2);
             if (bestMode == GLOBALMV) {
                 sym(ic->zeroMv[st.zeroMvCtx], 0, 2);
-                modeCount[2]++;
             } else {
                 sym(ic->zeroMv[st.zeroMvCtx], 1, 2);
                 sym(ic->refMv[st.refMvCtx], bestMode == NEARMV, 2);
-                modeCount[bestMode == NEARMV]++;
             }
         }
-        if (bestMode == NEWMV) {
-            for (int idx = 0; idx < 2; ++idx) {
+        if (isNewType(bestMode)) {
+            for (int idx = 0; idx < 2; ++idx)
                 if (st.num > idx + 1) {
-                    const int d = idx < bestIdx ? 1 : 0;
+                    const int d = idx < bestIdx;
                     sym(ic->drl[st.drlCtx[idx]], d, 2);
                     if (!d) break;
                 }
-            }
-            writeMv(mv, st.mv[st.num <= 1 ? 0 : bestIdx]);
-        } else if (bestMode == NEARMV) {
-            for (int idx = 1; idx < 3; ++idx) {
+        } else if (hasNearmv(bestMode)) {
+            for (int idx = 1; idx < 3; ++idx)
                 if (st.num > idx + 1) {
-                    const int d = idx < bestIdx ? 1 : 0;
+                    const int d = idx < bestIdx;
                     sym(ic->drl[st.drlCtx[idx]], d, 2);
                     if (!d) break;
                 }
-            }
         }
-        // store mode info
+        const double t0 = tell();
+        for (int i = 0; i < 1 + compound; ++i)
+            if (modeOfList(bestMode, i) == NEWMV) writeMv(target[i], bestPred[i]);
+        bits[1] += tell() - t0;
+        const int m0 = modeOfList(bestMode, 0);
+        modeCount[m0 == NEARESTMV ? 0 : m0 == NEARMV ? 1 : m0 == GLOBALMV ? 2 : 3]++;
+        if (compound) compoundBlocks++;
         for (int r = miRow; r < std::min(miRow + bh4, miRows); ++r)
             for (int c = miCol; c < std::min(miCol + bw4, miCols); ++c) {
                 MiInfo &m = at(r, c);
@@ -661,10 +837,10 @@ private:
                 m.skip = (uint8_t)skip;
                 m.isInter = 1;
                 m.mode = (uint8_t)bestMode;
-                m.ref[0] = (int8_t)refFrame;
-                m.ref[1] = -1;
-                m.mv[0] = mv;
-                m.mv[1] = pf::Mv{0, 0};
+                m.ref[0] = (int8_t)rp.r0;
+                m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
+                m.mv[0] = target[0];
+                m.mv[1] = compound ? target[1] : pf::Mv{0, 0};
                 m.written = true;
             }
         // residual
@@ -687,7 +863,9 @@ private:
             int16_t qv[1024];
             for (int r = 0; r < t; ++r)
                 for (int c = 0; c < t; ++c) qv[r * t + c] = levels[base + size_t(py + r) * pw + px + c];
+            const double t0 = tell();
             coeffs(p, px >> 2, py >> 2, txSz, bsize, qv);
+            bits[p ? 3 : 2] += tell() - t0;
         }
     }
 
@@ -737,6 +915,7 @@ private:
             leftDc[p].assign(miRows + 32, 0);
         }
         for (auto &m : modeCount) m = 0;
+        compoundBlocks = 0;
         for (int sbr = 0; sbr < miRows; sbr += 16) {
             for (int p = 0; p < 3; ++p) {
                 std::fill(leftLevel[p].begin(), leftLevel[p].end(), 0);
