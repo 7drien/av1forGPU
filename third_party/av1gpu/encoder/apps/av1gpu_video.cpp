@@ -100,9 +100,14 @@ int main(int argc, char **argv) {
     unsigned sceneCutRms = 0;
     GpConfig cfg;
     cfg.qindex = 100;
+    bool kfPresetSet = false;
     for (int i = 6; i < argc; ++i) {
-        if (!strcmp(argv[i], "--fast")) {
+        if (!strcmp(argv[i], "--kf-preset") && i + 1 < argc) {
+            if (!apply_preset(cfg, argv[++i])) { fprintf(stderr, "unknown --kf-preset\n"); return 2; }
+            kfPresetSet = true;
+        } else if (!strcmp(argv[i], "--fast")) {
             apply_preset(cfg, "turbo3");
+            kfPresetSet = true;
         } else if (!strcmp(argv[i], "--grain") && i+1<argc) {
             char *end;
             const char *arg = argv[++i];
@@ -415,6 +420,7 @@ int main(int argc, char **argv) {
     cfg.wantRecon = false;
     GpEncoder encoder;
     std::string err;
+    if (usePframes && !kfPresetSet) apply_preset(cfg, "slow");   // key frames carry much of the quality (--kf-preset)
     if (usePframes && pfFilters) {
         // keyframes: deblocking and CDEF searches; enable_cdef = 1 in the sequence header lets P frames use CDEF
         cfg.fLf = 2;

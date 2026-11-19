@@ -103,4 +103,11 @@ intra path), then T5, T7, T3, T2, T6.
   against SVT-AV1 preset 8 in its bitrate mode is -12.4% (51.4 to 56.5 dB overlap), at 21 to 28 fps against SVT's
   26 to 31 fps on this machine. Against SVT in CRF mode (`tests/compare.py`) it is still +19.6%; against libaom
   `cpu-used 8` (bitrate mode) +35.8%. Our short-clip rate control overshoots its target by 11 to 18%.
+- Key frames alone (first frame) needed 18.4% more bits than SVT-AV1 preset 8 (libaom: 31.0%). With `--pframes`
+  key frames now use the base encoder's `slow` preset (`--kf-preset NAME` overrides): key frames +10.7%, full
+  120-frame sequence +19.6% → +18.6%, about 8% slower at the default 120-frame key interval.
+- Tuning checked and left unchanged: `--pf-lambda` 0.5 (+19.9%) and 1.0 (+22.1%), `--pf-leaf-offset 10` (+20.0%),
+  `--pf-gop 16` (+20.5%), ALTREF temporal filtering 2 / 4 frames (+20.4% / +20.6%).
+- The test clip has no scene cuts (largest inter frame 3 KB against a 35 KB key frame), so intra blocks in inter
+  frames (T2) would gain little on it; it needs a clip with cuts and uncovered content to be measured.
 

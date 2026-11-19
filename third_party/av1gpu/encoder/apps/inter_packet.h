@@ -107,6 +107,7 @@ inline std::vector<uint8_t> packet(int w,int h,const std::vector<MotionBlock>& b
     if (qindex) {
         b.bit(0);      // delta_q_present
         b.put(0, 16);  // deblock levels, sharpness, delta disabled
+        b.put(0, 6);   // lr_params: lr_type RESTORE_NONE for Y, U, V (video sequence headers enable restoration)
         b.bit(!luma8); // TX_MODE_SELECT for 4x4 luma, TX_MODE_LARGEST for 8x8
     }
     b.bit(0); b.bit(1); // single reference mode, reduced tx set
