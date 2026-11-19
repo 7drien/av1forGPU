@@ -200,6 +200,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--pf-tf-strength") && i + 1 < argc) {
             pfTfStrength = strtof(argv[++i], nullptr);
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-no-rect")) {
+            pfSettings.rectPartitions = false;
         } else if (!strcmp(argv[i], "--pf-no-tx-split")) {
             pfSettings.txSplit = false;
         } else if (!strcmp(argv[i], "--pf-rdoq")) {

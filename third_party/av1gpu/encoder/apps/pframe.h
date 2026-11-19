@@ -27,6 +27,7 @@ struct BlockInfo {
     uint8_t skip;   // 1: no residual coded
     uint8_t ref;    // 0: reference 0 only, 1: reference 1 only, 2: compound average of both
     uint8_t txSplit;   // 1: luma uses four half-size transforms (coded blocks)
+    uint8_t part;      // partition of the log2 node: 0 NONE, 1 HORZ (two n x n/2 blocks), 2 VERT (two n/2 x n)
 };
 
 struct Settings {
@@ -35,7 +36,8 @@ struct Settings {
     int searchRange = 64;    // full-pel coarse search radius
     float rnd = 0.33f, zbin = 0.70f;
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
-    bool txSplit = true;         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
+    bool txSplit = true;
+    bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 

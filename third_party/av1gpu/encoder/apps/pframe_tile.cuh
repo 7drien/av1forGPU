@@ -46,12 +46,12 @@ AV1G_HDI void clearCounters(uint16_t *v, int n) {
 }
 
 struct MiInfo {
-    uint8_t size;      // log2 of the block size in pixels (3..6)
+    uint8_t wLog2, hLog2;   // log2 of the block width and height in pixels (3..6)
     uint8_t skip, isInter, mode;
     int8_t ref[2];
     pf::Mv mv[2];
     uint8_t written;
-    uint8_t txLog2;    // log2 of the luma transform width (InterTxSizes)
+    uint8_t txW, txH;  // log2 of the luma transform width and height (InterTxSizes)
 };
 
 struct TileStats {
@@ -182,7 +182,7 @@ struct TileCoder {
         for (int i = 0; i < end4;) {
             const int r = miRow + deltaRow, c = miCol + deltaCol + i;
             if (!inside(r, c)) break;
-            int len = imin(bw4, 1 << (at(r, c).size - 2));
+            int len = imin(bw4, 1 << (at(r, c).wLog2 - 2));
             if (iabs(deltaRow) > 1) len = imax(2, len);
             if (useStep16) len = imax(4, len);
             addRefMv(s, r, c, rp, len * 2);
@@ -200,7 +200,7 @@ struct TileCoder {
         for (int i = 0; i < end4;) {
             const int r = miRow + deltaRow + i, c = miCol + deltaCol;
             if (!inside(r, c)) break;
-            int len = imin(bh4, 1 << (at(r, c).size - 2));
+            int len = imin(bh4, 1 << (at(r, c).hLog2 - 2));
             if (iabs(deltaCol) > 1) len = imax(2, len);
             if (useStep16) len = imax(4, len);
             addRefMv(s, r, c, rp, len * 2);
@@ -262,7 +262,7 @@ struct TileCoder {
                         }
                     }
                 }
-                idx += 1 << (cand.size - 2);
+                idx += 1 << ((pass == 0 ? cand.wLog2 : cand.hLog2) - 2);
             }
         }
         if (rp.compound) {
@@ -291,8 +291,7 @@ struct TileCoder {
             for (int k = s.num; k < 2; ++k) s.mv[k][0] = pf::Mv{0, 0};
         }
     }
-    AV1G_HDI void findMvStack(Stack &s, int miRow, int miCol, int size, const RefPair &rp) {
-        const int bw4 = 1 << (size - 2), bh4 = bw4;
+    AV1G_HDI void findMvStack(Stack &s, int miRow, int miCol, int bw4, int bh4, const RefPair &rp) {
         s.num = 0; s.newCount = 0;
         s.foundMatch = false;
         scanRow(s, miRow, miCol, bw4, -1, rp);
@@ -545,7 +544,7 @@ struct TileCoder {
     }
 
     // ---- residual ----
-    AV1G_HDI void coeffs(int plane, int x4, int y4, int txSz, int bsizePixels, const int16_t *qv) {
+    AV1G_HDI void coeffs(int plane, int x4, int y4, int txSz, int bwPix, int bhPix, const int16_t *qv) {
         const int sub = plane > 0;
         const int tw = AV1G_T(Tx_Width)[txSz], th = AV1G_T(Tx_Height)[txSz];
         const int w4 = tw >> 2, h4 = th >> 2;
@@ -555,7 +554,7 @@ struct TileCoder {
         const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
         int ctx;
         if (plane == 0) {
-            if (tw == bsizePixels) {
+            if (tw == bwPix && th == bhPix) {
                 ctx = 0;   // the transform covers the whole block
             } else {
                 int top = 0, left = 0;
@@ -573,8 +572,7 @@ struct TileCoder {
             for (int i = 0; i < w4; i++) if (x4 + i < maxX4) above |= aL[x4 + i] | aD[x4 + i];
             for (int i = 0; i < h4; i++) if (y4 + i < maxY4) left |= lL[y4 + i] | lD[y4 + i];
             ctx = (above != 0) + (left != 0) + 7;
-            const int bp = bsizePixels >> sub;
-            if (bp * bp > tw * th) ctx += 3;
+            if ((bwPix >> sub) * (bhPix >> sub) > tw * th) ctx += 3;
         }
         const uint16_t *scan = av1g_get_scan(txSz, AV1G_DCT_DCT);
         const int n = imin(tw, 32) * imin(th, 32);
@@ -584,7 +582,8 @@ struct TileCoder {
         int culLevel = 0, dcCategory = 0;
         if (eob) {
             // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
-            if (plane == 0 && txSz != AV1G_TX_64X64) sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
+            if (plane == 0 && AV1G_T(Tx_Size_Sqr_Up)[txSz] != AV1G_TX_64X64)
+                sym(ic->txSet3[AV1G_T(Tx_Size_Sqr)[txSz]], 1, 2);
             int dcSign = 0;
             for (int k = 0; k < w4; k++)
                 if (x4 + k < maxX4) dcSign += aD[x4 + k] == 1 ? -1 : aD[x4 + k] == 2 ? 1 : 0;
@@ -601,8 +600,9 @@ struct TileCoder {
     }
 
     // ---- block / partition ----
-    AV1G_HDI void block(int miRow, int miCol, int size, const pf::BlockInfo &bi) {
-        const int bw4 = 1 << (size - 2), bh4 = bw4;
+    AV1G_HDI void block(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
+        const int bw4 = 1 << (lw - 2), bh4 = 1 << (lh - 2);
+        const int size = lw > lh ? lw : lh;   // log2 of the larger side
         const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
         const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
         const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
@@ -630,7 +630,7 @@ struct TileCoder {
         }
 #undef PF_CNT
         Stack s;
-        findMvStack(s, miRow, miCol, size, rp);
+        findMvStack(s, miRow, miCol, bw4, bh4, rp);
         const pf::Mv target[2] = {bi.mv, bi.mv2};
         float best = 1e30f;
         int bestMode = -1, bestIdx = 0;
@@ -690,7 +690,8 @@ struct TileCoder {
         for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
             for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
                 MiInfo &m = at(r, c);
-                m.size = (uint8_t)size;
+                m.wLog2 = (uint8_t)lw;
+                m.hLog2 = (uint8_t)lh;
                 m.skip = (uint8_t)skip;
                 m.isInter = 1;
                 m.mode = (uint8_t)bestMode;
@@ -699,32 +700,33 @@ struct TileCoder {
                 m.mv[0] = target[0];
                 m.mv[1] = compound ? target[1] : pf::Mv{0, 0};
                 m.written = 1;
-                m.txLog2 = (uint8_t)(skip ? size : size - (bi.txSplit ? 1 : 0));
+                m.txW = (uint8_t)(imin(lw, 6) - (!skip && bi.txSplit));
+                m.txH = (uint8_t)(imin(lh, 6) - (!skip && bi.txSplit));
             }
         const bool split = !skip && bi.txSplit;
         if (fs->txModeSelect && !skip) {
             const float tt = tell();
-            const int maxTx = size - 2;   // TX_8X8 = 1 .. TX_64X64 = 4 (square transform of the block)
-            auto txCtx = [&](int row, int col, int txLog2) {
+            const int maxTx = imin(size, 6) - 2;   // square find_tx_size(Min(64, Max(bw, bh)))
+            auto txCtx = [&](int row, int col, int tw2, int th2) {
                 int aw2, lh2;
                 if (row == miRow) {
                     if (!inside(row - 1, col)) aw2 = 64;
-                    else { const MiInfo &n = at(row - 1, col); aw2 = n.skip && n.isInter ? 1 << n.size : 1 << n.txLog2; }
-                } else aw2 = 1 << at(row - 1, col).txLog2;
+                    else { const MiInfo &n = at(row - 1, col); aw2 = n.skip && n.isInter ? 1 << n.wLog2 : 1 << n.txW; }
+                } else aw2 = 1 << at(row - 1, col).txW;
                 if (col == miCol) {
                     if (!inside(row, col - 1)) lh2 = 64;
-                    else { const MiInfo &n = at(row, col - 1); lh2 = n.skip && n.isInter ? 1 << n.size : 1 << n.txLog2; }
-                } else lh2 = 1 << at(row, col - 1).txLog2;
-                const int txSz = txLog2 - 2;
-                return (txSz != maxTx) * 3 + (4 - maxTx) * 6 + (aw2 < (1 << txLog2)) + (lh2 < (1 << txLog2));
+                    else { const MiInfo &n = at(row, col - 1); lh2 = n.skip && n.isInter ? 1 << n.hLog2 : 1 << n.txH; }
+                } else lh2 = 1 << at(row, col - 1).txH;
+                const int sqrUp = imax(tw2, th2) - 2;
+                return (sqrUp != maxTx) * 3 + (4 - maxTx) * 6 + (aw2 < (1 << tw2)) + (lh2 < (1 << th2));
             };
-            sym(ic->txfmSplit[txCtx(miRow, miCol, size)], split, 2);
+            sym(ic->txfmSplit[txCtx(miRow, miCol, imin(lw, 6), imin(lh, 6))], split, 2);
             if (split && size - 1 > 2) {   // children of 4x4 code nothing; depth 1 children code txfm_split = 0
                 const int half = 1 << (size - 3);
                 for (int k = 0; k < 4; k++) {
                     const int r = miRow + (k >> 1) * half, c = miCol + (k & 1) * half;
                     if (r >= fs->miRows || c >= fs->miCols) continue;
-                    sym(ic->txfmSplit[txCtx(r, c, size - 1)], 0, 2);
+                    sym(ic->txfmSplit[txCtx(r, c, size - 1, size - 1)], 0, 2);
                 }
             }
             st.bits[0] += tell() - tt;
@@ -737,7 +739,7 @@ struct TileCoder {
             }
             return;
         }
-        const int bsize = 4 * bw4;
+        const int bsize = 4 * bw4, bhsize = 4 * bh4;
         if (split) {
             // luma: four half-size transforms in raster order (transform_tree)
             const int t = bsize >> 1;
@@ -749,24 +751,25 @@ struct TileCoder {
                 for (int r = 0; r < t; ++r)
                     for (int c = 0; c < t; ++c) qv[r * t + c] = levels[size_t(py + r) * fs->aw + px + c];
                 const float c0 = tell();
-                coeffs(0, px >> 2, py >> 2, txSz, bsize, qv);
+                coeffs(0, px >> 2, py >> 2, txSz, bsize, bhsize, qv);
                 st.bits[2] += tell() - c0;
             }
         }
         for (int p = split ? 1 : 0; p < 3; ++p) {
             const int sub = p > 0;
-            const int t = bsize >> sub;
-            const int txSz = t == 4 ? AV1G_TX_4X4 : t == 8 ? AV1G_TX_8X8 : t == 16 ? AV1G_TX_16X16
-                           : t == 32 ? AV1G_TX_32X32 : AV1G_TX_64X64;
-            const int tq = imin(t, 32);
+            const int tlw = imin(lw, 6) - sub, tlh = imin(lh, 6) - sub;
+            int txSz = 0;
+            for (int t = 0; t < 19; t++)
+                if (AV1G_T(Tx_Width_Log2)[t] == tlw && AV1G_T(Tx_Height_Log2)[t] == tlh) txSz = t;
+            const int tqw = imin(1 << tlw, 32), tqh = imin(1 << tlh, 32);
             const int px = (miCol * 4) >> sub, py = (miRow * 4) >> sub;
             const int pw = p ? fs->aw / 2 : fs->aw;
             const size_t base = p ? size_t(fs->aw) * fs->ah + size_t(p - 1) * (fs->aw / 2) * (fs->ah / 2) : 0;
             int16_t qv[1024];
-            for (int r = 0; r < tq; ++r)
-                for (int c = 0; c < tq; ++c) qv[r * tq + c] = levels[base + size_t(py + r) * pw + px + c];
+            for (int r = 0; r < tqh; ++r)
+                for (int c = 0; c < tqw; ++c) qv[r * tqw + c] = levels[base + size_t(py + r) * pw + px + c];
             const float c0 = tell();
-            coeffs(p, px >> 2, py >> 2, txSz, bsize, qv);
+            coeffs(p, px >> 2, py >> 2, txSz, bsize, bhsize, qv);
             st.bits[p ? 3 : 2] += tell() - c0;
         }
     }
@@ -792,14 +795,16 @@ struct TileCoder {
             const bool hasRows = miRow + half < fs->miRows, hasCols = miCol + half < fs->miCols;
             const pf::BlockInfo &bi = grid[(miRow >> 1) * fs->gcols + (miCol >> 1)];
             const bool split = bi.log2 < size;
+            const int part = split ? AV1G_PARTITION_SPLIT : bi.part == 1 ? AV1G_PARTITION_HORZ
+                           : bi.part == 2 ? AV1G_PARTITION_VERT : AV1G_PARTITION_NONE;
             const float t0 = tell();
-            const int ctxAbove = inside(miRow - 1, miCol) && at(miRow - 1, miCol).size < size;
-            const int ctxLeft = inside(miRow, miCol - 1) && at(miRow, miCol - 1).size < size;
+            const int ctxAbove = inside(miRow - 1, miCol) && at(miRow - 1, miCol).wLog2 < size;
+            const int ctxLeft = inside(miRow, miCol - 1) && at(miRow, miCol - 1).hLog2 < size;
             const int pcx = ctxLeft * 2 + ctxAbove;
             uint16_t *pc = size == 6 ? cdf->partition_w64[pcx] : size == 5 ? cdf->partition_w32[pcx]
                          : size == 4 ? cdf->partition_w16[pcx] : cdf->partition_w8[pcx];
             if (hasRows && hasCols) {
-                sym(pc, split ? AV1G_PARTITION_SPLIT : AV1G_PARTITION_NONE, size == 3 ? 4 : 10);
+                sym(pc, part, size == 3 ? 4 : 10);
             } else if (hasCols || hasRows) {
                 if (!split) { st.error = 3; return; }
                 uint16_t t[2] = {uint16_t(32768 - av1g_split_or_psum(pc, hasRows)), 32768};
@@ -818,7 +823,16 @@ struct TileCoder {
                 continue;
             }
             if (bi.log2 != size) { st.error = 5; return; }
-            block(miRow, miCol, size, bi);
+            if (part != AV1G_PARTITION_NONE && !(hasRows && hasCols)) { st.error = 7; return; }
+            if (part == AV1G_PARTITION_HORZ) {
+                block(miRow, miCol, size, size - 1, bi);
+                if (!st.error) block(miRow + half, miCol, size, size - 1, grid[((miRow + half) >> 1) * fs->gcols + (miCol >> 1)]);
+            } else if (part == AV1G_PARTITION_VERT) {
+                block(miRow, miCol, size - 1, size, bi);
+                if (!st.error) block(miRow, miCol + half, size - 1, size, grid[(miRow >> 1) * fs->gcols + ((miCol + half) >> 1)]);
+            } else {
+                block(miRow, miCol, size, size, bi);
+            }
             if (st.error) return;
             --top;
         }
