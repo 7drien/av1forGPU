@@ -79,4 +79,6 @@ intra path), then T5, T7, T3, T2, T6.
   without it): its 33 ms of host time was mostly waiting for the analysis kernels.
 - A1 done: rectangular searches run after the square evaluation and skip nodes whose square evaluation prefers skip
   by a factor 2 or more (`--pf-no-prune` disables it). 21.6 → about 30 fps for +25.3% → +25.7% BD-rate.
+- `--pf-fast`: split transforms code DCT_DCT only (no type search): +28.1% at about 35 fps (default +25.7% at about
+  30 fps; a seven-type subset on splits, `AV1GPU_PF_SPLITTX=1`, gives +26.1% at about 31 fps).
 

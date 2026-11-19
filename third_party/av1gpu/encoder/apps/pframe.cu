@@ -577,6 +577,7 @@ struct EvalArgs {
     int switchable;     // is_filter_switchable: choose the interpolation filter per block
     float filterBias;   // scale of the SMOOTH / SHARP bit estimate
     int txExhaustive;   // price every type of the set (else a subset)
+    int splitTypes;     // split transforms: 0 same search, 1 seven-type subset, 2 DCT_DCT only
 };
 // inter_tx_type default CDFs (spec Default_Inter_Tx_Type_Set1/2/3_Cdf) for the type bits of the search
 __constant__ uint16_t kTxSet1Cdf[2][16] = {
@@ -868,7 +869,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     }
                     return warp_sumi(v);
                 };
-                const int ty = chooseLumaType(stx, a.types2 != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS);
+                const int ty = chooseLumaType(stx, a.types2 != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS);
                 if (!k) splitTop[1] = ty;
                 if (a.types2)
                     for (int i = lane; i < (SW >> 2) * (SH >> 2); i += 32)
@@ -947,7 +948,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                         return warp_sumi(v);
                     };
                     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
-                    const int ty = chooseLumaType(stx, tmap != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, os, q, hn * hn, runS);
+                    const int ty = chooseLumaType(stx, tmap != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hn * hn, runS);
                     if (!k) splitTop[d] = ty;
                     if (tmap)
                         for (int i = lane; i < (hn >> 2) * (hn >> 2); i += 32)
@@ -2017,6 +2018,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.switchable = st.switchableFilter;
     ea.filterBias = getenv("AV1GPU_PF_FBIAS") ? (float)atof(getenv("AV1GPU_PF_FBIAS")) : 16.f;
     ea.txExhaustive = st.txTypes == 3;
+    ea.splitTypes = getenv("AV1GPU_PF_SPLITTX") ? atoi(getenv("AV1GPU_PF_SPLITTX")) : st.splitTypes;
 #define PF_EVAL(K, N)                                                                                           \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
     ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \

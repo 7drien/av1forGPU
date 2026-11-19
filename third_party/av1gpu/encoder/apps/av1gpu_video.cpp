@@ -202,6 +202,8 @@ int main(int argc, char **argv) {
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-no-rect")) {
             pfSettings.rectPartitions = false;
+        } else if (!strcmp(argv[i], "--pf-fast")) {
+            pfSettings.splitTypes = 2;
         } else if (!strcmp(argv[i], "--pf-no-prune")) {
             pfSettings.pruneRect = false;
         } else if (!strcmp(argv[i], "--pf-switchable")) {
