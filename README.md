@@ -68,9 +68,9 @@ The single-frame analysis tool accepts exactly one tightly packed, 8-bit planar 
 
 Per frame, CUDA does the following:
 
-- **Motion search:** for each reference, an exhaustive quarter-resolution search, then a per-block full-pel and quarter-sample search on exact AV1 interpolation phase planes. Square blocks from 64×64 to 8×8 and rectangular HORZ/VERT halves (64×32 down to 16×8) each carry their own vector.
+- **Motion search:** for each reference, an exhaustive quarter-resolution search, then a per-block full-pel and quarter-sample search on exact AV1 interpolation phase planes. Blocks from 64×64 down to 8×8 in every AV1 partition shape except those with a 4-pixel side (square, HORZ/VERT halves, HORZ_4/VERT_4 quarters, three-way HORZ_A/B and VERT_A/B) each carry their own vector.
 - **Prediction:** each block uses LAST, ALTREF, or their compound average.
-- **Residuals:** a quantized DCT the size of the block (up to 64×64, rectangular for rectangular blocks), or four half-size luma transforms (TX_MODE_SELECT transform split). Partition, skip and transform choices are made by rate-distortion cost.
+- **Residuals:** a quantized DCT the size of the block (up to 64×64, rectangular for rectangular blocks), or a TX_MODE_SELECT transform split: one or two levels for square blocks, one level (longer side halved) for rectangular blocks. Partition, skip and transform choices are made by rate-distortion cost.
 - **Loop filtering:** deblocking and CDEF with levels chosen by measured error.
 - **Entropy modeling:** parallel kernels build the mode info and coefficient contexts, choose NEAREST/NEAR/NEW modes from the AV1 motion-vector candidate list, and emit compact symbol records with exact contexts.
 - **Reconstruction:** decoder-exact, so it can serve as a reference picture.

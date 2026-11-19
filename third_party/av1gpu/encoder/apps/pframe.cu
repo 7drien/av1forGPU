@@ -653,6 +653,56 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         }
         __syncwarp();
         if (p == 0) { lumaD = dCoded; lumaBits = bits; }
+        if (BW != BH && p == 0 && a.recon2) {
+            // rectangular split: two transforms, the longer side halved (Split_Tx_Size)
+            constexpr int SW = BW > BH ? BW / 2 : BW, SH = BW > BH ? BH : BH / 2;
+            constexpr int lsw = Log2<SW>::v, lsh = Log2<SH>::v;
+            const int stx = txSizeOf(lsw, lsh);
+            float dS = 0.f, bS = 0.f;
+            bool nzS = false;
+            uint8_t *pq = recS[warp], *rq = recS[warp] + SW * SH;
+            for (int k = 0; k < 2; k++) {
+                const int qx = BW > BH ? k * SW : 0, qy = BW > BH ? 0 : k * SH;
+                float en = 0.f;
+                for (int i = lane; i < SW * SH; i += 32) {
+                    const int r = i >> lsw, col = i & (SW - 1);
+                    const int x = px + qx + col, y = py + qy + r;
+                    const uint8_t pv = pred[(qy + r) * BW + qx + col];
+                    pq[i] = pv;
+                    int dd = 0;
+                    if (x < pw && y < ph) dd = (int)src[y * pitch + x] - pv;
+                    res[i] = (int16_t)dd;
+                    en += (float)(dd * dd);
+                }
+                __syncwarp();
+                EvalIn es = e;
+                es.txSz = stx;
+                es.skipCtx = 2;
+                es.resEnergy = warp_sum(en);
+                EvalOut os;
+                warp_fwd_rt(res, tmpS[warp], SW, SH, stx, AV1G_DCT_DCT);
+                warp_quant_rate_rt<8>(tmpS[warp], q, es, os, SW, SH);
+                bS += os.R;
+                inverseAddAny(lsw, lsh, q, stx, dcQ, acQ, res, pq, rq);
+                const int sqw = SW > 32 ? 32 : SW, sqh = SH > 32 ? 32 : SH;
+                int anyS = 0, sseS = 0;
+                for (int i = lane; i < SW * SH; i += 32) {
+                    const int r = i >> lsw, col = i & (SW - 1);
+                    const int x = px + qx + col, y = py + qy + r;
+                    const int16_t lv = (r < sqh && col < sqw) ? q[r * sqw + col] : 0;
+                    anyS |= lv;
+                    a.levels2[size_t(y) * apw + x] = lv;
+                    if (x >= pw || y >= ph) continue;
+                    const int dd = (int)src[y * pitch + x] - rq[i];
+                    sseS += dd * dd;
+                    a.recon2[y * pw + x] = rq[i];
+                }
+                nzS = nzS || __any_sync(0xffffffffu, anyS);
+                dS += (float)warp_sumi(sseS);
+                __syncwarp();
+            }
+            splitD[1] = dS; splitBits[1] = bS; nzSplit[1] = nzS;
+        }
         if (BW == BH && p == 0 && a.recon2) {
             // transform split: depth 1 (four half-size transforms) and, for 16x16 and larger, depth 2 (sixteen
             // quarter-size transforms), all with the same prediction
@@ -714,7 +764,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         int depth = 0;
         float bestJ = lumaD + a.lambda * lumaBits;
         for (int d = 1; d <= 2; d++)
-            if (BW == BH && a.recon2 && splitD[d] + a.lambda * (splitBits[d] + 1.f + 2.f * (d - 1)) < bestJ) {
+            if (a.recon2 && splitD[d] + a.lambda * (splitBits[d] + 1.f + 2.f * (d - 1)) < bestJ) {
                 bestJ = splitD[d] + a.lambda * (splitBits[d] + 1.f + 2.f * (d - 1));
                 depth = d;
             }
@@ -836,14 +886,13 @@ __global__ void decideGrid(DecideArgs a) {
                               : &a.rcand[rk][(gy >> s) * a.rcols[rk] + (gx >> (s - 1))];
                     bi.log2 = (uint8_t)(3 + s);
                     bi.part = (uint8_t)(t < 2 ? 1 : 2);
-                    bi.txSplit = 0;
                 } else {
                     c = &a.cand[s - 1][(gy >> (s - 1)) * a.cols[s - 1] + (gx >> (s - 1))];
                     bi.log2 = (uint8_t)(2 + s);
                     bi.part = 0;
                 }
                 const bool coded = c->nz && c->costCoded < c->costSkip;
-                if (!inRect) bi.txSplit = coded ? c->txSplit : 0;
+                bi.txSplit = coded ? c->txSplit : 0;
                 bi.mv = c->mv;
                 bi.mv2 = c->mv2;
                 bi.skip = (uint8_t)!coded;
@@ -862,6 +911,7 @@ __global__ void decideGrid(DecideArgs a) {
                 bi.txSplit = 0;
                 bi.log2 = (uint8_t)(3 + s);
                 bi.part = (uint8_t)(m - 2);
+                bi.txSplit = (c.nz && c.costCoded < c.costSkip) ? c.txSplit : 0;
                 bi.skip = (uint8_t)!(c.nz && c.costCoded < c.costSkip);
                 bi.ref = c.ref;
                 break;
@@ -888,8 +938,8 @@ struct CommitArgs {
     int gcols, w, h, aw, ah;
     const uint8_t *pred[kShapes], *recon[kShapes];
     const int16_t *levels[kShapes];
-    const uint8_t *recon2[kSizes], *recon3[kSizes];
-    const int16_t *levels2[kSizes], *levels3[kSizes];
+    const uint8_t *recon2[kShapes], *recon3[kSizes];
+    const int16_t *levels2[kShapes], *levels3[kSizes];
     uint8_t *out;
     int16_t *outLevels;
 };
@@ -912,7 +962,7 @@ __global__ void commit(CommitArgs a) {
     const int shape = !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
-        if (p == 0 && bi.txSplit) level = (bi.txSplit == 2 ? pickN(s, a.levels3) : pickN(s, a.levels2))[size_t(y) * apw + x];
+        if (p == 0 && bi.txSplit) level = (bi.txSplit == 2 ? pickN(s, a.levels3) : pickN(shape, a.levels2))[size_t(y) * apw + x];
         else level = pickN(shape, a.levels)[lbase + size_t(y) * apw + x];
     }
     a.outLevels[lbase + size_t(y) * apw + x] = level;
@@ -920,7 +970,7 @@ __global__ void commit(CommitArgs a) {
     if (x >= pw || y >= ph) return;
     const size_t off = (p ? size_t(a.w) * a.h + size_t(p - 1) * pw * ph : 0) + size_t(y) * pw + x;
     if (p == 0 && !bi.skip && bi.txSplit) {
-        a.out[off] = (bi.txSplit == 2 ? pickN(s, a.recon3) : pickN(s, a.recon2))[off];
+        a.out[off] = (bi.txSplit == 2 ? pickN(s, a.recon3) : pickN(shape, a.recon2))[off];
         return;
     }
     a.out[off] = (bi.skip ? pickN(shape, a.pred) : pickN(shape, a.recon))[off];
@@ -929,6 +979,7 @@ __global__ void commit(CommitArgs a) {
 // ------------------------------------------------------------------------------------------------
 // In-loop filter maps (spec Skips, LoopfilterTxSizes, cdef_idx) from the decision grid. Every transform equals
 // its block, so all transform edges are block edges and the intra-frame filter rules apply unchanged.
+__device__ __forceinline__ int imin6(int v) { return v > 6 ? 6 : v; }
 __global__ void buildFilterMaps(const BlockInfo *grid, int gcols, av1g_pf_frame f) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
     if (c >= f.MiCols || r >= f.MiRows) return;
@@ -937,7 +988,9 @@ __global__ void buildFilterMaps(const BlockInfo *grid, int gcols, av1g_pf_frame 
     f.skip[k] = bi.skip;
     const int lw = bi.log2 - (bi.part == 2) - 2 * (bi.part == 4), lh = bi.log2 - (bi.part == 1) - 2 * (bi.part == 3);
     const int sp = bi.skip ? 0 : bi.txSplit;
-    f.lfTx[0][k] = (uint8_t)txSizeOf(lw - sp, lh - sp);
+    const int tlw = imin6(lw), tlh = imin6(lh);
+    f.lfTx[0][k] = (uint8_t)(lw == lh ? txSizeOf(tlw - sp, tlh - sp)
+                                      : txSizeOf(tlw - (sp && lw > lh), tlh - (sp && lh > lw)));
     if (!(r & 1) && !(c & 1)) {
         const int cc = f.MiCols >> 1;
         const size_t kc = size_t(r >> 1) * cc + (c >> 1);
@@ -1318,6 +1371,8 @@ struct State {
     uint8_t *rpred[10] = {}, *rrecon[10] = {};
     int16_t *rlevels[10] = {};
     int rcols[10] = {}, rrows[10] = {};
+    uint8_t *rrecon2[10] = {};
+    int16_t *rlevels2[10] = {};
     int16_t *levels2[kSizes] = {};
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
     bool havePrev = false;
@@ -1377,6 +1432,7 @@ Analyzer::~Analyzer() {
     for (auto *p : s->levels) cudaFree(p);
     for (auto *p : s->recon2) cudaFree(p);
     for (int k = 0; k < kSizes; k++) { cudaFree(s->recon3[k]); cudaFree(s->levels3[k]); }
+    for (int k = 0; k < 10; k++) { cudaFree(s->rrecon2[k]); cudaFree(s->rlevels2[k]); }
     for (int k = 0; k < 10; k++) { cudaFree(s->rcand[k]); cudaFree(s->rpred[k]); cudaFree(s->rrecon[k]); cudaFree(s->rlevels[k]); }
     for (auto *p : s->levels2) cudaFree(p);
     cudaFree(s->outLevels);
@@ -1462,6 +1518,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->rpred[k], frame);
         alloc(&s->rrecon[k], frame);
         alloc(&s->rlevels[k], aframe * sizeof(int16_t));
+        alloc(&s->rrecon2[k], size_t(w) * h);
+        alloc(&s->rlevels2[k], size_t(aw) * ah * sizeof(int16_t));
     }
     alloc(&s->outLevels, aframe * sizeof(int16_t));
     s->gcols = aw / 8; s->grows = ah / 8;
@@ -1659,7 +1717,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     PF_EVAL(3, 64);
 #define PF_REVAL(RK, BW, BH)                                                                                    \
     ea.cand = s->rcand[RK]; ea.cols = s->rcols[RK]; ea.rows = s->rrows[RK];                                    \
-    ea.pred = s->rpred[RK]; ea.recon = s->rrecon[RK]; ea.levels = s->rlevels[RK]; ea.recon2 = nullptr;         \
+    ea.pred = s->rpred[RK]; ea.recon = s->rrecon[RK]; ea.levels = s->rlevels[RK];                              \
+    ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                           \
     evaluate<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,       \
                        32 * EvalCfg<BW, BH>::warps>>>(ea)
     if (st.rectPartitions) {
@@ -1691,7 +1750,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ca.recon2[k] = s->recon2[k]; ca.levels2[k] = s->levels2[k];
         ca.recon3[k] = s->recon3[k]; ca.levels3[k] = s->levels3[k];
     }
-    for (int k = 0; k < 10; k++) { ca.pred[4 + k] = s->rpred[k]; ca.recon[4 + k] = s->rrecon[k]; ca.levels[4 + k] = s->rlevels[k]; }
+    for (int k = 0; k < 10; k++) {
+        ca.pred[4 + k] = s->rpred[k]; ca.recon[4 + k] = s->rrecon[k]; ca.levels[4 + k] = s->rlevels[k];
+        ca.recon2[4 + k] = s->rrecon2[k]; ca.levels2[4 + k] = s->rlevels2[k];
+    }
     ca.out = recon;
     ca.outLevels = s->outLevels;
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);

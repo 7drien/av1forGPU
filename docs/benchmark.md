@@ -76,7 +76,7 @@ BD-rate of `--pframes` (negative is better):
 | SVT-AV1 preset 8 | +45.7% |
 | libaom `cpu-used 8` | +79.4% |
 
-Contributions measured on the way (BD-rate against SVT-AV1 preset 8): transform split +72.5% → +54.1%, then rectangular partitions → +45.5%.
+Contributions measured on the way (BD-rate against SVT-AV1 preset 8): transform split +72.5% → +54.1%, rectangular partitions → +45.5%, HORZ_4/VERT_4 → +41.8%, three-way partitions → +40.4%, depth-2 transform split → +38.8%, rectangular transform split → +38.2% (about 27 fps on the 120-frame test).
 
 Full 1,207-frame clip, piped from FFmpeg as in the commands above:
 

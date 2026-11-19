@@ -664,6 +664,14 @@ struct TileCoder {
     template <class F>
     AV1G_HDI void forTransformAreas(int miRow, int miCol, int lw, int lh, int depth, F f) {
         const bool split = depth > 0;
+        if (split && lw != lh) {
+            const int cw = imin(lw, 6) - (lw > lh), ch = imin(lh, 6) - (lh > lw), txSz = txSizeOfLog2(cw, ch);
+            for (int k = 0; k < 2; ++k) {
+                const int px = miCol * 4 + (lw > lh ? k << cw : 0), py = miRow * 4 + (lh > lw ? k << ch : 0);
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                f(0, px, py, txSz);
+            }
+        } else
         if (split) {
             const int t = 1 << (lw - depth), txSz = txSizeOfLog2(lw - depth, lw - depth), per = 1 << depth;
             for (int k = 0; k < per * per; ++k) {
@@ -732,6 +740,15 @@ struct TileCoder {
     template <class F>
     AV1G_HDI void forTransforms(int miRow, int miCol, int lw, int lh, int depth, F f) {
         const bool split = depth > 0;
+        if (split && lw != lh) {
+            const int cw = imin(lw, 6) - (lw > lh), ch = imin(lh, 6) - (lh > lw), txSz = txSizeOfLog2(cw, ch);
+            for (int k = 0; k < 2; ++k) {
+                const int px = miCol * 4 + (lw > lh ? k << cw : 0), py = miRow * 4 + (lh > lw ? k << ch : 0);
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                loadLevels(0, px, py, imin(1 << cw, 32), imin(1 << ch, 32));
+                f(0, px >> 2, py >> 2, txSz);
+            }
+        } else
         if (split) {
             const int t = 1 << (lw - depth), txSz = txSizeOfLog2(lw - depth, lw - depth), per = 1 << depth;
             for (int k = 0; k < per * per; ++k) {
@@ -784,8 +801,8 @@ struct TileCoder {
                     m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
                     m.mv[0] = bi.mv;
                     m.mv[1] = compound ? bi.mv2 : pf::Mv{0, 0};
-                    m.txW = (uint8_t)(imin(lw, 6) - depth);
-                    m.txH = (uint8_t)(imin(lh, 6) - depth);
+                    m.txW = (uint8_t)(imin(lw, 6) - (lw == lh ? depth : (depth && lw > lh)));
+                    m.txH = (uint8_t)(imin(lh, 6) - (lw == lh ? depth : (depth && lh > lw)));
                     m.order = curOrder;
                 }
             if (!skip) forTransformAreas(miRow, miCol, lw, lh, depth, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
@@ -898,7 +915,15 @@ struct TileCoder {
                 return (sqrUp != maxTx) * 3 + (4 - maxTx) * 6 + (aw2 < (1 << tw2)) + (lh2 < (1 << th2));
             };
             sym(ic->txfmSplit[txCtx(miRow, miCol, imin(lw, 6), imin(lh, 6))], split, 2);
-            if (split && size - 1 > 2) {   // depth 1 children (not 4x4) code txfm_split; depth 2 leaves code nothing
+            if (split && lw != lh) {
+                // rectangular: two children with the longer side halved, coding txfm_split = 0 unless 4x4
+                const int cw = imin(lw, 6) - (lw > lh), ch = imin(lh, 6) - (lh > lw);
+                for (int k = 0; k < 2; k++) {
+                    const int r = miRow + (lh > lw ? k * (1 << (ch - 2)) : 0), c = miCol + (lw > lh ? k * (1 << (cw - 2)) : 0);
+                    if (r >= fs->miRows || c >= fs->miCols) continue;
+                    if (!(cw == 2 && ch == 2)) sym(ic->txfmSplit[txCtx(r, c, cw, ch)], 0, 2);
+                }
+            } else if (split && size - 1 > 2) {   // depth 1 children (not 4x4) code txfm_split; depth 2 leaves code nothing
                 const int half = 1 << (size - 3);
                 for (int k = 0; k < 4; k++) {
                     const int r = miRow + (k >> 1) * half, c = miCol + (k & 1) * half;

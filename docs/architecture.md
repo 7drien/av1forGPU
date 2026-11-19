@@ -41,8 +41,8 @@ The `av1gpu-framehdr` utility writes a reduced still-picture key-frame header OB
 The supported inter subset:
 
 - **Frames:** single-tile by default (uniform tiles optional), 64×64 superblocks, `enable_order_hint = 0`. Each mini-GOP is a pyramid of hidden ALTREF and middle frames, displayed with `show_existing_frame`. A filtered ALTREF is displayed through an overlay frame instead.
-- **Blocks:** square partitions from 64×64 to 8×8, plus HORZ/VERT partitions of 16×16 to 64×64 nodes. Each block is single-reference (LAST or ALTREF) or a COMPOUND_AVERAGE of both. Modes are NEAREST, NEAR, GLOBAL and NEW, with their compound forms. Vectors use quarter-sample precision and the regular eight-tap filter.
-- **Residuals:** TX_MODE_SELECT. DCT_DCT transforms equal to the block (square or 2:1, up to 64×64), or one level of luma transform split for square blocks, with `reduced_tx_set`.
+- **Blocks:** NONE, SPLIT, HORZ, VERT, HORZ_A/B, VERT_A/B and (for 32×32 and 64×64 nodes) HORZ_4/VERT_4 partitions. Blocks are at least 8×8. Each block is single-reference (LAST or ALTREF) or a COMPOUND_AVERAGE of both. Modes are NEAREST, NEAR, GLOBAL and NEW, with their compound forms. Vectors use quarter-sample precision and the regular eight-tap filter.
+- **Residuals:** TX_MODE_SELECT. DCT_DCT transforms equal to the block (square or 2:1, up to 64×64), or a luma transform split: up to depth 2 (MAX_VARTX_DEPTH) for square blocks, depth 1 for rectangular blocks, with `reduced_tx_set`.
 - **Filters:** deblocking and CDEF, with one CDEF strength per frame.
 - **CDFs:** frame-end CDFs are kept per reference slot for `primary_ref_frame`.
 
@@ -61,7 +61,7 @@ Every feature is validated by decoding with dav1d and comparing to the encoder r
 
 Done: CUDA motion search with per-block vectors, a hidden-ALTREF pyramid with compound prediction, rate control, in-loop filters, GPU and overlapped CPU entropy coding, and BD-rate tooling (`tests/compare.py`). Remaining gaps relative to SVT-AV1 preset 8:
 
-1. 4×N, 4:1 and AB partitions, and deeper transform split.
+1. Blocks with a 4-pixel side (4×4, 4×8, 8×4, 16×4, 4×16). Their chroma is predicted from several luma blocks' vectors.
 2. Intra blocks in inter frames. These need a wavefront for neighbor reconstruction.
 3. Switchable interpolation filters, inter transform types other than DCT_DCT, OBMC and warped motion.
 4. Broader input formats and audio/container support, once the elementary video path is stable.
