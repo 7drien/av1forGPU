@@ -87,6 +87,8 @@ int main(int argc, char **argv) {
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
     bool pfGpuEntropy = false;
+    int pfTfFrames = 0;
+    float pfTfStrength = 1.0f;
     bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
     bool useAnchor = false;
@@ -192,6 +194,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--pf-tiles takes log2 tile columns and rows (0..6)\n");
                 return 2;
             }
+        } else if (!strcmp(argv[i], "--pf-tf-frames") && i + 1 < argc) {
+            pfTfFrames = atoi(argv[++i]);
+            if (pfTfFrames < 0 || pfTfFrames > 4) { fprintf(stderr, "--pf-tf-frames must be 0..4\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-tf-strength") && i + 1 < argc) {
+            pfTfStrength = strtof(argv[++i], nullptr);
+            if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
+        } else if (!strcmp(argv[i], "--pf-rdoq")) {
+            pfSettings.rdoq = true;
         } else if (!strcmp(argv[i], "--pf-gpu-entropy")) {
             pfGpuEntropy = true;
         } else if (!strcmp(argv[i], "--pf-no-filters")) {
@@ -416,11 +426,14 @@ int main(int argc, char **argv) {
         for (int k = 0; k < 8; ++k)
             if (cudaMalloc(&slotBuf[k], frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
         if (cudaMalloc(&spare, frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
-        std::vector<std::array<uint8_t *, 3>> inBuf(G);
+        std::vector<std::array<uint8_t *, 3>> inBuf(G + pfTfFrames + 1);
         for (auto &fb : inBuf)
             for (int p = 0; p < 3; ++p)
                 if (cudaMalloc(&fb[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "input allocation failed\n"); return 1; }
         bool slotValid[8] = {};
+        std::array<uint8_t *, 3> tfBuf{};
+        for (int p = 0; p < 3; ++p)
+            if (cudaMalloc(&tfBuf[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "filter buffer allocation failed\n"); return 1; }
         std::vector<std::vector<uint8_t>> pending;   // raw frames read ahead
         bool eof = false;
         auto readMore = [&](size_t want) {
@@ -755,7 +768,7 @@ int main(int argc, char **argv) {
             }
             const uint64_t untilKey = keyInterval - (frameCount - lastKeyIndex);
             const size_t g = std::min<size_t>(G, untilKey);
-            readMore(g);
+            readMore(g + pfTfFrames);
             const size_t n = std::min(g, pending.size());
             if (n == 1) {
                 // single P frame from the last shown picture
@@ -771,8 +784,32 @@ int main(int argc, char **argv) {
             // Mini-GOP pyramid: the last frame is coded first as a hidden ALTREF; each interval (lo, hi) codes its middle
             // frame from lo (LAST) and hi (ALTREF), hidden unless it is the next frame to display, and shows coded
             // frames with show_existing_frame when their turn comes.
-            for (size_t i = 0; i < n; ++i)
+            const size_t avail = std::min(pending.size(), n + pfTfFrames);
+            for (size_t i = 0; i < avail; ++i)
                 if (!upload(pending[i], inBuf[i])) { fprintf(stderr, "upload failed\n"); return 1; }
+            // temporal filter of the ALTREF source from its neighbours (past frames of this mini-GOP, read-ahead frames)
+            bool filtered = false;
+            std::array<uint8_t *, 3> altSrc = inBuf[n - 1];
+            if (pfTfFrames > 0) {
+                std::vector<const uint8_t *> nbs[3];
+                for (int d = -pfTfFrames; d <= pfTfFrames; ++d) {
+                    const long idx = long(n) - 1 + d;
+                    if (!d || idx < 0 || idx >= long(avail)) continue;
+                    for (int p = 0; p < 3; ++p) nbs[p].push_back(inBuf[idx][p]);
+                }
+                if (!nbs[0].empty()) {
+                    const uint8_t *const center[3] = {inBuf[n - 1][0], inBuf[n - 1][1], inBuf[n - 1][2]};
+                    const uint8_t *const *nbp[3] = {nbs[0].data(), nbs[1].data(), nbs[2].data()};
+                    uint8_t *const outp[3] = {tfBuf[0], tfBuf[1], tfBuf[2]};
+                    if (pfAnalyzer.temporalFilter(center, nbp, int(nbs[0].size()), std::max(1, pfSettings.qindex - pfAltrefBoost),
+                                                  pfTfStrength, outp, perr, sizeof perr)) {
+                        fprintf(stderr, "%s\n", perr);
+                        return 1;
+                    }
+                    altSrc = tfBuf;
+                    filtered = true;
+                }
+            }
             std::vector<int> freeSlots;
             for (int k = 7; k >= 0; --k)
                 if (k != lastShown) freeSlots.push_back(k);
@@ -791,9 +828,19 @@ int main(int argc, char **argv) {
             };
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();
-            if (interFrame(inBuf[n - 1], lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
+            if (interFrame(altSrc, lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
             std::function<int(uint64_t, uint64_t, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
                                                                             int hiSlotL, int depth) -> int {
+                if (hi == lo + 1 && filtered && hi == base + n) {
+                    // overlay: display the original picture coded from the filtered ALTREF (refreshes no slot)
+                    if (interFrame(inBuf[n - 1], loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
+                                   true, true, frameCount))
+                        return 1;
+                    dump(spare);
+                    ++predicted; ++frameCount;
+                    release(loSlot);
+                    return 0;
+                }
                 if (hi == lo + 1) {
                     Job se;
                     se.kind = Job::ShowExisting;
@@ -808,7 +855,8 @@ int main(int argc, char **argv) {
                 }
                 const uint64_t mid = (lo + hi) / 2;
                 if (mid == lo + 1) {
-                    const bool referenced = hi - mid > 1;
+                    // the frame shown before an overlay is the overlay's LAST reference
+                    const bool referenced = hi - mid > 1 || (filtered && hi == base + n);
                     const int midSlot = referenced ? allocSlot() : -1;
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
                     if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
@@ -840,6 +888,7 @@ int main(int argc, char **argv) {
         stopWriter();
         for (auto &fb : inBuf)
             for (auto *p : fb) cudaFree(p);
+        for (auto *p : tfBuf) cudaFree(p);
         for (auto *p : slotBuf) cudaFree(p);
         cudaFree(spare);
         return 0;

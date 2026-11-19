@@ -36,12 +36,35 @@ The `av1gpu-framehdr` utility writes a reduced still-picture key-frame header OB
 
 `third_party/av1gpu` supplies a working CUDA software encoder backend for still images. It performs block decisions, reconstruction, post-filtering, and tile entropy coding on CUDA and writes AVIF. A locally built `sm_86` binary encoded a 1080×1920 frame extracted from the sample video in 200.54 ms of GPU pipeline time, and FFmpeg decoded its output. See [benchmark.md](benchmark.md) for the exact run and limitations. Its BSD-2-Clause license and third-party notices are retained with the source.
 
+## CUDA inter frames (`--pframes`)
+
+The supported inter subset:
+
+- **Frames:** single-tile by default (uniform tiles optional), 64×64 superblocks, `enable_order_hint = 0`. Each mini-GOP is a pyramid of hidden ALTREF and middle frames, displayed with `show_existing_frame`. A filtered ALTREF is displayed through an overlay frame instead.
+- **Blocks:** square partitions from 64×64 to 8×8. Each block is single-reference (LAST or ALTREF) or a COMPOUND_AVERAGE of both. Modes are NEAREST, NEAR, GLOBAL and NEW, with their compound forms. Vectors use quarter-sample precision and the regular eight-tap filter.
+- **Residuals:** TX_MODE_LARGEST, with DCT_DCT from 8×8 to 64×64 and `reduced_tx_set`.
+- **Filters:** deblocking and CDEF, with one CDEF strength per frame.
+- **CDFs:** frame-end CDFs are kept per reference slot for `primary_ref_frame`.
+
+Pipeline (`encoder/apps/pframe.cu`, `pframe_tile.cuh`, `pframe_writer.h`):
+
+1. **Phase planes (GPU):** each reference is expanded into its 16 exact quarter-sample planes.
+2. **Search (GPU):** a quarter-resolution coarse search, then per-size refinement on the phase planes, then the LAST / ALTREF / compound choice.
+3. **Evaluation (GPU):** exact prediction, forward DCT, quantization, an AV1-context rate estimate, and an exact inverse transform. Bottom-up partition decisions, then commit of the reconstruction and levels.
+4. **Filters (GPU):** deblocking and CDEF searches on the reconstruction.
+5. **Entropy coding:** the tile coder runs on a CPU writer thread overlapped with the GPU (default), or on the GPU with one thread per tile. The host writes the frame header and OBUs.
+6. **Rate control (host):** one quantizer per period, adjusted by the measured bits.
+
+Every feature is validated by decoding with dav1d and comparing to the encoder reconstruction. Full-clip streams are also cross-checked with libaom and NVDEC.
+
 ## Next milestone: inter-frame coding and quality
 
-1. Use decoded references to add inter-frame prediction and motion search on CUDA.
-2. Add rate control and GOP/keyframe scheduling.
-3. Compare visual quality and bitrate against libaom on the same input, then tune CUDA occupancy, memory transfers, and kernel scheduling.
-4. Broaden input formats and add audio/container support only after the elementary video path is stable.
+Done: CUDA motion search with per-block vectors, a hidden-ALTREF pyramid with compound prediction, rate control, in-loop filters, GPU and overlapped CPU entropy coding, and BD-rate tooling (`tests/compare.py`). Remaining gaps relative to SVT-AV1 preset 8:
+
+1. Rectangular and 4×N partitions, and transform split (TX_MODE_SELECT).
+2. Intra blocks in inter frames. These need a wavefront for neighbor reconstruction.
+3. Switchable interpolation filters, inter transform types other than DCT_DCT, OBMC and warped motion.
+4. Broader input formats and audio/container support, once the elementary video path is stable.
 
 The all-intra milestone requires independent decoding of the full output with the expected frame count and timestamps. The sample video benchmark is recorded in [benchmark.md](benchmark.md).
 

@@ -28,7 +28,7 @@ See [docs/architecture.md](docs/architecture.md) for the initial implementation 
 
 ## Build and current status
 
-The CUDA video encoder reads raw 8-bit YUV420 and writes IVF. Its default mode batches independent keyframes. Enable native temporal prediction with `--inter`, or opt into variable presentation timing with `--adaptive-fps`. Encoding uses a fixed quantizer.
+The CUDA video encoder reads raw 8-bit YUV420 and writes IVF. Its default mode batches independent keyframes. `--pframes` enables the CUDA inter encoder described below: per-block motion vectors, a hidden-ALTREF pyramid with compound prediction, in-loop filters and optional rate control. The older `--inter` modes remain for experiments.
 
 Requirements: NVIDIA driver, CUDA Toolkit 12+, CMake 3.24+, a C++17 compiler, and JPEG/PNG/WebP development libraries. Build for an RTX 3060 Ti with:
 
@@ -62,7 +62,38 @@ build/av1gpu-framehdr 1080 1920 build/frame_header.obu
 
 The single-frame analysis tool accepts exactly one tightly packed, 8-bit planar YUV420 frame; the stream tool reads frames from standard input. The sequence-header tool takes an explicit level index (8 is AV1 level 4.0). The frame-header tool emits only a header OBU; it must be paired with matching sequence and tile data and is not a decodable frame by itself. See [docs/benchmark.md](docs/benchmark.md) for measured prototype and encoder-foundation results.
 
-### Native temporal prediction
+### CUDA inter encoder (`--pframes`)
+
+`--pframes` is the recommended video mode. After each keyframe it codes mini-GOPs of up to 32 frames (`--pf-gop N`) as a hierarchical pyramid. The last frame is coded first as a hidden ALTREF. Each middle frame predicts from its nearest coded past frame (LAST) and future frame (ALTREF). Hidden frames are displayed later with `show_existing_frame`.
+
+Per frame, CUDA does the following:
+
+- **Motion search:** for each reference, an exhaustive quarter-resolution search, then a per-block full-pel and quarter-sample search on exact AV1 interpolation phase planes. Square blocks from 64×64 to 8×8 each carry their own vector.
+- **Prediction:** each block uses LAST, ALTREF, or their compound average.
+- **Residuals:** a quantized DCT with a transform the size of the block (8×8 to 64×64), with skip, coded and split decisions made by rate-distortion cost.
+- **Loop filtering:** deblocking and CDEF with levels chosen by measured error.
+- **Reconstruction:** decoder-exact, so it can serve as a reference picture.
+
+The AV1 tile syntax is one `__host__ __device__` coder (`encoder/apps/pframe_tile.cuh`). By default a writer thread runs it on the CPU from pinned-memory copies of the decisions, overlapped with the GPU analysis of later frames. `--pf-gpu-entropy` instead codes each AV1 tile in its own CUDA thread. That is slower here and needs many tiles, which cost about 5% in size. `--pf-tiles C R` sets log2 tile columns and rows.
+
+```sh
+ffmpeg -hide_banner -loglevel error -i benckmark/video_1.mp4 -map 0:v:0 \
+  -vf scale=in_range=tv:out_range=pc:in_color_matrix=bt709:out_color_matrix=bt709 -f rawvideo -pix_fmt yuv420p - | \
+  build-cuda/third_party/av1gpu/av1gpu-video 1080 1920 30 1 out.ivf --pframes --persistent-cdf --qindex 100
+```
+
+Options:
+
+- `--qindex N` sets the keyframe quantizer. P frames use N + 60 (`--pf-qoffset`), lowered by up to `--pf-altref-boost` (default 100) toward the base of the pyramid.
+- `--bitrate KBPS` enables rate control: one base quantizer per keyframe or mini-GOP period, with a buffer of `--rc-buffer` seconds (default 2).
+- `--persistent-cdf` carries adapted probabilities between frames through each reference slot.
+- `--pf-tf-frames K` enables a GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display. Off by default: no gain on the sample clip.
+- `--pf-rdoq` enables greedy rate-distortion optimized quantization. Off by default: no gain on the sample clip.
+- `--pf-no-filters` turns off in-loop filtering.
+
+On the 1,207-frame sample clip this path runs at about 60 fps on an RTX 3060 Ti, including FFmpeg's H.264 decode. Its output decodes byte-identically with dav1d, libaom and the GPU's NVDEC AV1 decoder. See [docs/benchmark.md](docs/benchmark.md) for rate-quality results.
+
+### Native temporal prediction (earlier experimental modes)
 
 Append `--inter` to the existing av1gpu-video command. CUDA evaluates five integer translations by default, or seven with `--diagonal-motion` per 64×64 region against the most recent reconstructed keyframe, including chroma. AV1 segmentation selects each block's translation. Use `--motion-step N` to set the displacement to an even number of pixels from 2 to 16. Each search evaluates zero and the enabled directions at that displacement. Use `--auto-motion-step` with fixed frame timing to choose among 2, 4, 8 and 16 pixels from a sampled CUDA luma search before the full luma and chroma search. The encoder writes an inter frame when local and frame-average prediction errors fit the quantizer-dependent limits. Larger changes trigger a new keyframe, with a maximum spacing of 120 input ticks by default, configurable with `--keyint`. Use `--scene-cut-rms N` to enable early keyframes even in residual modes. It requires frame-wide prediction RMS above N and at least one third of samples in regions above that threshold. The measurement includes luma and chroma. This implementation uses skipped residuals on predicted pictures. Its single-tile inter path supports even dimensions up to 4096 pixels wide and 9,437,184 padded luma samples. Other sizes use the existing keyframe path.
 
@@ -78,4 +109,4 @@ Add `--anchor-reference` to rolling reference mode to retain the most recent rec
 
 Use `--adaptive-fps` to enable prediction and hold a displayed picture when the extra prediction error is small. IVF presentation timestamps use the original input time base. Remux with FFmpeg stream copy to preserve variable sample durations in MP4. Input is still a fixed-rate raw stream. Add `--grain 12` for optional decoder-synthesized luma grain (strength 0–32, default 0). Grain uses a new seed per picture, so enabling grain retains every input tick. The model uses a manually selected amplitude.
 
-Run `python3 tests/check_inter.py build-cuda/third_party/av1gpu/av1gpu-video` to check reconstructed motion blocks and variable timing with dav1d. Full sample results are in [the native inter sweep](benckmark/inter_sweep/README.md).
+Run `python3 tests/check_pframes.py build-cuda/third_party/av1gpu/av1gpu-video` to check that dav1d decodes `--pframes` streams to exactly the encoder's reconstruction. It covers pyramids, keyframe boundaries, tiles, both entropy coders and rate control. Run `python3 tests/compare.py build-cuda/third_party/av1gpu/av1gpu-video --refs svt,aom` for BD-rate against SVT-AV1 and libaom on the first 120 frames of the sample clip. Run `python3 tests/check_inter.py build-cuda/third_party/av1gpu/av1gpu-video` to check reconstructed motion blocks and variable timing with dav1d. Full sample results are in [the native inter sweep](benckmark/inter_sweep/README.md).

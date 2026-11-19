@@ -25,7 +25,11 @@
 
 ## Testing & Validation
 
-- No automated test framework is configured yet. When adding one, keep tests separate from production sources and document its command here.
+- Tests live in `tests/` (no framework; each script exits non-zero on failure). After building `build-cuda`:
+  - `python3 tests/check_pframes.py build-cuda/third_party/av1gpu/av1gpu-video`: `--pframes` streams must decode with dav1d to exactly the encoder reconstruction.
+  - `python3 tests/check_inter.py build-cuda/third_party/av1gpu/av1gpu-video`: the older `--inter` modes.
+  - `python3 tests/compare.py build-cuda/third_party/av1gpu/av1gpu-video --refs svt,aom`: BD-rate against SVT-AV1 and libaom (outputs in `build-cuda/compare/`).
+  - `tests/gen_inter_tables.py` regenerates `encoder/apps/inter_tables.h` from the AV1 specification source.
 - For now, `make` checks compilation. For encoder work, add bitstream validation with an independent AV1 decoder as soon as the feature can emit a complete stream; document the input and expected result.
 
 ## Commits & Pull Requests

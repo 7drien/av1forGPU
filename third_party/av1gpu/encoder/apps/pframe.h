@@ -35,6 +35,7 @@ struct Settings {
     int searchRange = 64;    // full-pel coarse search radius
     float rnd = 0.33f, zbin = 0.70f;
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
+    bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
 };
 
 // In-loop filter parameters chosen for a P frame (the reconstruction already includes them).
@@ -95,6 +96,10 @@ public:
                bool search, FilterParams &out, char *err, int errLen);
     // Forget the temporal motion field (after a keyframe).
     void resetTemporal();
+    // Motion-compensated temporal filter of a padded source frame (planes with pitches aw, aw/2, aw/2) from up to 8
+    // neighbouring padded frames; out receives the filtered padded planes. strength scales the blending weights.
+    int temporalFilter(const uint8_t *const center[3], const uint8_t *const *const neighbors[3], int count, int qindex,
+                       float strength, uint8_t *const out[3], char *err, int errLen);
     // Code the tiles of the last analyzed frame on the GPU.
     int entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen);
     int width() const { return w; }

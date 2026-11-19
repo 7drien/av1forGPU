@@ -55,3 +55,32 @@ On the same RTX 3060 Ti and 1,207-frame clip, rerun the full encode command abov
 | Batched fast | 38.51 | 31.34 | 50,545,035 | 46.81 dB |
 
 The default output matched the previous IVF byte for byte. Both new modes processed seven frames per full batch on this clip. Fast mode also used 4×4 tiles and the turbo3 search preset. Batch buffering adds latency even when throughput exceeds the playback rate.
+
+## CUDA inter encoder (`--pframes`)
+
+Same RTX 3060 Ti and clip. The rate-quality points come from `python3 tests/compare.py build-cuda/third_party/av1gpu/av1gpu-video --refs svt,aom --ours "--pframes --persistent-cdf --qindex {q}" --qs 40,80,120,160`. That covers the first 120 frames, range-converted to full-range BT.709, decoded with dav1d. PSNR is YUV-weighted 6:1:1. References are SVT-AV1 at CRF 24/32/40/48 (preset 8, plus preset 12) and libaom with `cpu-used 8`.
+
+| qindex | kbit/s | PSNR (dB) |
+| ---: | ---: | ---: |
+| 40 | 2637.6 | 55.50 |
+| 80 | 824.4 | 50.77 |
+| 120 | 470.0 | 47.96 |
+| 160 | 261.5 | 45.26 |
+
+BD-rate of `--pframes` (negative is better):
+
+| Against | BD-rate |
+| --- | ---: |
+| This encoder at the start of the inter work (`--inter-qindex`, rolling reference) | −79.0% |
+| SVT-AV1 preset 12 | −11.2% |
+| SVT-AV1 preset 8 | +72.5% |
+| libaom `cpu-used 8` | +112.9% |
+
+Full 1,207-frame clip, piped from FFmpeg as in the commands above:
+
+| Mode | Wall time | Frames/s | Output |
+| --- | ---: | ---: | ---: |
+| `--pframes --persistent-cdf --qindex 100` | 20.5 s | 59.9 | 3,477,442 bytes |
+| `--pframes --persistent-cdf --bitrate 600` | 20.0 s | 61.4 | 3,007,951 bytes (598.1 kbit/s) |
+
+dav1d, libaom and NVDEC (`av1_cuvid`) decoded both streams to byte-identical output (1,207 frames). P-frame GPU time is about 8 ms per frame: refinement 5.3 ms, evaluation 2.0 ms, coarse search 0.6 ms. Filters add about 2 ms. Entropy coding runs concurrently on the CPU.
