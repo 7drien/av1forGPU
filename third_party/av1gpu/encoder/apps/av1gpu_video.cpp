@@ -86,6 +86,8 @@ int main(int argc, char **argv) {
     int pfQindex = 0, pfQoffset = 60, pfGop = 32, pfAltrefBoost = 100, pfLeafOffset = 0;
     double targetKbps = 0, rcBufferSeconds = 2.0;
     int pfTileCols = -1, pfTileRows = -1;
+    bool pfLr = true;
+    int pfLrFrames = 0;   // luma Wiener loop restoration (--pf-no-lr)
     int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
     int pfTfFrames = 0;
@@ -205,6 +207,8 @@ int main(int argc, char **argv) {
             pfSettings.rectPartitions = false;
         } else if (!strcmp(argv[i], "--pf-refs") && i + 1 < argc) {
             pfRefs = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--pf-lr")) {
+            pfLr = true;
         } else if (!strcmp(argv[i], "--pf-fast")) {
             pfSettings.splitTypes = 2;
         } else if (!strcmp(argv[i], "--pf-no-prune")) {
@@ -642,6 +646,7 @@ int main(int argc, char **argv) {
             pfMs += pfAnalyzer.lastMs();
             const auto tf0 = std::chrono::steady_clock::now();
             pf::FilterParams flt;
+            flt.lrAllowed = pfLr;
             if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, true, flt, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
@@ -661,6 +666,7 @@ int main(int argc, char **argv) {
             ein.txModeSelect = pfSettings.txSplit;
             ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.switchableFilter = pfSettings.switchableFilter;
+            ein.lrLuma = flt.lrLuma;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -673,6 +679,8 @@ int main(int argc, char **argv) {
             fp.txModeSelect = pfSettings.txSplit;
             fp.reducedTxSet = pfSettings.txTypes < 2;
             fp.switchable = pfSettings.switchableFilter;
+            fp.lrType[0] = flt.lrLuma ? 2 : 0;   // lr_type 2: RESTORE_WIENER
+            pfLrFrames += flt.lrLuma;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;
@@ -1128,7 +1136,7 @@ int main(int argc, char **argv) {
     if (usePframes)
         fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
                 pfBits[0], pfBits[1], pfBits[2], pfBits[3]),
-        fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms\n", pfFilterMs, pfWriteMs),
+        fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms, loop restoration in %d frames\n", pfFilterMs, pfWriteMs, pfLrFrames),
         fprintf(stderr, "P-frame analysis %.1f ms; compound blocks %llu; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
                 (unsigned long long)pfCompound,
                 (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],

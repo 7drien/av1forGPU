@@ -32,6 +32,7 @@ struct InterCdfs {
     uint16_t txSet3[4][3];
     uint16_t txSet1[2][17], txSet2[13];
     uint16_t interpFilter[16][4];
+    uint16_t useWiener[3];
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
 };
@@ -127,6 +128,8 @@ struct FrameSyntax {
     int txModeSelect;     // TX_MODE_SELECT: coded blocks signal txfm_split
     int reducedTxSet;     // reduced_tx_set
     int switchable;       // is_filter_switchable
+    int lrLuma;           // FrameRestorationType[0] = RESTORE_WIENER (64-sample units)
+    int width, height;    // FrameWidth, FrameHeight
     int miRows, miCols, aw, ah, gcols;
 };
 
@@ -1006,10 +1009,87 @@ struct TileCoder {
         if (hasRows && hasCols) sym(pc, nd.part, size == 3 ? 4 : 10);
         else symSplitOr(pc, hasRows);
     }
+    // ---- loop restoration (luma Wiener, 64-sample units; spec 5.11.57 read_lr) ----
+    AV1G_HDI static int lrUnits(int size) { return imax((size + 32) / 64, 1); }   // count_units_in_frame(64, size)
+    // units coded at superblock (r, c) in mode-info units: rows [*r0, *r1), columns [*c0, *c1)
+    AV1G_HDI void lrRange(int r, int c, int *r0, int *r1, int *c0, int *c1) const {
+        const int rows = lrUnits(fs->height), cols = lrUnits(fs->width);
+        *r0 = (r * 4 + 63) / 64; *r1 = imin(rows, ((r + 16) * 4 + 63) / 64);
+        *c0 = (c * 4 + 63) / 64; *c1 = imin(cols, ((c + 16) * 4 + 63) / 64);
+    }
+    AV1G_HDI const pf::BlockInfo &lrUnit(int ur, int uc) const { return grid[(ur * 8) * fs->gcols + uc * 8]; }
+    // literal bits of the subexponential code (encoder side of decode_signed_subexp_with_ref_bool)
+    AV1G_HDI void bits(int v, int n) {
+        CoeffSinkT sk{recs, &nrec, recCap, &run};
+        for (int i = n - 1; i >= 0; i--) sk.bit((v >> i) & 1);
+    }
+    AV1G_HDI static int recenter(int r, int v) {   // inverse of inverse_recenter
+        if (v > 2 * r) return v;
+        return v >= r ? (v - r) << 1 : ((r - v) << 1) - 1;
+    }
+    AV1G_HDI void subexpBool(int numSyms, int k, int x) {
+        int i = 0, mk = 0;
+        for (;;) {
+            const int b2 = i ? k + i - 1 : k, a = 1 << b2;
+            if (numSyms <= mk + 3 * a) {   // NS(numSyms - mk)
+                const int n = numSyms - mk, v = x - mk;
+                int w = 0;
+                while ((1 << (w + 1)) <= n) ++w;
+                ++w;                       // FloorLog2(n) + 1
+                const int m = (1 << w) - n;
+                if (v < m) bits(v, w - 1);
+                else { bits((v + m) >> 1, w - 1); bits((v + m) & 1, 1); }
+                return;
+            }
+            const int more = x >= mk + a;
+            bits(more, 1);
+            if (!more) { bits(x - mk, b2); return; }
+            ++i;
+            mk += a;
+        }
+    }
+    AV1G_HDI void signedSubexp(int low, int high, int k, int ref, int v) {
+        const int mx = high - low, r = ref - low, x = v - low;
+        subexpBool(mx, k, (r << 1) <= mx ? recenter(r, x) : recenter(mx - 1 - r, mx - 1 - x));
+    }
+    // read_lr of the superblock at (r, c). The Wiener references are the coefficients of the last unit coded with
+    // Wiener earlier in the tile (Wiener_Taps_Mid at the tile start): found by scanning back, so blocks stay independent.
+    AV1G_HDI void emitLr(int r, int c) {
+        int r0, r1, c0, c1;
+        lrRange(r, c, &r0, &r1, &c0, &c1);
+        if (r0 >= r1 || c0 >= c1) return;
+        int ref[2][3] = {{3, -7, 15}, {3, -7, 15}};
+        bool found = false;
+        for (int sr = r; sr >= rowStart && !found; sr -= 16)
+            for (int sc = sr == r ? c - 16 : colStart + ((colEnd - colStart - 1) / 16) * 16;
+                 sc >= colStart && !found; sc -= 16) {
+                int a0, a1, b0, b1;
+                lrRange(sr, sc, &a0, &a1, &b0, &b1);
+                for (int ur = a1 - 1; ur >= a0 && !found; --ur)
+                    for (int uc = b1 - 1; uc >= b0 && !found; --uc)
+                        if (lrUnit(ur, uc).lrUse) {
+                            for (int p = 0; p < 2; p++) for (int j = 0; j < 3; j++) ref[p][j] = lrUnit(ur, uc).lrCoef[p][j];
+                            found = true;
+                        }
+            }
+        const int tmin[3] = {-5, -23, -17}, tmax[3] = {10, 8, 46}, tk[3] = {1, 2, 3};
+        for (int ur = r0; ur < r1; ++ur)
+            for (int uc = c0; uc < c1; ++uc) {
+                const pf::BlockInfo &u = lrUnit(ur, uc);
+                sym(ic->useWiener, u.lrUse ? 1 : 0, 2);
+                if (!u.lrUse) continue;
+                for (int p = 0; p < 2; p++)
+                    for (int j = 0; j < 3; j++) {
+                        signedSubexp(tmin[j], tmax[j] + 1, tk[j], ref[p][j], u.lrCoef[p][j]);
+                        ref[p][j] = u.lrCoef[p][j];
+                    }
+            }
+    }
     // Phases 2 and 3 for one block of the list (blocks are independent in these phases).
     AV1G_HDI void runEntry(const BlockEntry &e) {
         curOrder = e.order;
         run = 0;
+        if (phase == 3 && fs->lrLuma && (e.order & 0xff) == 0) emitLr(e.r & ~15, e.c & ~15);
         if (phase == 3)
             for (int k = 0; k < e.nNodes; k++) emitNode(e.nodes[k]);
         block(e.r, e.c, e.lw, e.lh, grid[(e.r >> 1) * fs->gcols + (e.c >> 1)]);

@@ -32,6 +32,10 @@ struct BlockInfo {
     uint8_t ab;        // AV1 PARTITION_HORZ_A .. VERT_B when the block belongs to a three-way node, else 0
     uint8_t abLog2;    // log2 size of that node
     uint8_t filter;    // interp_filter: 0 EIGHTTAP, 1 SMOOTH, 2 SHARP
+    // loop restoration of the 64x64 luma unit whose top-left 8x8 this is (set only there): lrUse 1 = Wiener with
+    // LrWiener coefficients lrCoef[pass][0..2] (pass 0 vertical, 1 horizontal)
+    int8_t lrUse;
+    int8_t lrCoef[2][3];
     uint16_t txTypes;  // AV1 luma transform type of the transform covering each 4x4 (nibble 2 * dy + dx); 0 DCT_DCT
 };
 
@@ -58,6 +62,8 @@ struct FilterParams {
     bool cdef = false;
     int damping = 3;             // CdefDamping (3..6)
     int yPri = 0, ySec = 0, uvPri = 0, uvSec = 0;   // secondary strengths 0, 1, 2, 4
+    bool lrAllowed = false;      // input: try luma Wiener loop restoration
+    bool lrLuma = false;         // output: some luma unit uses it (FrameRestorationType[0] = RESTORE_WIENER)
 };
 
 // GPU tile entropy coding of the last analyzed frame (pframe_tile.cuh).
@@ -66,6 +72,7 @@ struct EntropyIn {
     bool referenceSelect = false;
     bool txModeSelect = false;
     bool reducedTxSet = true;
+    bool lrLuma = false;        // luma Wiener loop restoration (parameters in the grid)
     bool switchableFilter = false;
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults

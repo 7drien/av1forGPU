@@ -21,6 +21,7 @@ struct FrameParams {
     bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
     bool reducedTxSet = true;
     bool switchable = false;        // is_filter_switchable (else EIGHTTAP)
+    int lrType[3] = {0, 0, 0};      // lr_type per plane (0 NONE, 2 WIENER); 64-sample units
     bool persistent = false;        // error_resilient_mode = 0 and CDFs from primary_ref_frame
     bool primary = false;           // primary_ref_frame = LAST (else NONE)
     int grain = 0;
@@ -113,6 +114,12 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
         b.put(fp.cdefYSec == 4 ? 3 : fp.cdefYSec, 2);
         b.put(fp.cdefUV, 4);
         b.put(fp.cdefUVSec == 4 ? 3 : fp.cdefUVSec, 2);
+    }
+    // lr_params (enable_restoration = 1 in the sequence header)
+    for (int p = 0; p < 3; ++p) b.put(fp.lrType[p], 2);
+    if (fp.lrType[0] || fp.lrType[1] || fp.lrType[2]) {
+        b.bit(0);                                     // lr_unit_shift: LoopRestorationSize 64
+        if (fp.lrType[1] || fp.lrType[2]) b.bit(0);   // lr_uv_shift
     }
     b.bit(fp.txModeSelect);      // tx_mode_select (else TX_MODE_LARGEST)
     b.bit(fp.referenceSelect);   // reference_select

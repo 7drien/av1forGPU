@@ -84,4 +84,10 @@ intra path), then T5, T7, T3, T2, T6.
 - T3 stage 1, off by default (`--pf-refs 3`): pyramid frames also predict from the next anchor after their interval
   (ALTREF2, single prediction). Bit-exact; +25.7% → +25.3% for about 9% less speed, below the speed budget. A far
   past reference (a pinned golden frame) and compound pairs with it are the next things to try.
+- T7 stage 1, off by default (`--pf-lr`): luma Wiener loop restoration in 64-sample units. The taps come from
+  alternating 3x3 least squares per unit on the GPU, then the exact spec filter (stripes, deblocked rows outside the
+  stripe) decides per unit; `read_lr` symbols use the recentred subexponential code. Video sequence headers now set
+  `enable_restoration` (key frames code `lr_type` NONE). Bit-exact with dav1d in all three entropy paths. On the
+  120-frame test (46 to 57 dB PSNR) it gains 0.1% (+25.7% → +25.6%) for 8% speed; lower thresholds lose. Worth
+  re-measuring at lower qualities and with chroma / self-guided filters.
 

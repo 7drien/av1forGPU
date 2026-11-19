@@ -1706,6 +1706,8 @@ struct State {
     bool tablesReady = false;
     void *pfScratch = nullptr;
     uint8_t *work = nullptr, *cdefOut = nullptr;
+    float *lrCoef = nullptr; int8_t *lrQ = nullptr; unsigned long long *lrSse = nullptr; uint8_t *lrOut = nullptr;
+    int lrUnitRows = 1, lrUnitCols = 1;
     unsigned long long *sse = nullptr;
     float *best[kSizes] = {};
     uint8_t *mode[kSizes] = {};
@@ -1767,6 +1769,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->pfScratch);
     cudaFree(s->work);
     cudaFree(s->cdefOut);
+    cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
     cudaFree(s->sse);
     cudaFree(s->hphase);
     for (void *p : {(void *)s->slots, (void *)s->tileWork, (void *)s->staging, (void *)s->defaultInter, (void *)s->mi,
@@ -1859,6 +1862,10 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc((uint8_t **)&s->pfScratch, av1g_gpu_pf_scratch_size(&fp));
         alloc(&s->work, frame);
         alloc(&s->cdefOut, frame);
+        s->lrUnitRows = std::max((h + 32) / 64, 1); s->lrUnitCols = std::max((w + 32) / 64, 1);
+        const int nu = s->lrUnitRows * s->lrUnitCols;
+        alloc(&s->lrCoef, sizeof(float) * 6 * nu); alloc(&s->lrQ, 6 * nu);
+        alloc(&s->lrSse, sizeof(unsigned long long) * 2 * nu); alloc(&s->lrOut, size_t(w) * h);
         alloc(&s->sse, sizeof(unsigned long long) * 64);
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
         for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
@@ -1930,6 +1937,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
         memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
         memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
+        { const uint16_t uw[3] = {11570, 32768, 0}; memcpy(d.useWiener, uw, sizeof uw); }
         memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
         memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
         memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
@@ -2188,6 +2196,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.txModeSelect = in.txModeSelect;
     j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.switchable = in.switchableFilter;
+    j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
     j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2391,6 +2400,7 @@ int HostEntropy::init(int width, int height, char *, int) {
     memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
         memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
         memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
+        { const uint16_t uw[3] = {11570, 32768, 0}; memcpy(d.useWiener, uw, sizeof uw); }
         memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
     memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
     memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
@@ -2423,6 +2433,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.txModeSelect = in.txModeSelect;
     fs.reducedTxSet = in.reducedTxSet;
     fs.switchable = in.switchableFilter;
+    fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
     fs.miRows = miRows; fs.miCols = miCols; fs.aw = aw; fs.ah = ah; fs.gcols = aw / 8;
     // costs and cdf ids from the default CDFs (as on the GPU, so both paths decide alike)
     pft2::EntropyState &init = s->init;
@@ -2580,6 +2591,147 @@ void Analyzer::resetTemporal() {
     if (state) static_cast<State *>(state)->havePrev = false;
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// Loop restoration: luma Wiener filter in 64-sample units (spec 7.17). The unit of a sample uses the stripe offset:
+// unitRow = Min(unitRows - 1, (y + 8) / 64). Samples outside the 64-row stripe of the sample being filtered come from
+// the deblocked frame (two rows at most), inside it from the CDEF output.
+__constant__ float c_lrBits;
+struct LrArgs {
+    const uint8_t *dbk, *cdef;   // luma planes (w x h, pitch w)
+    const uint8_t *src;
+    int srcPitch;
+    int w, h, unitRows, unitCols;
+    float *coef;                 // per unit: [pass][3] filter taps / 128 (pass 0 vertical, 1 horizontal)
+    int8_t *q;                   // per unit: quantized taps [2][3]
+    unsigned long long *sse;     // per unit: [0] unfiltered, [1] filtered
+    uint8_t *out;                // filtered luma
+};
+__device__ __forceinline__ int lrSample(const LrArgs &a, int x, int y, int stripeStart, int stripeEnd) {
+    x = min(max(x, 0), a.w - 1);
+    y = min(max(y, 0), a.h - 1);
+    if (y < stripeStart) return a.dbk[max(stripeStart - 2, y) * a.w + x];
+    if (y > stripeEnd) return a.dbk[min(stripeEnd + 2, y) * a.w + x];
+    return a.cdef[y * a.w + x];
+}
+__device__ __forceinline__ int lrUnitOf(const LrArgs &a, int x, int y, int *ur, int *uc) {
+    *ur = min(a.unitRows - 1, (y + 8) / 64);
+    *uc = min(a.unitCols - 1, x / 64);
+    return *ur * a.unitCols + *uc;
+}
+// Normal equations of one pass for one unit (one CTA per unit, grid-stride over the frame rows of the unit): solve
+// the free taps (a, b, c) of the pass `dir` (0 vertical, 1 horizontal) with the other pass fixed, then store them.
+__global__ void __launch_bounds__(256) lrSolve(LrArgs a, int dir) {
+    const int u = blockIdx.x, ur = u / a.unitCols, uc = u % a.unitCols;
+    const int y0 = ur == 0 ? 0 : ur * 64 - 8, y1 = ur == a.unitRows - 1 ? a.h : ur * 64 + 56;
+    const int x0 = uc * 64, x1 = uc == a.unitCols - 1 ? a.w : uc * 64 + 64;
+    float fixed[7];
+    {
+        const float *c = a.coef + u * 6 + (dir ? 0 : 3);   // the other pass
+        fixed[0] = fixed[6] = c[0]; fixed[1] = fixed[5] = c[1]; fixed[2] = fixed[4] = c[2];
+        fixed[3] = 1.f - 2.f * (c[0] + c[1] + c[2]);
+    }
+    float m[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, v[3] = {0, 0, 0};
+    const int W = x1 - x0, n = W * (y1 - y0);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int x = x0 + i % W, y = y0 + i / W;
+        const int sn = (y + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
+        float t[7];
+        for (int k = 0; k < 7; k++) {   // filtered along the fixed direction, at offset k - 3 along the solved one
+            float s = 0.f;
+            for (int j = 0; j < 7; j++)
+                s += fixed[j] * (float)(dir ? lrSample(a, x + k - 3, y + j - 3, ss, se) : lrSample(a, x + j - 3, y + k - 3, ss, se));
+            t[k] = s;
+        }
+        const float f[3] = {t[0] + t[6] - 2.f * t[3], t[1] + t[5] - 2.f * t[3], t[2] + t[4] - 2.f * t[3]};
+        const float r = (float)a.src[y * a.srcPitch + x] - t[3];
+        for (int p = 0; p < 3; p++) {
+            v[p] += f[p] * r;
+            for (int q = 0; q < 3; q++) m[p * 3 + q] += f[p] * f[q];
+        }
+    }
+    __shared__ float red[12][8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int k = 0; k < 12; k++) {
+        float x = k < 9 ? m[k] : v[k - 9];
+        for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+        if (!lane) red[k][warp] = x;
+    }
+    __syncthreads();
+    if (threadIdx.x) return;
+    double M[9], V[3];
+    for (int k = 0; k < 12; k++) {
+        double x = 0;
+        for (int w = 0; w < 8; w++) x += red[k][w];
+        if (k < 9) M[k] = x; else V[k - 9] = x;
+    }
+    const double reg = 1e-3 * (M[0] + M[4] + M[8]) + 1e-6;
+    M[0] += reg; M[4] += reg; M[8] += reg;
+    const double det = M[0] * (M[4] * M[8] - M[5] * M[7]) - M[1] * (M[3] * M[8] - M[5] * M[6]) + M[2] * (M[3] * M[7] - M[4] * M[6]);
+    float *out = a.coef + u * 6 + (dir ? 3 : 0);
+    if (fabs(det) < 1e-12) { out[0] = out[1] = out[2] = 0.f; return; }
+    double x[3];
+    for (int c = 0; c < 3; c++) {   // Cramer
+        double Mc[9];
+        for (int k = 0; k < 9; k++) Mc[k] = (k % 3 == c) ? V[k / 3] : M[k];
+        x[c] = (Mc[0] * (Mc[4] * Mc[8] - Mc[5] * Mc[7]) - Mc[1] * (Mc[3] * Mc[8] - Mc[5] * Mc[6]) + Mc[2] * (Mc[3] * Mc[7] - Mc[4] * Mc[6])) / det;
+    }
+    for (int c = 0; c < 3; c++) out[c] = (float)x[c];
+}
+// Quantize the taps to the coded ranges (Wiener_Taps_Min / Max) and clear the SSE accumulators.
+__global__ void lrQuantize(LrArgs a) {
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= a.unitRows * a.unitCols) return;
+    const int lo[3] = {-5, -23, -17}, hi[3] = {10, 8, 46};
+    for (int p = 0; p < 2; p++)
+        for (int j = 0; j < 3; j++)
+            a.q[u * 6 + p * 3 + j] = (int8_t)min(max((int)lrintf(a.coef[u * 6 + p * 3 + j] * 128.f), lo[j]), hi[j]);
+    a.sse[2 * u] = a.sse[2 * u + 1] = 0;
+}
+// Exact Wiener filter (spec 7.17.4, 8-bit: InterRound0 3, InterRound1 11) of every luma sample with its unit's
+// quantized taps, and the per-unit SSE with and without it.
+__global__ void lrApply(LrArgs a) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    int e0 = 0, e1 = 0, u = -1;
+    if (x < a.w && y < a.h) {
+        int ur, uc;
+        u = lrUnitOf(a, x, y, &ur, &uc);
+        const int8_t *q = a.q + u * 6;
+        const int vf[7] = {q[0], q[1], q[2], 128 - 2 * (q[0] + q[1] + q[2]), q[2], q[1], q[0]};
+        const int hf[7] = {q[3], q[4], q[5], 128 - 2 * (q[3] + q[4] + q[5]), q[5], q[4], q[3]};
+        const int sn = (y + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
+        int s = 0;
+        for (int r = 0; r < 7; r++) {
+            int hs = 0;
+            for (int t = 0; t < 7; t++) hs += hf[t] * lrSample(a, x + t - 3, y + r - 3, ss, se);
+            const int iv = min(max((hs + 4) >> 3, -2048), 6143);   // Round2(s, 3), Clip3(-offset, limit - offset)
+            s += vf[r] * iv;
+        }
+        const int v = min(max((s + 1024) >> 11, 0), 255);
+        a.out[y * a.w + x] = (uint8_t)v;
+        const int src = a.src[y * a.srcPitch + x];
+        e0 = (src - a.cdef[y * a.w + x]) * (src - a.cdef[y * a.w + x]);
+        e1 = (src - v) * (src - v);
+    }
+    if (u >= 0) { atomicAdd(&a.sse[2 * u], (unsigned long long)e0); atomicAdd(&a.sse[2 * u + 1], (unsigned long long)e1); }
+}
+// Per unit: keep the filter when its SSE saving pays for its bits; write the decision into the grid (the unit's
+// top-left 8x8 entry) and the chosen samples into dst.
+__global__ void lrDecide(LrArgs a, float lambda, BlockInfo *grid, int gcols, uint8_t *dst) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= a.w || y >= a.h) return;
+    int ur, uc;
+    const int u = lrUnitOf(a, x, y, &ur, &uc);
+    const float gain = (float)a.sse[2 * u] - (float)a.sse[2 * u + 1];
+    const bool use = gain > lambda * c_lrBits;   // use_wiener plus the coefficient bits (estimate)
+    dst[y * a.w + x] = use ? a.out[y * a.w + x] : a.cdef[y * a.w + x];
+    if (x == uc * 64 && y == ur * 64) {
+        BlockInfo &b = grid[(ur * 8) * gcols + uc * 8];
+        b.lrUse = use;
+        for (int k = 0; k < 6; k++) b.lrCoef[k / 3][k % 3] = use ? a.q[u * 6 + k] : 0;
+    }
+}
+
 int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
                      bool search, FilterParams &out, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
@@ -2662,7 +2814,33 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
         f.cdefYPri[0] = out.yPri; f.cdefYSec[0] = out.ySec;
         f.cdefUVPri[0] = out.uvPri; f.cdefUVSec[0] = out.uvSec;
         av1g_gpu_cdef(&f, dst, strides, 0);
-        e = cudaMemcpy(recon, s->cdefOut, frame, cudaMemcpyDeviceToDevice);
+        if (!out.lrAllowed) e = cudaMemcpy(recon, s->cdefOut, frame, cudaMemcpyDeviceToDevice);
+        else e = cudaMemcpy(recon + ysz, s->cdefOut + ysz, 2 * csz, cudaMemcpyDeviceToDevice);   // luma below
+    }
+    out.lrLuma = false;
+    if (out.lrAllowed && e == cudaSuccess) {
+        // luma Wiener: the deblocked luma is still in recon, the CDEF output in cdefOut (or recon without CDEF)
+        LrArgs la{};
+        la.dbk = recon; la.cdef = cdefAllowed ? s->cdefOut : recon;
+        la.src = src[0]; la.srcPitch = pitch[0];
+        la.w = w; la.h = h; la.unitRows = s->lrUnitRows; la.unitCols = s->lrUnitCols;
+        la.coef = s->lrCoef; la.q = s->lrQ; la.sse = s->lrSse; la.out = s->lrOut;
+        const int nu = la.unitRows * la.unitCols;
+        const float lrBits = getenv("AV1GPU_PF_LRBITS") ? (float)atof(getenv("AV1GPU_PF_LRBITS")) : 26.f;
+        cudaMemcpyToSymbolAsync(c_lrBits, &lrBits, sizeof lrBits);
+        cudaMemsetAsync(s->lrCoef, 0, sizeof(float) * 6 * nu);
+        lrSolve<<<nu, 256>>>(la, 1);   // horizontal given an identity vertical pass
+        lrSolve<<<nu, 256>>>(la, 0);   // vertical given the horizontal pass
+        lrSolve<<<nu, 256>>>(la, 1);
+        lrQuantize<<<(nu + 127) / 128, 128>>>(la);
+        const dim3 g16((w + 15) / 16, (h + 15) / 16);
+        lrApply<<<g16, t16>>>(la);
+        lrDecide<<<g16, t16>>>(la, gp_lambda<8>(qindex, 0.7f), s->grid, s->gcols, recon);
+        std::vector<unsigned long long> sse(2 * nu);
+        e = cudaMemcpy(sse.data(), s->lrSse, sizeof(unsigned long long) * 2 * nu, cudaMemcpyDeviceToHost);
+        const float lambda = gp_lambda<8>(qindex, 0.7f);
+        for (int u = 0; u < nu && e == cudaSuccess; u++)
+            if ((float)sse[2 * u] - (float)sse[2 * u + 1] > lambda * lrBits) out.lrLuma = true;
     }
     if (e == cudaSuccess) e = cudaGetLastError();
     if (e != cudaSuccess) {

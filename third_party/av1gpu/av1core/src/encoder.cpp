@@ -1358,7 +1358,7 @@ void write_headers(const av1g_frame_params *fp, const TileInfo &tiles, int level
     }
     seq.put(0, 1);          // enable_superres
     seq.put(fp->enable_cdef, 1);  // enable_cdef
-    seq.put(0, 1);          // enable_restoration
+    seq.put(video ? 1 : 0, 1);  // enable_restoration (video: inter frames may use loop restoration)
     // color_config
     seq.put(bd == 10, 1);   // high_bitdepth (BitDepth 10; twelve_bit is only coded in the Professional profile)
     if (!high) seq.put(mono, 1);  // mono_chrome (High profile: not coded, 0)
@@ -1471,7 +1471,9 @@ void write_headers(const av1g_frame_params *fp, const TileInfo &tiles, int level
             }
         }
     }
-    // lr_params: disabled in sequence header
+    // lr_params (video): key frames use none
+    if (video && !lossless)
+        for (int i = 0; i < (mono ? 1 : 3); i++) fh.put(0, 2);   // lr_type RESTORE_NONE
     if (!lossless) fh.put(fp->tx_mode_select ? 1 : 0, 1);  // tx_mode_select
     fh.put(fp->reduced_tx_set ? 1 : 0, 1);  // reduced_tx_set
     write_video_grain(fh, grain, seed, false);
