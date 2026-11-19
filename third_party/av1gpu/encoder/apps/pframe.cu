@@ -452,6 +452,7 @@ __device__ void inverseAddAny(int lw, int lh, int16_t *q, int txSz, int dcQ, int
 #define PF_INV(A, B) if (lw == A && lh == B) { warpInverseAdd<A, B>(q, txSz, dcQ, acQ, res, pred, recon); return; }
     PF_INV(2, 2) PF_INV(3, 3) PF_INV(4, 4) PF_INV(5, 5) PF_INV(6, 6)
     PF_INV(3, 2) PF_INV(2, 3) PF_INV(4, 3) PF_INV(3, 4) PF_INV(5, 4) PF_INV(4, 5) PF_INV(6, 5) PF_INV(5, 6)
+    PF_INV(4, 2) PF_INV(2, 4) PF_INV(5, 3) PF_INV(3, 5) PF_INV(6, 4) PF_INV(4, 6)
 #undef PF_INV
 }
 
@@ -724,9 +725,9 @@ struct DecideArgs {
     const Cand *cand[kSizes];
     int cols[kSizes];
     float *best[kSizes];      // best cost of the subtree rooted at each block
-    uint8_t *mode[kSizes];    // 0: split, 1: none + skip, 2: none + coded, 3: HORZ, 4: VERT
-    const Cand *rcand[6];     // rectangular blocks: index (level - 1) * 2 + (0 HORZ, 1 VERT)
-    int rcols[6];
+    uint8_t *mode[kSizes];    // 0: split, 1: none + skip, 2: none + coded, 3: HORZ, 4: VERT, 5: HORZ_4, 6: VERT_4
+    const Cand *rcand[10];    // rectangular blocks: (level - 1) * 2 + (0 HORZ, 1 VERT); 6 + (level - 2) * 2 + 4:1
+    int rcols[10];
     int rect;
     int w, h;
     int gcols, grows;
@@ -771,6 +772,16 @@ __global__ void decideLevel(DecideArgs a, int s, int rows) {
                 c2 += halfCost(d == 0 ? rc[(2 * by + k) * rcols + bx] : rc[by * rcols + 2 * bx + k]);
             if (c2 < best) { best = c2; mode = 3 + d; }
         }
+        if (s >= 2)
+            for (int d = 0; d < 2; d++) {
+                const int rk = 6 + (s - 2) * 2 + d;
+                const Cand *rc = a.rcand[rk];
+                const int rcols = a.rcols[rk];
+                float c4 = a.lambda * 3.5f;
+                for (int k = 0; k < 4; k++)
+                    c4 += halfCost(d == 0 ? rc[(4 * by + k) * rcols + bx] : rc[by * rcols + 4 * bx + k]);
+                if (c4 < best) { best = c4; mode = 5 + d; }
+            }
     }
     a.best[s][i] = best;
     a.mode[s][i] = (uint8_t)mode;
@@ -786,8 +797,9 @@ __global__ void decideGrid(DecideArgs a) {
             const int sh = s, idx = (gy >> sh) * a.cols[s] + (gx >> sh);
             const int m = a.mode[s][idx];
             if (m >= 3) {
-                const int rk = (s - 1) * 2 + (m - 3);
-                const int ridx = m == 3 ? (gy >> (s - 1)) * a.rcols[rk] + (gx >> s) : (gy >> s) * a.rcols[rk] + (gx >> (s - 1));
+                const int rk = m <= 4 ? (s - 1) * 2 + (m - 3) : 6 + (s - 2) * 2 + (m - 5);
+                const int sh = m <= 4 ? s - 1 : s - 2;   // log2 of 8x8 units per block along the split direction
+                const int ridx = (m == 3 || m == 5) ? (gy >> sh) * a.rcols[rk] + (gx >> s) : (gy >> s) * a.rcols[rk] + (gx >> sh);
                 const Cand &c = a.rcand[rk][ridx];
                 bi.mv = c.mv;
                 bi.mv2 = c.mv2;
@@ -814,7 +826,7 @@ __global__ void decideGrid(DecideArgs a) {
 }
 
 // Gather the chosen reconstruction and levels. Shapes: 0..3 squares 8..64, 4 + (level - 1) * 2 + (0 HORZ, 1 VERT).
-constexpr int kShapes = 10;
+constexpr int kShapes = 14;   // + 10 + (level - 2) * 2 + (0 HORZ_4, 1 VERT_4)
 struct CommitArgs {
     const BlockInfo *grid;
     int gcols, w, h, aw, ah;
@@ -841,7 +853,7 @@ __global__ void commit(CommitArgs a) {
     const BlockInfo bi = a.grid[((y << sub) >> 3) * a.gcols + ((x << sub) >> 3)];
     const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
     const int s = bi.log2 - 3;
-    const int shape = bi.part ? 4 + (s - 1) * 2 + (bi.part - 1) : s;
+    const int shape = !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
         if (p == 0 && bi.txSplit) level = pickN(s, a.levels2)[size_t(y) * apw + x];
@@ -867,7 +879,7 @@ __global__ void buildFilterMaps(const BlockInfo *grid, int gcols, av1g_pf_frame 
     const BlockInfo bi = grid[(r >> 1) * gcols + (c >> 1)];
     const size_t k = size_t(r) * f.MiCols + c;
     f.skip[k] = bi.skip;
-    const int lw = bi.log2 - (bi.part == 2), lh = bi.log2 - (bi.part == 1);
+    const int lw = bi.log2 - (bi.part == 2) - 2 * (bi.part == 4), lh = bi.log2 - (bi.part == 1) - 2 * (bi.part == 3);
     const int sp = bi.txSplit && !bi.skip;
     f.lfTx[0][k] = (uint8_t)txSizeOf(lw - sp, lh - sp);
     if (!(r & 1) && !(c & 1)) {
@@ -1245,10 +1257,10 @@ struct State {
     uint8_t *pred[kSizes] = {}, *recon[kSizes] = {};
     int16_t *levels[kSizes] = {}, *outLevels = nullptr;
     uint8_t *recon2[kSizes] = {};
-    Cand *rcand[6] = {};
-    uint8_t *rpred[6] = {}, *rrecon[6] = {};
-    int16_t *rlevels[6] = {};
-    int rcols[6] = {}, rrows[6] = {};
+    Cand *rcand[10] = {};
+    uint8_t *rpred[10] = {}, *rrecon[10] = {};
+    int16_t *rlevels[10] = {};
+    int rcols[10] = {}, rrows[10] = {};
     int16_t *levels2[kSizes] = {};
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
     bool havePrev = false;
@@ -1307,7 +1319,7 @@ Analyzer::~Analyzer() {
     for (auto *p : s->recon) cudaFree(p);
     for (auto *p : s->levels) cudaFree(p);
     for (auto *p : s->recon2) cudaFree(p);
-    for (int k = 0; k < 6; k++) { cudaFree(s->rcand[k]); cudaFree(s->rpred[k]); cudaFree(s->rrecon[k]); cudaFree(s->rlevels[k]); }
+    for (int k = 0; k < 10; k++) { cudaFree(s->rcand[k]); cudaFree(s->rpred[k]); cudaFree(s->rrecon[k]); cudaFree(s->rlevels[k]); }
     for (auto *p : s->levels2) cudaFree(p);
     cudaFree(s->outLevels);
     cudaFree(s->grid);
@@ -1381,8 +1393,10 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->recon2[k], size_t(w) * h);
         alloc(&s->levels2[k], size_t(aw) * ah * sizeof(int16_t));
     }
-    for (int k = 0; k < 6; k++) {
-        const int n = 16 << (k / 2), bw = k & 1 ? n / 2 : n, bh = k & 1 ? n : n / 2;
+    for (int k = 0; k < 10; k++) {
+        // 0..5: HORZ / VERT halves of 16, 32, 64 nodes; 6..9: HORZ_4 / VERT_4 quarters of 32, 64 nodes
+        const int n = k < 6 ? 16 << (k / 2) : 32 << ((k - 6) / 2), div = k < 6 ? 2 : 4;
+        const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
         s->rcols[k] = aw / bw; s->rrows[k] = ah / bh;
         alloc(&s->rcand[k], sizeof(Cand) * s->rcols[k] * s->rrows[k]);
         alloc(&s->rpred[k], frame);
@@ -1540,6 +1554,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             PF_RREFINE(0, 1, 16, 8); PF_RREFINE(1, 1, 8, 16);
             PF_RREFINE(2, 2, 32, 16); PF_RREFINE(3, 2, 16, 32);
             PF_RREFINE(4, 3, 64, 32); PF_RREFINE(5, 3, 32, 64);
+            PF_RREFINE(6, 2, 32, 8); PF_RREFINE(7, 2, 8, 32);
+            PF_RREFINE(8, 3, 64, 16); PF_RREFINE(9, 3, 16, 64);
         }
 #undef PF_RREFINE
 #undef PF_REFINE
@@ -1556,6 +1572,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         PF_CHOOSE(s->rcand[0], s->rcols[0], s->rrows[0], 16, 8); PF_CHOOSE(s->rcand[1], s->rcols[1], s->rrows[1], 8, 16);
         PF_CHOOSE(s->rcand[2], s->rcols[2], s->rrows[2], 32, 16); PF_CHOOSE(s->rcand[3], s->rcols[3], s->rrows[3], 16, 32);
         PF_CHOOSE(s->rcand[4], s->rcols[4], s->rrows[4], 64, 32); PF_CHOOSE(s->rcand[5], s->rcols[5], s->rrows[5], 32, 64);
+        PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8); PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32);
+        PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16); PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64);
     }
 #undef PF_CHOOSE
     mark(2);
@@ -1586,6 +1604,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     if (st.rectPartitions) {
         PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16);
         PF_REVAL(3, 16, 32); PF_REVAL(4, 64, 32); PF_REVAL(5, 32, 64);
+        PF_REVAL(6, 32, 8); PF_REVAL(7, 8, 32); PF_REVAL(8, 64, 16); PF_REVAL(9, 16, 64);
     }
 #undef PF_REVAL
 #undef PF_EVAL
@@ -1594,7 +1613,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     for (int k = 0; k < kSizes; k++) {
         da.cand[k] = s->cand[k]; da.cols[k] = s->cols[k]; da.best[k] = s->best[k]; da.mode[k] = s->mode[k];
     }
-    for (int k = 0; k < 6; k++) { da.rcand[k] = s->rcand[k]; da.rcols[k] = s->rcols[k]; }
+    for (int k = 0; k < 10; k++) { da.rcand[k] = s->rcand[k]; da.rcols[k] = s->rcols[k]; }
     da.rect = st.rectPartitions;
     da.w = w; da.h = h; da.gcols = s->gcols; da.grows = s->grows; da.grid = s->grid; da.lambda = lambda;
     // approximate partition symbol costs (bits)
@@ -1610,7 +1629,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ca.pred[k] = s->pred[k]; ca.recon[k] = s->recon[k]; ca.levels[k] = s->levels[k];
         ca.recon2[k] = s->recon2[k]; ca.levels2[k] = s->levels2[k];
     }
-    for (int k = 0; k < 6; k++) { ca.pred[4 + k] = s->rpred[k]; ca.recon[4 + k] = s->rrecon[k]; ca.levels[4 + k] = s->rlevels[k]; }
+    for (int k = 0; k < 10; k++) { ca.pred[4 + k] = s->rpred[k]; ca.recon[4 + k] = s->rrecon[k]; ca.levels[4 + k] = s->rlevels[k]; }
     ca.out = recon;
     ca.outLevels = s->outLevels;
     commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);

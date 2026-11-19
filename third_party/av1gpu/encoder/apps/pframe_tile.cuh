@@ -952,7 +952,8 @@ struct TileCoder {
             const pf::BlockInfo &bi = grid[(miRow >> 1) * fs->gcols + (miCol >> 1)];
             const bool split = bi.log2 < size;
             const int part = split ? AV1G_PARTITION_SPLIT : bi.part == 1 ? AV1G_PARTITION_HORZ
-                           : bi.part == 2 ? AV1G_PARTITION_VERT : AV1G_PARTITION_NONE;
+                           : bi.part == 2 ? AV1G_PARTITION_VERT : bi.part == 3 ? AV1G_PARTITION_HORZ_4
+                           : bi.part == 4 ? AV1G_PARTITION_VERT_4 : AV1G_PARTITION_NONE;
             if (phase == 1 && (hasRows || hasCols) && nPending < 4)
                 pending[nPending++] = PartNode{(int16_t)miRow, (int16_t)miCol, (uint8_t)size, (uint8_t)part};
             if (!(hasRows && hasCols) && !split) { st.error = 3; return; }
@@ -970,6 +971,15 @@ struct TileCoder {
             } else if (part == AV1G_PARTITION_VERT) {
                 block(miRow, miCol, size - 1, size, bi);
                 if (!st.error) block(miRow, miCol + half, size - 1, size, grid[(miRow >> 1) * fs->gcols + ((miCol + half) >> 1)]);
+            } else if (part == AV1G_PARTITION_HORZ_4 || part == AV1G_PARTITION_VERT_4) {
+                const int q = half >> 1;   // quarter of the node in mode-info units
+                for (int k = 0; k < 4 && !st.error; k++) {
+                    const int r = miRow + (part == AV1G_PARTITION_HORZ_4 ? k * q : 0);
+                    const int c = miCol + (part == AV1G_PARTITION_VERT_4 ? k * q : 0);
+                    if (r >= fs->miRows || c >= fs->miCols) break;
+                    block(r, c, part == AV1G_PARTITION_HORZ_4 ? size : size - 2, part == AV1G_PARTITION_HORZ_4 ? size - 2 : size,
+                          grid[(r >> 1) * fs->gcols + (c >> 1)]);
+                }
             } else {
                 block(miRow, miCol, size, size, bi);
             }
