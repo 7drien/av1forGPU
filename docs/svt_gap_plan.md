@@ -212,4 +212,12 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
   5.3 to 0.8 ms but cost 1.4 to 1.6 points of BD-rate on video_2.
 - Per inter frame on video_2: GPU work about 38 ms (analysis 30, filters 5, entropy modeling 3) against about 49 ms of
   wall time; key frames about 200 ms each. The remaining speed is in CPU / GPU serialization and key frames.
+- Filter searches read their candidate errors back once per search (was one synchronous copy per candidate): ~3.5%
+  faster, same decisions.
+- Determinism bug fixed: the frame-difference memo (scene cuts, motion) was keyed by buffer address, and freed frame
+  buffers could come back at the same address, so decisions occasionally depended on allocation timing (two runs of the
+  same command gave 1,601,151 and 1,629,940 bytes). The memo is cleared whenever frames leave the queue; repeated runs
+  are now identical. Measurements between the memo commit and this fix carry about ±1 point of noise.
+- Clean measurement after the fix (120 frames): video_2 +53.4% against SVT-AV1 preset 8 (+59.5% against libaom) at
+  16.3 to 22.0 fps (SVT: 32 to 34 fps); video_1 +18.6% (+44.4%) at 21 to 25.5 fps (SVT: 36 to 37 fps).
 
