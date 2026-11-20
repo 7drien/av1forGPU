@@ -292,11 +292,15 @@ libaom equal to the encoder reconstruction.
   with 60 trials cost almost as much as one with 1200. The shapes write disjoint buffers, so their trials now run
   concurrently on one stream per shape (fork / join events). Pass spans on video_2 q50 (nsys): 5.0, 4.2, 3.9, 3.6,
   3.5, 2.8 ms → 3.7, 2.7, 2.1, 1.7, 1.5, 1.4 ms. Output unchanged.
+- The candidate screen then took 0.45-0.7 ms per pass, again bound by single warps scanning 64x64 blocks: it now uses
+  one CTA of four warps per block. video_2 q50 at 6 passes 17.0 → 17.4 fps, output unchanged. The remaining floor
+  of a pass is the 64x64 trial chain (one warp per block in `evaluate`, about 0.3 ms even for a few blocks; 2.4 ms
+  in the first pass).
 
 | video_2, 120 frames, passes | 1 | 2 | 3 | 4 | 6 | 8 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | BD-rate vs SVT-AV1 preset 8 | +47.7% | +42.3% | +38.9% | +37.0% | +35.0% | +34.3% |
-| fps at q50 (direct runs) | 19.7 | 18.9 | 18.2 | 17.7 | 17.0 | 16.5 |
+| fps at q50 (direct runs, before the CTA screen) | 19.7 | 18.9 | 18.2 | 17.7 | 17.0 | 16.5 |
 
 - video_1: +13.1% (1 pass) → +9.5% (3) → +8.2% (6); vs libaom +37.7% → +31.6%. video_2 vs libaom (3 passes):
   +44.0%.

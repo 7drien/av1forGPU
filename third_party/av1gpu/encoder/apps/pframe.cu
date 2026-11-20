@@ -1807,10 +1807,12 @@ __global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions 
 
 // Screen with 4x4 luma SATD on the existing search planes. Final acceptance uses exact interpolation,
 // chroma and the quantized residual, including on boundaries and for compound prediction.
+constexpr int kProposeWarps = 4;
 __device__ int motionSatd(const RefinementArgs &a, const MotionOption &option, int ref, int x0, int y0, int lw,
                           int lh) {
+    __shared__ int partial[kProposeWarps];
     const Frame &f = a.f;
-    const int lane = threadIdx.x & 31, tw = 1 << (lw - 2), nt = 1 << (lw + lh - 4);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tw = 1 << (lw - 2), nt = 1 << (lw + lh - 4);
     const int nref = ref == 2 ? 2 : 1;
     const uint8_t *planes[2];
     for (int i = 0; i < nref; ++i) {
@@ -1819,7 +1821,7 @@ __device__ int motionSatd(const RefinementArgs &a, const MotionOption &option, i
         planes[i] = a.phases[i ? 1 : ref == 3 ? 2 : ref == 1 ? 1 : 0] + size_t(phase) * f.w * f.h;
     }
     int sum = 0;
-    for (int tile = lane >> 4; tile < nt; tile += 2) {
+    for (int tile = warp * 2 + (lane >> 4); tile < nt; tile += 2 * kProposeWarps) {
         const int x = x0 + (tile & (tw - 1)) * 4 + (lane & 3), y = y0 + (tile / tw) * 4 + ((lane & 15) >> 2);
         int d = 0;
         if (x < f.w && y < f.h) {
@@ -1837,12 +1839,19 @@ __device__ int motionSatd(const RefinementArgs &a, const MotionOption &option, i
         }
         sum += abs(d);
     }
-    return warp_sumi(sum);
+    sum = warp_sumi(sum);
+    if (!lane) partial[warp] = sum;
+    __syncthreads();
+    int total = 0;
+    for (int w = 0; w < kProposeWarps; ++w) total += partial[w];
+    __syncthreads();
+    return total;
 }
 
-__global__ void proposeMotion(TileJob j, RefinementArgs a, const MotionOptions *menus) {
-    constexpr int warps = 4;
-    const int e = blockIdx.x * warps + (threadIdx.x >> 5), sb = e / 64, lane = threadIdx.x & 31;
+// One CTA per block: its warps share the SATD tiles (large blocks bound the kernel's duration otherwise).
+__global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, RefinementArgs a,
+                                                                    const MotionOptions *menus) {
+    const int e = blockIdx.x, sb = e / 64, lane = threadIdx.x;
     if (e % 64 >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[e];
     const int gy = b.r / 2, gx = b.c / 2, pos = gy * j.fs.gcols + gx;
@@ -2882,7 +2891,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.screenWeight = 3.f * lambdaSad;
             ra.pass = pass;
             priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass);
-            proposeMotion<<<nSb * 16, 128, 0, stream>>>(j, ra, s->modeMenus);
+            proposeMotion<<<nSb * 64, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
         // and only accepted blocks overwrite their reconstruction, levels and transform types.
