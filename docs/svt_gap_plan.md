@@ -302,6 +302,10 @@ libaom equal to the encoder reconstruction.
 | BD-rate vs SVT-AV1 preset 8 | +47.7% | +42.3% | +38.9% | +37.0% | +35.0% | +34.3% |
 | fps at q50 (direct runs, before the CTA screen) | 19.7 | 18.9 | 18.2 | 17.7 | 17.0 | 16.5 |
 
+- A block whose trial is rejected keeps the same menu, so later passes skipped it and its second-best candidate was
+  never tried. Rejected proposals are now remembered (up to four, with their rate saving) and excluded from the
+  screen, and a block rejected in the previous pass is screened again. video_2 +35.0% → +34.6%, fps −1.4%.
+  `--pf-rdoq` on top: +34.8% (no gain, slower).
 - video_1: +13.1% (1 pass) → +9.5% (3) → +8.2% (6); vs libaom +37.7% → +31.6%. video_2 vs libaom (3 passes):
   +44.0%.
 - Verified: both suites (plus a single-pass case), repeated runs identical, a full 120-frame video_2 stream decoded

@@ -72,11 +72,14 @@ struct ModeTrial {
     float oldCost, rateSaving;
     bool active;
     // State kept across refinement passes: cost (distortion + coefficient rate, no MV rate) of an accepted trial, and
-    // the last rejected proposal (same vectors at the same saving are not re-evaluated by a later pass).
+    // the proposals rejected since (not proposed again unless their rate saving grew), so that a later pass tries the
+    // next alternative of the block.
     bool refined;
     float curCost;
-    Mv rejMv[2];
-    float rejSaving;
+    static constexpr int kRej = 4;
+    Mv rejMv[kRej][2];
+    float rejSaving[kRej];
+    int nRej, rejPass;
 };
 
 struct Frame {
@@ -1856,17 +1859,27 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
     const auto &b = j.entries[e];
     const int gy = b.r / 2, gx = b.c / 2, pos = gy * j.fs.gcols + gx;
     ModeTrial &trial = a.trials[pos];
+    // pass 0 initializes the block's cross-pass state (thread 0); the other threads must not read it then
+    const bool retry = a.pass > 0 && trial.rejPass == a.pass - 1;
+    const int nRej = a.pass > 0 ? trial.nRej : 0;
+    __syncthreads();
     if (!lane) {
         trial.active = false;
-        if (!a.pass) { trial.refined = false; trial.rejSaving = -1.f; }
+        if (!a.pass) { trial.refined = false; trial.nRej = 0; trial.rejPass = -2; }
     }
     const MotionOptions &menu = menus[e];
-    if (menu.count == 1 || menu.same) return;
+    if (menu.count == 1 || (menu.same && !retry)) return;
     const BlockInfo &bi = j.grid[pos];
+    const float origBits = menu.option[0].bits;
     int best = 0;
     float bestScore = kInf;
     for (int i = 1; i < menu.count; ++i) {
         const MotionOption option = menu.option[i];
+        bool rejected = false;
+        for (int r = 0; r < nRej; ++r)
+            rejected |= option.mv[0] == trial.rejMv[r][0] && option.mv[1] == trial.rejMv[r][1] &&
+                        origBits - option.bits <= trial.rejSaving[r];
+        if (rejected) continue;
         const int satd = motionSatd(a, option, bi.ref, gx * 8, gy * 8, b.lw, b.lh);
         const float score = satd * 0.125f + a.screenWeight * option.bits;
         if (score < bestScore) { bestScore = score; best = i; }
@@ -1876,7 +1889,6 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
     if (!lane && bestScore < satd * 0.125f + a.screenWeight * orig.bits) {
         const MotionOption option = menu.option[best];
         const float saving = orig.bits - option.bits;
-        if (option.mv[0] == trial.rejMv[0] && option.mv[1] == trial.rejMv[1] && saving == trial.rejSaving) return;
         const int shape = blockShape(bi);
         const int index = (gy >> (b.lh - 3)) * a.cols[shape] + (gx >> (b.lw - 3));
         const Cand &old = a.candidates[shape][index];
@@ -1893,7 +1905,7 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
     }
 }
 
-__global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint8_t *changed, float lambda) {
+__global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint8_t *changed, float lambda, int pass) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[sb * 64 + k];
@@ -1904,14 +1916,16 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
     const bool skip = !c.nz || c.costSkip <= c.costCoded;
     const float cost = skip ? c.costSkip : c.costCoded;
     if (cost >= trial.oldCost + lambda * trial.rateSaving) {
-        trial.rejMv[0] = c.mv;
-        trial.rejMv[1] = c.mv2;
-        trial.rejSaving = trial.rateSaving;
+        const int r = trial.nRej < ModeTrial::kRej ? trial.nRej++ : pass % ModeTrial::kRej;
+        trial.rejMv[r][0] = c.mv;
+        trial.rejMv[r][1] = c.mv2;
+        trial.rejSaving[r] = trial.rateSaving;
+        trial.rejPass = pass;
         return;
     }
     trial.refined = true;
     trial.curCost = cost;
-    trial.rejSaving = -1.f;
+    trial.nRej = 0;
     const int endY = min(gy + (1 << (b.lh - 3)), j.fs.miRows / 2);
     const int endX = min(gx + (1 << (b.lw - 3)), j.fs.miCols / 2);
     for (int y = gy; y < endY; ++y)
@@ -2932,7 +2946,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         {
             FineTimer t("mode refinement commit");
-            acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda);
+            acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda, pass);
             ca.changed = ta.changed = s->modeChanged;
             commit<<<commitGrid, t16, 0, stream>>>(ca);
             fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
