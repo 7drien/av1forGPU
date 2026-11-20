@@ -221,3 +221,20 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Clean measurement after the fix (120 frames): video_2 +53.4% against SVT-AV1 preset 8 (+59.5% against libaom) at
   16.3 to 22.0 fps (SVT: 32 to 34 fps); video_1 +18.6% (+44.4%) at 21 to 25.5 fps (SVT: 36 to 37 fps).
 
+### Asynchronous host pipeline
+
+- Stage one padded transfer per source in two pinned buffers on a copy stream. Upload the ALTREF first, then send
+  later pictures in coding order during analysis. Inter analysis and filters use an explicit compute stream. The
+  host projects TMVP during coarse search, GPU entropy reuses a snapshot of that field, and the CPU entropy writer
+  waits for its own downloads. Deblocking and CDEF choose their candidates on the device. The host receives a
+  single filter result per frame. The candidate workspace adds about 23.7 MiB at 1080p.
+- Byte-identical to `d437504` on both clips at qindex 20, 50, 90, and 130, including repeated default runs at 20,
+  50, and 90. The GPU and CPU entropy modes also matched in repeated runs at 20 and 90. Both decoder suites passed.
+  BD-rate vs SVT-AV1 preset 8 stayed at +53.4% for video_2 and +18.6% for video_1.
+- Wall fps on the first 120 frames at qindex 50, median of five alternating runs per build with no other GPU
+  compute observed: video_2 18.25 → 19.11 (+4.7%), video_1 22.46 → 24.16 (+7.5%). Video_2 at qindex 20,
+  three runs per build: 16.71 → 17.38 (+4.0%). The first video_1 timing sweep and the first video_2 qindex 90
+  sweep had uneven GPU sharing. A single quieter video_2 qindex 90 pair ran at 20.29 → 21.29 fps.
+- Profile medians at qindex 50 (three alternating runs, first 60 frames): subtracting measured keyframe GPU time
+  left 45.8 → 43.1 ms per inter frame on video_2 and 34.4 → 31.0 ms on video_1. Evaluation stayed at about 21.8 ms
+  and 12.5 ms respectively. The filter result still gates entropy submission.

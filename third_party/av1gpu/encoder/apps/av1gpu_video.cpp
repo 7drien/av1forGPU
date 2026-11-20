@@ -57,16 +57,110 @@ static bool read_frame(FILE *f, int w, int h, std::vector<uint8_t> &src) {
     return true;
 }
 
-static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, int paddedH,
-                      std::vector<uint8_t> &dst) {
-    dst.resize((size_t)paddedW * paddedH);
+static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, int paddedH, uint8_t *dst) {
     for (int y = 0; y < paddedH; ++y) {
         const uint8_t *row = src + (size_t)std::min(y, h - 1) * pitch;
-        uint8_t *out = dst.data() + (size_t)y * paddedW;
+        uint8_t *out = dst + (size_t)y * paddedW;
         memcpy(out, row, w);
         memset(out + w, row[w - 1], paddedW - w);
     }
 }
+
+static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, int paddedH,
+                      std::vector<uint8_t> &dst) {
+    dst.resize((size_t)paddedW * paddedH);
+    pad_plane(src, w, h, pitch, paddedW, paddedH, dst.data());
+}
+
+class FrameUploads {
+public:
+    FrameUploads(int w, int h, int aw, int ah, size_t count)
+        : w(w), h(h), aw(aw), ah(ah), yBytes(size_t(aw) * ah), frames(count) {}
+    FrameUploads(const FrameUploads &) = delete;
+    FrameUploads &operator=(const FrameUploads &) = delete;
+
+    ~FrameUploads() {
+        if (stream) cudaStreamSynchronize(stream);
+        for (auto &frame : frames) {
+            if (frame.ready) cudaEventDestroy(frame.ready);
+            if (frame.planes[0]) cudaFree(frame.planes[0]);
+        }
+        for (auto &stage : staging) {
+            if (stage.done) cudaEventDestroy(stage.done);
+            if (stage.data) cudaFreeHost(stage.data);
+        }
+        if (consumed) cudaEventDestroy(consumed);
+        if (stream) cudaStreamDestroy(stream);
+    }
+
+    bool init() {
+        cudaError_t e = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&consumed, cudaEventDisableTiming);
+        for (auto &stage : staging) {
+            if (e == cudaSuccess) e = cudaMallocHost(&stage.data, yBytes * 3 / 2);
+            if (e == cudaSuccess) e = cudaEventCreateWithFlags(&stage.done, cudaEventDisableTiming);
+        }
+        for (auto &frame : frames) {
+            if (e == cudaSuccess) e = cudaMalloc(&frame.planes[0], yBytes * 3 / 2);
+            if (e == cudaSuccess) {
+                frame.planes[1] = frame.planes[0] + yBytes;
+                frame.planes[2] = frame.planes[1] + yBytes / 4;
+                e = cudaEventCreateWithFlags(&frame.ready, cudaEventDisableTiming);
+            }
+        }
+        return check(e);
+    }
+
+    bool upload(size_t index, const std::vector<uint8_t> &raw) {
+        auto &stage = staging[nextStage];
+        nextStage = (nextStage + 1) % staging.size();
+        if (!check(cudaEventSynchronize(stage.done))) return false;
+        const size_t y = size_t(w) * h;
+        pad_plane(raw.data(), w, h, w, aw, ah, stage.data);
+        for (int p = 0; p < 2; ++p)
+            pad_plane(raw.data() + y + p * (y / 4), w / 2, h / 2, w / 2, aw / 2, ah / 2,
+                      stage.data + yBytes + p * (yBytes / 4));
+        auto &frame = frames[index];
+        cudaError_t e = cudaMemcpyAsync(frame.planes[0], stage.data, yBytes * 3 / 2, cudaMemcpyHostToDevice, stream);
+        if (e == cudaSuccess) e = cudaEventRecord(stage.done, stream);
+        if (e == cudaSuccess) e = cudaEventRecord(frame.ready, stream);
+        return check(e);
+    }
+
+    bool wait(size_t index, cudaStream_t consumer) const {
+        return check(cudaStreamWaitEvent(consumer, frames[index].ready, 0));
+    }
+
+    // Input slots may be overwritten once the compute stream has consumed the current mini-GOP.
+    bool finishBatch(cudaStream_t consumer) {
+        cudaError_t e = cudaEventRecord(consumed, consumer);
+        if (e == cudaSuccess) e = cudaStreamWaitEvent(stream, consumed, 0);
+        return check(e);
+    }
+
+    const std::array<uint8_t *, 3> &operator[](size_t index) const { return frames[index].planes; }
+
+private:
+    static bool check(cudaError_t e) {
+        if (e != cudaSuccess) fprintf(stderr, "P-frame input transfer: %s\n", cudaGetErrorString(e));
+        return e == cudaSuccess;
+    }
+    struct Input {
+        std::array<uint8_t *, 3> planes{};
+        cudaEvent_t ready = nullptr;
+    };
+    struct Stage {
+        uint8_t *data = nullptr;
+        cudaEvent_t done = nullptr;
+    };
+    int w, h, aw, ah;
+    const size_t yBytes;
+    std::vector<Input> frames;
+    std::array<Stage, 2> staging{};
+    size_t nextStage = 0;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t consumed = nullptr;
+};
 
 int main(int argc, char **argv) {
     if (argc < 6) {
@@ -97,8 +191,6 @@ int main(int argc, char **argv) {
     bool pfCutPreset = true;    // base-preset scene-cut key frames (--pf-slow-cuts keeps the main preset)
     bool pfTmvp = true;          // temporal motion vector candidates (--pf-no-tmvp)
     pfm::MotionField mfield;
-    std::vector<pf::BlockInfo> mfGrid;
-    int mfHints[8] = {0}, mfHint = 0;   // OrderHints / OrderHint of the frame being coded (for the storage)
     constexpr int kOrderHintBits = 7;   // --pframes streams: enable_order_hint with 7-bit hints
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -477,8 +569,10 @@ int main(int argc, char **argv) {
     if (usePframes) {
         char perr[256];
         if (pfAnalyzer.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+        // The non-blocking compute stream shares tables initialized on the default stream.
+        const auto e = cudaStreamSynchronize(nullptr);
+        if (e != cudaSuccess) { fprintf(stderr, "P-frame initialization: %s\n", cudaGetErrorString(e)); return 1; }
         mfield.init(2 * ((w + 7) >> 3), 2 * ((h + 7) >> 3), kOrderHintBits);
-        mfGrid.resize(pfAnalyzer.gridCount());
         const int sbCols = (w + 63) / 64, sbRows = (h + 63) / 64;
         // one tile compresses best; the tile coder runs off the critical path, overlapped with later analysis
         (void)sbCols; (void)sbRows;
@@ -500,10 +594,9 @@ int main(int argc, char **argv) {
         for (int k = 0; k < 8; ++k)
             if (cudaMalloc(&slotBuf[k], frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
         if (cudaMalloc(&spare, frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
-        std::vector<std::array<uint8_t *, 3>> inBuf(G + pfTfFrames + 1);
-        for (auto &fb : inBuf)
-            for (int p = 0; p < 3; ++p)
-                if (cudaMalloc(&fb[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "input allocation failed\n"); return 1; }
+        const cudaStream_t compute = pfAnalyzer.stream();
+        FrameUploads inBuf(w, h, aw, ah, G + pfTfFrames + 1);
+        if (!inBuf.init()) return 1;
         bool slotValid[8] = {};
         std::array<uint8_t *, 3> tfBuf{};
         for (int p = 0; p < 3; ++p)
@@ -517,21 +610,20 @@ int main(int argc, char **argv) {
                 pending.push_back(std::move(raw));
             }
         };
-        auto upload = [&](const std::vector<uint8_t> &raw, std::array<uint8_t *, 3> &fb) -> bool {
-            const uint8_t *planes[3] = {raw.data(), raw.data() + (size_t)w * h, raw.data() + (size_t)w * h + (size_t)cw * ch};
-            const int widths[3] = {w, cw, cw}, heights[3] = {h, ch, ch};
-            const int paddedWidths[3] = {aw, acw, acw}, paddedHeights[3] = {ah, ach, ach};
-            for (int p = 0; p < 3; ++p) {
-                pad_plane(planes[p], widths[p], heights[p], widths[p], paddedWidths[p], paddedHeights[p], padded[p]);
-                if (cudaMemcpy(fb[p], padded[p].data(), sizes[p], cudaMemcpyHostToDevice) != cudaSuccess) return false;
-            }
-            return true;
-        };
-        auto dump = [&](const uint8_t *dev) {
-            if (!reconDump) return;
+        auto dump = [&](const uint8_t *dev) -> int {
+            if (!reconDump) return 0;
             std::vector<uint8_t> host(frameBytes);
-            cudaMemcpy(host.data(), dev, frameBytes, cudaMemcpyDeviceToHost);
-            fwrite(host.data(), 1, host.size(), reconDump);
+            cudaError_t e = cudaStreamSynchronize(compute);
+            if (e == cudaSuccess) e = cudaMemcpy(host.data(), dev, frameBytes, cudaMemcpyDeviceToHost);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "P-frame reconstruction download: %s\n", cudaGetErrorString(e));
+                return 1;
+            }
+            if (fwrite(host.data(), 1, host.size(), reconDump) != host.size()) {
+                fprintf(stderr, "reconstruction write failed\n");
+                return 1;
+            }
+            return 0;
         };
         const int pitches[3] = {aw, acw, acw};
         char perr[256];
@@ -548,16 +640,30 @@ int main(int argc, char **argv) {
             uint64_t pts = 0;
         };
         const int kBuffers = 3;
-        std::vector<pf::BlockInfo *> gridBuf(kBuffers, nullptr);
-        std::vector<int16_t *> levelBuf(kBuffers, nullptr);
-        std::vector<int> freeBufs;
-        for (int k = 0; k < kBuffers; ++k) {
-            if (cudaMallocHost(&gridBuf[k], pfAnalyzer.gridCount() * sizeof(pf::BlockInfo)) != cudaSuccess ||
-                cudaMallocHost(&levelBuf[k], pfAnalyzer.levelCount() * sizeof(int16_t)) != cudaSuccess) {
-                fprintf(stderr, "pinned buffer allocation failed\n");
-                return 1;
+        struct CpuEntropyBuffer {
+            pf::BlockInfo *grid = nullptr;
+            int16_t *levels = nullptr;
+            cudaEvent_t ready = nullptr;
+            ~CpuEntropyBuffer() {
+                if (ready) cudaEventDestroy(ready);
+                if (grid) cudaFreeHost(grid);
+                if (levels) cudaFreeHost(levels);
             }
-            freeBufs.push_back(k);
+        };
+        std::array<CpuEntropyBuffer, kBuffers> cpuBuf;
+        std::vector<int> freeBufs;
+        if (pfEntropyMode == 0) {
+            for (int k = 0; k < kBuffers; ++k) {
+                auto &buf = cpuBuf[k];
+                cudaError_t e = cudaMallocHost(&buf.grid, pfAnalyzer.gridCount() * sizeof(pf::BlockInfo));
+                if (e == cudaSuccess) e = cudaMallocHost(&buf.levels, pfAnalyzer.levelCount() * sizeof(int16_t));
+                if (e == cudaSuccess) e = cudaEventCreateWithFlags(&buf.ready, cudaEventDisableTiming);
+                if (e != cudaSuccess) {
+                    fprintf(stderr, "CPU entropy buffer allocation: %s\n", cudaGetErrorString(e));
+                    return 1;
+                }
+                freeBufs.push_back(k);
+            }
         }
         pf::HostEntropy hostEntropy;
         if (hostEntropy.init(w, h, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
@@ -609,7 +715,10 @@ int main(int argc, char **argv) {
                     } else if (job.kind == Job::Coded) {
                         job.ein.primarySlot = persistentCdf && hostSlotValid[job.slot0] ? job.slot0 : -1;
                         job.ein.saveSlot = persistentCdf && job.outSlot < 8 ? job.outSlot : -1;
-                        ok = !hostEntropy.code(job.ein, gridBuf[job.buf], levelBuf[job.buf], eout, werr, sizeof werr);
+                        auto &buf = cpuBuf[job.buf];
+                        const cudaError_t e = cudaEventSynchronize(buf.ready);
+                        if (e != cudaSuccess) snprintf(werr, sizeof werr, "CPU entropy download: %s", cudaGetErrorString(e));
+                        ok = e == cudaSuccess && !hostEntropy.code(job.ein, buf.grid, buf.levels, eout, werr, sizeof werr);
                         {
                             std::lock_guard<std::mutex> lock(mtx);
                             freeBufs.push_back(job.buf);
@@ -681,42 +790,68 @@ int main(int argc, char **argv) {
             ~WriterGuard() { f(); }
         } writerGuard{[&] {
             if (writerThread.joinable()) stopWriter();
-            for (int k = 0; k < kBuffers; ++k) { cudaFreeHost(gridBuf[k]); cudaFreeHost(levelBuf[k]); }
+            cudaStreamSynchronize(compute);
         }};
-        // Analyze, filter and write one inter frame. refSlots: slots of the AV1 references used by BlockInfo::ref
-        // 0 and 1 (second < 0: single reference). The reconstruction goes to outSlot.
-        auto interFrame = [&](std::array<uint8_t *, 3> &fb, int slot0, int slot1, int outSlot, int qindex, bool show,
-                              bool endTU, uint64_t pts, int slot2 = -1) -> int {
+        std::vector<size_t> uploadOrder;
+        size_t nextUpload = 0;
+        const bool tmvp = persistentCdf && pfTmvp;
+        constexpr int refNames[3] = {pfw::LAST_FRAME, pfw::ALTREF_FRAME, pfw::ALTREF2_FRAME};
+        struct PendingMotion {
+            int slot = -1, hint = 0;
+            std::array<int, 8> refHints{};
+        } pendingMotion;
+        // The reconstruction goes to outSlot. The original input of a temporally filtered ALTREF is
+        // kept in its input slot for the overlay.
+        auto interFrame = [&](size_t input, int slot0, int slot1, int outSlot, int qindex, bool show,
+                              bool endTU, uint64_t pts, int slot2 = -1, bool filteredSource = false) -> int {
+            if (!filteredSource && !inBuf.wait(input, compute)) return 1;
+            const auto &fb = filteredSource ? tfBuf : inBuf[input];
             // slot2: a third single reference (ALTREF2), used only with slot1 (--pf-refs 3)
             if (pfRefs < 3 || slot1 < 0) slot2 = -1;
             const uint8_t *refs[3] = {slotBuf[slot0], slot1 >= 0 ? slotBuf[slot1] : nullptr, slot2 >= 0 ? slotBuf[slot2] : nullptr};
             const int refCount = slot2 >= 0 ? 3 : slot1 >= 0 ? 2 : 1;
-            if (persistentCdf && pfTmvp) {
-                // projected motion field of this frame: the motion search aims at its candidates, the tile coder uses it
-                int rs[7];
-                for (int r = 0; r < 7; ++r) rs[r] = slot0;
-                if (slot1 >= 0) rs[pfw::ALTREF_FRAME - 1] = slot1;
-                if (slot2 >= 0) rs[pfw::ALTREF2_FRAME - 1] = slot2;
-                int oh[8] = {0};
-                for (int r = 0; r < 7; ++r) oh[r + 1] = slotHint[rs[r]];
-                const pf::Mv *field = mfield.estimate(rs, oh, int(frameOrder & ((1u << kOrderHintBits) - 1)));
-                const int names[3] = {pfw::LAST_FRAME, pfw::ALTREF_FRAME, pfw::ALTREF2_FRAME};
-                if (pfAnalyzer.setMotionField(field, names, perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+            const int orderHint = int(frameOrder & ((1u << kOrderHintBits) - 1));
+            int refSlot[7];
+            std::fill_n(refSlot, 7, slot0);
+            if (slot1 >= 0) refSlot[pfw::ALTREF_FRAME - 1] = slot1;
+            if (slot2 >= 0) refSlot[pfw::ALTREF2_FRAME - 1] = slot2;
+            std::array<int, 8> refHints{};
+            for (int r = 0; r < 7; ++r) refHints[r + 1] = slotHint[refSlot[r]];
+            pf::Analyzer::ProjectMotion projectMotion;
+            if (tmvp) {
+                projectMotion = [&]() -> const pf::Mv * {
+                    if (pendingMotion.slot >= 0) {
+                        const auto *grid = pfAnalyzer.motionGrid(perr, sizeof perr);
+                        if (!grid) return nullptr;
+                        mfield.store(pendingMotion.slot, grid, pfAnalyzer.gridCols(), refNames,
+                                     pendingMotion.refHints.data(), pendingMotion.hint);
+                        pendingMotion.slot = -1;
+                    }
+                    return mfield.estimate(refSlot, refHints.data(), orderHint);
+                };
             }
             pf::Settings st = pfSettings;
             st.qindex = qindex;
             // moving content codes most blocks: search rectangular partitions only where the square clearly wins
             if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
-            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, nullptr, nullptr, perr, sizeof perr)) {
+            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, projectMotion, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
             }
             pfMs += pfAnalyzer.lastMs();
+            if (outSlot < 8 && tmvp) {
+                if (pfAnalyzer.stageMotionGrid(perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
+                pendingMotion = {outSlot, orderHint, refHints};
+            }
+            if (nextUpload < uploadOrder.size()) {
+                const size_t next = uploadOrder[nextUpload++];
+                if (!inBuf.upload(next, pending[next])) return 1;
+            }
             const auto tf0 = std::chrono::steady_clock::now();
             pf::FilterParams flt;
             flt.lrAllowed = pfLr;
-            if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, true, flt, perr, sizeof perr)) {
+            if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, flt, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
             }
@@ -741,9 +876,7 @@ int main(int argc, char **argv) {
             ein.tileRowsLog2 = pfTileRows;
             pfw::FrameParams &fp = job.fp;
             fp.qindex = qindex;
-            for (int r = 0; r < 7; ++r) fp.refSlot[r] = slot0;
-            if (slot1 >= 0) fp.refSlot[pfw::ALTREF_FRAME - 1] = slot1;
-            if (slot2 >= 0) fp.refSlot[pfw::ALTREF2_FRAME - 1] = slot2;
+            std::copy_n(refSlot, 7, fp.refSlot);
             fp.referenceSelect = refCount >= 2;
             fp.txModeSelect = pfSettings.txSplit;
             fp.reducedTxSet = pfSettings.txTypes < 2;
@@ -754,21 +887,16 @@ int main(int argc, char **argv) {
             fp.showFrame = show;
             fp.persistent = persistentCdf;
             fp.orderHintBits = kOrderHintBits;
-            fp.orderHint = int(frameOrder & ((1u << kOrderHintBits) - 1));
+            fp.orderHint = orderHint;
             for (int k = 0; k < 8; ++k) fp.slotHint[k] = slotHint[k];
-            for (int r = 0; r < 7; ++r)   // RefFrameSignBias for the tile coder's motion vector candidates
-                ein.signBias[r + 1] = pfw::relDist(slotHint[fp.refSlot[r]], fp.orderHint, kOrderHintBits) > 0;
-            int orderHints[8] = {0};
-            for (int r = 0; r < 7; ++r) orderHints[r + 1] = slotHint[fp.refSlot[r]];
-            for (int r = 0; r < 8; ++r) mfHints[r] = orderHints[r];
-            mfHint = fp.orderHint;
-            // temporal motion vector candidates (use_ref_frame_mvs needs error_resilient_mode = 0)
-            if (persistentCdf && pfTmvp) {
-                const pf::Mv *field = mfield.out.data();   // estimated before the analysis
-                job.mf.assign(field, field + mfield.out.size());
-                ein.useTmvp = true;
+            for (int r = 1; r < 8; ++r)
+                ein.signBias[r] = pfw::relDist(refHints[r], orderHint, kOrderHintBits) > 0;
+            // use_ref_frame_mvs needs error_resilient_mode = 0. The GPU entropy paths snapshot the
+            // device motion field; only the CPU coder needs a copy of the host projection.
+            ein.useTmvp = fp.useRefFrameMvs = tmvp;
+            if (tmvp && pfEntropyMode == 0) {
+                job.mf = mfield.out;
                 ein.motionField = job.mf.data();
-                fp.useRefFrameMvs = true;
             }
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
@@ -819,7 +947,8 @@ int main(int argc, char **argv) {
                     job.buf = freeBufs.back();
                     freeBufs.pop_back();
                 }
-                if (pfAnalyzer.download(gridBuf[job.buf], levelBuf[job.buf], perr, sizeof perr)) {
+                auto &buf = cpuBuf[job.buf];
+                if (pfAnalyzer.download(buf.grid, buf.levels, buf.ready, perr, sizeof perr)) {
                     fprintf(stderr, "%s\n", perr);
                     return 1;
                 }
@@ -828,12 +957,7 @@ int main(int argc, char **argv) {
             if (submit(std::move(job))) return 1;
             if (outSlot < 8) {
                 slotValid[outSlot] = persistentCdf;
-                slotHint[outSlot] = int(frameOrder & ((1u << kOrderHintBits) - 1));
-                if (persistentCdf && pfTmvp) {
-                    if (pfAnalyzer.downloadGrid(mfGrid.data(), perr, sizeof perr)) { fprintf(stderr, "%s\n", perr); return 1; }
-                    const int names[3] = {pfw::LAST_FRAME, pfw::ALTREF_FRAME, pfw::ALTREF2_FRAME};
-                    mfield.store(outSlot, mfGrid.data(), pfAnalyzer.gridCols(), names, mfHints, mfHint);
-                }
+                slotHint[outSlot] = orderHint;
                 std::swap(slotBuf[outSlot], spare);
             }
             return 0;
@@ -970,8 +1094,8 @@ int main(int argc, char **argv) {
                 // keyframe
                 std::vector<uint8_t> raw = std::move(pending.front());
                 pending.erase(pending.begin());
-                if (!upload(raw, inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
-                prevFrame = raw;
+                if (!inBuf.upload(0, raw) || !inBuf.wait(0, nullptr)) return 1;
+                prevFrame = std::move(raw);
                 diffCache.clear();   // freed buffers may be reused at the same addresses
                 GpFrameIn in;
                 in.deviceRecon = reference;
@@ -1008,10 +1132,12 @@ int main(int argc, char **argv) {
                 gpuMs += times.total + entropyMs;
                 for (int k = 0; k < 8; ++k)
                     if (cudaMemcpy(slotBuf[k], reference, frameBytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
+                if (cudaStreamSynchronize(nullptr) != cudaSuccess) { fprintf(stderr, "key frame reference copy failed\n"); return 1; }
                 for (auto &v : slotValid) v = false;
+                pendingMotion.slot = -1;
                 mfield.keyFrame();
                 pfAnalyzer.resetTemporal();
-                dump(slotBuf[0]);
+                if (dump(slotBuf[0])) return 1;
                 lastShown = 0;
                 lastKeyIndex = frameCount;
                 keyPending = true;
@@ -1026,13 +1152,14 @@ int main(int argc, char **argv) {
             const size_t n = std::min(g, pending.size());
             if (n == 1) {
                 // single P frame from the last shown picture
-                if (!upload(pending[0], inBuf[0])) { fprintf(stderr, "upload failed\n"); return 1; }
+                if (!inBuf.upload(0, pending[0])) return 1;
                 frameOrder = frameCount;
-                if (interFrame(inBuf[0], lastShown, -1, 0, pfSettings.qindex, true, true, frameCount)) return 1;
-                dump(slotBuf[0]);
+                if (interFrame(0, lastShown, -1, 0, pfSettings.qindex, true, true, frameCount)) return 1;
+                if (dump(slotBuf[0])) return 1;
                 lastShown = 0;
                 ++predicted; ++frameCount;
-                prevFrame = pending[0];
+                if (!inBuf.finishBatch(compute)) return 1;
+                prevFrame = std::move(pending[0]);
                 pending.erase(pending.begin());
                 diffCache.clear();
                 endPeriod(frameCount - periodBegin);
@@ -1042,17 +1169,30 @@ int main(int argc, char **argv) {
             // frame from lo (LAST) and hi (ALTREF), hidden unless it is the next frame to display, and shows coded
             // frames with show_existing_frame when their turn comes.
             const size_t avail = std::min(pending.size(), n + pfTfFrames);
-            for (size_t i = 0; i < avail; ++i)
-                if (!upload(pending[i], inBuf[i])) { fprintf(stderr, "upload failed\n"); return 1; }
-            // temporal filter of the ALTREF source from its neighbours (past frames of this mini-GOP, read-ahead frames)
+            // Prime the ALTREF and any temporal-filter neighbours. Prefetch the remaining original
+            // pictures in pyramid coding order, one per analysis launch.
+            const size_t firstReady = n - 1 - std::min(n - 1, size_t(pfTfFrames));
+            if (!inBuf.upload(n - 1, pending[n - 1])) return 1;
+            for (size_t i = firstReady; i < avail; ++i)
+                if (i != n - 1 && !inBuf.upload(i, pending[i])) return 1;
+            uploadOrder.clear();
+            nextUpload = 0;
+            auto order = [&](auto &self, size_t lo, size_t hi) -> void {
+                if (hi <= lo + 1) return;
+                const size_t mid = (lo + hi) / 2;
+                if (mid - 1 < firstReady) uploadOrder.push_back(mid - 1);
+                self(self, lo, mid);
+                self(self, mid, hi);
+            };
+            order(order, 0, n);
+
             bool filtered = false;
-            std::array<uint8_t *, 3> altSrc = inBuf[n - 1];
             if (pfTfFrames > 0) {
                 std::vector<const uint8_t *> nbs[3];
-                for (int d = -pfTfFrames; d <= pfTfFrames; ++d) {
-                    const long idx = long(n) - 1 + d;
-                    if (!d || idx < 0 || idx >= long(avail)) continue;
-                    for (int p = 0; p < 3; ++p) nbs[p].push_back(inBuf[idx][p]);
+                for (size_t i = firstReady; i < avail; ++i) {
+                    if (!inBuf.wait(i, compute)) return 1;
+                    if (i == n - 1) continue;
+                    for (int p = 0; p < 3; ++p) nbs[p].push_back(inBuf[i][p]);
                 }
                 if (!nbs[0].empty()) {
                     const uint8_t *const center[3] = {inBuf[n - 1][0], inBuf[n - 1][1], inBuf[n - 1][2]};
@@ -1063,7 +1203,6 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "%s\n", perr);
                         return 1;
                     }
-                    altSrc = tfBuf;
                     filtered = true;
                 }
             }
@@ -1089,17 +1228,17 @@ int main(int argc, char **argv) {
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
             int hiSlot = allocSlot();
             frameOrder = base + n;
-            if (interFrame(altSrc, lastShown, -1, hiSlot, qAt(0), false, false, 0)) return 1;
+            if (interFrame(n - 1, lastShown, -1, hiSlot, qAt(0), false, false, 0, -1, filtered)) return 1;
             // hi2Slot: the next anchor after hi (still held, displayed later), the third reference of the interval
             std::function<int(uint64_t, uint64_t, int, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
                                                                                  int hiSlotL, int depth, int hi2Slot) -> int {
                 if (hi == lo + 1 && filtered && hi == base + n) {
                     // overlay: display the original picture coded from the filtered ALTREF (refreshes no slot)
                     frameOrder = base + n;
-                    if (interFrame(inBuf[n - 1], loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
+                    if (interFrame(n - 1, loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
                                    true, true, frameCount))
                         return 1;
-                    dump(spare);
+                    if (dump(spare)) return 1;
                     ++predicted; ++frameCount;
                     release(loSlot);
                     return 0;
@@ -1111,7 +1250,7 @@ int main(int argc, char **argv) {
                     se.endTU = true;
                     se.pts = frameCount;
                     if (submit(std::move(se))) return 1;
-                    dump(slotBuf[hiSlotL]);
+                    if (dump(slotBuf[hiSlotL])) return 1;
                     ++predicted; ++frameCount;
                     release(loSlot);
                     return 0;
@@ -1123,18 +1262,18 @@ int main(int argc, char **argv) {
                     const int midSlot = referenced ? allocSlot() : -1;
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
                     frameOrder = mid;
-                    if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, referenced ? midSlot : 8,
+                    if (interFrame(mid - base - 1, loSlot, hiSlotL, referenced ? midSlot : 8,
                                    referenced ? qAt(depth) : std::min(255, pfSettings.qindex + pfLeafOffset), true,
                                    true, frameCount, hi2Slot))
                         return 1;
-                    dump(referenced ? slotBuf[midSlot] : spare);
+                    if (dump(referenced ? slotBuf[midSlot] : spare)) return 1;
                     ++predicted; ++frameCount;
                     release(loSlot);
                     return rec(mid, hi, midSlot, hiSlotL, depth + 1, hi2Slot);
                 }
                 const int midSlot = allocSlot();
                 frameOrder = mid;
-                if (interFrame(inBuf[mid - base - 1], loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0, hi2Slot))
+                if (interFrame(mid - base - 1, loSlot, hiSlotL, midSlot, qAt(depth), false, false, 0, hi2Slot))
                     return 1;
                 if (rec(lo, mid, loSlot, midSlot, depth + 1, hiSlotL)) return 1;
                 return rec(mid, hi, midSlot, hiSlotL, depth + 1, hi2Slot);
@@ -1146,15 +1285,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             lastShown = hiSlot;
-            prevFrame = pending[n - 1];
+            if (!inBuf.finishBatch(compute)) return 1;
+            prevFrame = std::move(pending[n - 1]);
             pending.erase(pending.begin(), pending.begin() + n);
             diffCache.clear();
             endPeriod(frameCount - periodBegin);
         }
         if (drain()) return 1;
         stopWriter();
-        for (auto &fb : inBuf)
-            for (auto *p : fb) cudaFree(p);
+        const cudaError_t e = cudaStreamSynchronize(compute);
+        if (e != cudaSuccess) { fprintf(stderr, "P-frame compute: %s\n", cudaGetErrorString(e)); return 1; }
         for (auto *p : tfBuf) cudaFree(p);
         for (auto *p : slotBuf) cudaFree(p);
         cudaFree(spare);

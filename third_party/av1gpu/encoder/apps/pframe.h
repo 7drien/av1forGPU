@@ -7,6 +7,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace pf {
@@ -98,7 +99,7 @@ class HostEntropy {
 public:
     ~HostEntropy();
     int init(int width, int height, char *err, int errLen);
-    // grid / levels: host copies of the decisions and levels of the frame (Analyzer::analyze downloads).
+    // grid / levels: host copies of the decisions and levels of the frame.
     int code(const EntropyIn &in, const BlockInfo *grid, const int16_t *levels, EntropyOut &out, char *err, int errLen);
     // Range-code symbol records modeled on the GPU (in.primarySlot / saveSlot refer to this object's slots).
     int codeRecords(const EntropyIn &in, const std::vector<uint32_t> &tileCounts, const std::vector<uint8_t> &records,
@@ -113,24 +114,23 @@ class Analyzer {
 public:
     ~Analyzer();
     int init(int width, int height, char *err, int errLen);
+    cudaStream_t stream() const;
     // src: device planes with pitches; refs: device reference frames (refs[0] = LAST); recon: output frame.
-    // When info / levels are non-null, also downloads the decisions (8x8 grid) and levels (spatial layout).
+    // Once coarse search is queued, project the motion field on the host for use by refinement and entropy.
+    using ProjectMotion = std::function<const Mv *()>;
     int analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                const Settings &s, uint8_t *recon, std::vector<BlockInfo> *info, std::vector<int16_t> *levels,
-                char *err, int errLen);
-    // Copy the last frame's decisions and levels into host buffers (pinned memory recommended).
-    int download(BlockInfo *info, int16_t *levels, char *err, int errLen);
-    // Copy the decisions grid only (after filter(): includes the loop restoration fields).
-    int downloadGrid(BlockInfo *info, char *err, int errLen);
-    // Projected motion field (MotionFieldMvs[8][MiRows / 2][MiCols / 2]) for the next analyze(): its candidates join
-    // the motion search. refName: AV1 reference of analyze()'s refs[0..2].
-    int setMotionField(const Mv *field, const int refName[3], char *err, int errLen);
+                const Settings &s, uint8_t *recon, const ProjectMotion &projectMotion, char *err, int errLen);
+    // Enqueue copies into pinned buffers. The caller waits on done before reading or releasing them.
+    int download(BlockInfo *info, int16_t *levels, cudaEvent_t done, char *err, int errLen);
+    // Queue an early download of the decisions used by the host motion-field storage.
+    int stageMotionGrid(char *err, int errLen);
+    const BlockInfo *motionGrid(char *err, int errLen);
     int gridCols() const { return aw / 8; }
     size_t gridCount() const { return size_t(aw / 8) * (ah / 8); }
     size_t levelCount() const { return size_t(aw) * ah * 3 / 2; }
     // Deblocking and CDEF of the last analyzed frame's reconstruction (in place), choosing levels by SSE.
     int filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
-               bool search, FilterParams &out, char *err, int errLen);
+               FilterParams &out, char *err, int errLen);
     // Forget the temporal motion field (after a keyframe).
     void resetTemporal();
     // Motion-compensated temporal filter of a padded source frame (planes with pitches aw, aw/2, aw/2) from up to 8
