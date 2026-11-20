@@ -38,16 +38,32 @@ def decode(path):
                                     path, "-f", "rawvideo", "-"])
 
 
-def psnr(ref, dist):
+def psnr_stream(source, path):
+    """6:1:1 YUV PSNR averaged over frames, decoding and comparing one frame at a time (4K clips do not fit in
+    memory as whole float arrays)."""
     size = W * H * 3 // 2
-    assert len(ref) == len(dist), (len(ref), len(dist))
-    a = np.frombuffer(ref, np.uint8).reshape(-1, size).astype(np.float64)
-    b = np.frombuffer(dist, np.uint8).reshape(-1, size).astype(np.float64)
     y = W * H
-    def p(sl):
-        mse = np.mean((a[:, sl] - b[:, sl]) ** 2, axis=1)
-        return np.mean(10 * np.log10(255 * 255 / np.maximum(mse, 1e-10)))
-    return (6 * p(slice(0, y)) + p(slice(y, y + y // 4)) + p(slice(y + y // 4, size))) / 8
+    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-xerror", "-c:v", "libdav1d", "-i", path, "-f", "rawvideo", "-"],
+                            stdout=subprocess.PIPE)
+    total, n = 0.0, 0
+    with open(source, "rb") as f:
+        while True:
+            d = proc.stdout.read(size)
+            if not d:
+                break
+            r = f.read(size)
+            assert len(d) == size and len(r) == size, (len(d), len(r))
+            a = np.frombuffer(r, np.uint8).astype(np.int32)
+            b = np.frombuffer(d, np.uint8).astype(np.int32)
+            def p(sl):
+                mse = float(np.mean((a[sl] - b[sl]) ** 2))
+                return 10 * math.log10(255 * 255 / max(mse, 1e-10))
+            total += (6 * p(slice(0, y)) + p(slice(y, y + y // 4)) + p(slice(y + y // 4, size))) / 8
+            n += 1
+        assert not f.read(1), "decoded fewer frames than the source"
+    if proc.wait():
+        raise subprocess.CalledProcessError(proc.returncode, "ffmpeg")
+    return total / n
 
 
 def bd_rate(r1, q1, r2, q2):
@@ -76,8 +92,7 @@ def run(name, cmd, source, frames, stdin=True, cache=False):
         subprocess.run(cmd(out), stdin=f if stdin else None, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     seconds = time.time() - start
-    ref = source.read_bytes()
-    q = psnr(ref, decode(out))
+    q = psnr_stream(source, out)
     size = out.stat().st_size
     kbps = size * 8 / (frames / FPS) / 1000
     row = {"name": name, "bytes": size, "kbps": round(kbps, 1), "psnr": round(q, 3),
@@ -88,7 +103,7 @@ def run(name, cmd, source, frames, stdin=True, cache=False):
 
 
 def main():
-    global W, H, FPS, FPSN, FPSD, SRC, OUT
+    global W, H, FPS, FPSN, FPSD, SRC, OUT, RANGE
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--src", default="benckmark/video_1.mp4")
@@ -100,8 +115,12 @@ def main():
     args = ap.parse_args()
     if args.src != "benckmark/video_1.mp4":
         info = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                                        "stream=width,height,r_frame_rate", "-of", "csv=p=0", args.src], text=True)
-        w, h, rate = info.strip().split(",")
+                                        "stream=width,height,r_frame_rate,color_range,pix_fmt", "-of", "default=nw=1",
+                                        args.src], text=True)
+        kv = dict(line.split("=", 1) for line in info.strip().splitlines())
+        w, h, rate, crange, pixfmt = kv["width"], kv["height"], kv["r_frame_rate"], kv["color_range"], kv["pix_fmt"]
+        if crange == "pc" or pixfmt.startswith("yuvj"):   # full-range source: keep its levels
+            RANGE = RANGE.replace("in_range=tv", "in_range=pc")
         num, den = rate.split("/")
         W, H, FPS = int(w), int(h), float(num) / float(den)
         FPSN, FPSD = int(num), int(den)
