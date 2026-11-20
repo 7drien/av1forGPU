@@ -277,3 +277,29 @@ libaom equal to the encoder reconstruction.
 | video_2 | +47.7% (was +53.4%) | +53.7% (was +59.5%) | 19.2 (20.3) |
 | video_1 | +13.1% (was +18.6%) | +37.7% (was +44.4%) | 25.5 (25.0) |
 
+### Repeated final-partition refinement (`--pf-refine-passes N`, default 6)
+
+- The refinement prices every block against a snapshot of its neighbours' vectors (Jacobi), so a block that
+  adopts a neighbour's vector often loses it when that neighbour switches too, and a uniform-motion area can only
+  converge one block further per pass. The pass is now repeated: each pass rebuilds the stacks from the accepted
+  vectors, compares against the block's current cost (the accepted trial's distortion and coefficient rate for
+  blocks changed by an earlier pass), skips a block whose priced menu equals the previous pass's (its screen and
+  trial would repeat), and does not re-evaluate a proposal that was rejected at the same rate saving. Each pass
+  commits only its own accepted blocks. `--pf-refine-passes 1` reproduces the previous output byte for byte.
+- Trials per pass roughly halve (video_2 q50, about 1200 → 660 → 360 → 200 → 110 → 60 per frame).
+- The trial evaluation was latency bound, not work bound: per pass the 14 shape evaluations ran as a serial chain of
+  48 kernels, each as long as its slowest block (one warp evaluating a 64x64 block takes about 0.3 ms), so a pass
+  with 60 trials cost almost as much as one with 1200. The shapes write disjoint buffers, so their trials now run
+  concurrently on one stream per shape (fork / join events). Pass spans on video_2 q50 (nsys): 5.0, 4.2, 3.9, 3.6,
+  3.5, 2.8 ms → 3.7, 2.7, 2.1, 1.7, 1.5, 1.4 ms. Output unchanged.
+
+| video_2, 120 frames, passes | 1 | 2 | 3 | 4 | 6 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BD-rate vs SVT-AV1 preset 8 | +47.7% | +42.3% | +38.9% | +37.0% | +35.0% | +34.3% |
+| fps at q50 (direct runs) | 19.7 | 18.9 | 18.2 | 17.7 | 17.0 | 16.5 |
+
+- video_1: +13.1% (1 pass) → +9.5% (3) → +8.2% (6); vs libaom +37.7% → +31.6%. video_2 vs libaom (3 passes):
+  +44.0%.
+- Verified: both suites (plus a single-pass case), repeated runs identical, a full 120-frame video_2 stream decoded
+  by dav1d equal to the encoder reconstruction.
+

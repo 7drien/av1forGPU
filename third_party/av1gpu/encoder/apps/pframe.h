@@ -56,6 +56,7 @@ struct Settings {
     bool pruneRect = true;       // skip HORZ / VERT / 4:1 searches of nodes whose square evaluation chose skip
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
     bool modeRefine = true;      // recheck motion vectors on the final partition
+    int modeRefinePasses = 6;    // passes of that check (each against the neighbours' vectors of the previous one)
 };
 
 // In-loop filter parameters chosen for a P frame (the reconstruction already includes them).

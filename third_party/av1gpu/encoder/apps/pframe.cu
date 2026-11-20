@@ -71,6 +71,12 @@ struct ModeTrial {
     Cand cand;
     float oldCost, rateSaving;
     bool active;
+    // State kept across refinement passes: cost (distortion + coefficient rate, no MV rate) of an accepted trial, and
+    // the last rejected proposal (same vectors at the same saving are not re-evaluated by a later pass).
+    bool refined;
+    float curCost;
+    Mv rejMv[2];
+    float rejSaving;
 };
 
 struct Frame {
@@ -1732,6 +1738,7 @@ struct RefinementArgs {
     int *trialCount;
     int *trialIndices[kShapes];
     float lambda, origMvWeight, screenWeight;
+    int pass;
 };
 
 struct MotionOption {
@@ -1742,6 +1749,7 @@ struct MotionOptions {
     // 13 implied compound pairs including mixed NEW modes, plus the searched vector pair.
     MotionOption option[14];
     int count;
+    int same;   // equal to the menu of the previous pass: the screen and trial would repeat their outcome
 };
 
 // Price each distinct vector pair once. A mixed compound mode keeps the searched vector on its NEWMV list.
@@ -1769,7 +1777,7 @@ __device__ int motionOptions(pft2::TileCoder &t, const pft2::TileCoder::RefPair 
     return n;
 }
 
-__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus) {
+__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus, int pass) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[sb * 64 + k];
@@ -1784,12 +1792,17 @@ __global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions 
     t.setParallelMvCtx(stack);
     MotionOption options[14];
     const int n = motionOptions(t, rp, stack, bi, options);
-    MotionOptions &menu = menus[sb * 64 + k];
-    menu.option[0] = options[0];
     int count = 1;
     for (int i = 1; i < n; ++i)
-        if (options[i].bits < options[0].bits) menu.option[count++] = options[i];
+        if (options[i].bits < options[0].bits) options[count++] = options[i];
+    MotionOptions &menu = menus[sb * 64 + k];
+    bool same = pass > 0 && menu.count == count;
+    for (int i = 0; same && i < count; ++i)
+        same = menu.option[i].mv[0] == options[i].mv[0] && menu.option[i].mv[1] == options[i].mv[1] &&
+               menu.option[i].bits == options[i].bits;
+    for (int i = 0; i < count; ++i) menu.option[i] = options[i];
     menu.count = count;
+    menu.same = same;
 }
 
 // Screen with 4x4 luma SATD on the existing search planes. Final acceptance uses exact interpolation,
@@ -1834,9 +1847,12 @@ __global__ void proposeMotion(TileJob j, RefinementArgs a, const MotionOptions *
     const auto &b = j.entries[e];
     const int gy = b.r / 2, gx = b.c / 2, pos = gy * j.fs.gcols + gx;
     ModeTrial &trial = a.trials[pos];
-    if (!lane) trial.active = false;
+    if (!lane) {
+        trial.active = false;
+        if (!a.pass) { trial.refined = false; trial.rejSaving = -1.f; }
+    }
     const MotionOptions &menu = menus[e];
-    if (menu.count == 1) return;
+    if (menu.count == 1 || menu.same) return;
     const BlockInfo &bi = j.grid[pos];
     int best = 0;
     float bestScore = kInf;
@@ -1850,31 +1866,43 @@ __global__ void proposeMotion(TileJob j, RefinementArgs a, const MotionOptions *
     const int satd = motionSatd(a, orig, bi.ref, gx * 8, gy * 8, b.lw, b.lh);
     if (!lane && bestScore < satd * 0.125f + a.screenWeight * orig.bits) {
         const MotionOption option = menu.option[best];
+        const float saving = orig.bits - option.bits;
+        if (option.mv[0] == trial.rejMv[0] && option.mv[1] == trial.rejMv[1] && saving == trial.rejSaving) return;
         const int shape = blockShape(bi);
         const int index = (gy >> (b.lh - 3)) * a.cols[shape] + (gx >> (b.lw - 3));
         const Cand &old = a.candidates[shape][index];
+        if (trial.refined) trial.oldCost = trial.curCost;
+        else trial.oldCost = (bi.skip ? old.costSkip : old.costCoded) - a.lambda * old.mvBits * a.origMvWeight;
         trial.cand.mv = option.mv[0];
         trial.cand.mv2 = option.mv[1];
         trial.cand.ref = bi.ref;
         trial.cand.pruned = 0;
         trial.cand.mvBits = 0;
-        trial.oldCost = (bi.skip ? old.costSkip : old.costCoded) - a.lambda * old.mvBits * a.origMvWeight;
-        trial.rateSaving = orig.bits - option.bits;
+        trial.rateSaving = saving;
         trial.active = true;
         a.trialIndices[shape][atomicAdd(a.trialCount + shape, 1)] = index;
     }
 }
 
-__global__ void acceptMotion(TileJob j, const ModeTrial *trials, BlockInfo *grid, uint8_t *changed, float lambda) {
+__global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint8_t *changed, float lambda) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[sb * 64 + k];
     const int gx = b.c / 2, gy = b.r / 2, cols = j.fs.gcols;
-    const ModeTrial &trial = trials[gy * cols + gx];
+    ModeTrial &trial = trials[gy * cols + gx];
     if (!trial.active) return;
     const Cand &c = trial.cand;
     const bool skip = !c.nz || c.costSkip <= c.costCoded;
-    if ((skip ? c.costSkip : c.costCoded) >= trial.oldCost + lambda * trial.rateSaving) return;
+    const float cost = skip ? c.costSkip : c.costCoded;
+    if (cost >= trial.oldCost + lambda * trial.rateSaving) {
+        trial.rejMv[0] = c.mv;
+        trial.rejMv[1] = c.mv2;
+        trial.rejSaving = trial.rateSaving;
+        return;
+    }
+    trial.refined = true;
+    trial.curCost = cost;
+    trial.rejSaving = -1.f;
     const int endY = min(gy + (1 << (b.lh - 3)), j.fs.miRows / 2);
     const int endX = min(gx + (1 << (b.lw - 3)), j.fs.miCols / 2);
     for (int y = gy; y < endY; ++y)
@@ -2248,6 +2276,7 @@ struct State {
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
     ModeTrial *modeTrials = nullptr;
     uint8_t *modeChanged = nullptr;
+    bool refineStats = getenv("AV1GPU_PF_REFINE_STATS") != nullptr;
     pft2::MiInfo *modeMi = nullptr;
     pft2::BlockEntry *modeEntries = nullptr;
     uint32_t *modeEntryCount = nullptr;
@@ -2266,6 +2295,10 @@ struct State {
     BlockInfo *motionGridHost = nullptr;
     cudaStream_t compute = nullptr;
     cudaEvent_t mfUploaded = nullptr, motionGridReady = nullptr;
+    // mode refinement trials: the per-shape evaluations are independent and mostly latency bound, so they run
+    // concurrently, one stream per shape (forked from and joined into the compute stream)
+    cudaStream_t shapeStream[kShapes] = {};
+    cudaEvent_t trialFork = nullptr, trialJoin[kShapes] = {};
     float *lrCoef = nullptr; int8_t *lrQ = nullptr; unsigned long long *lrSse = nullptr; uint8_t *lrOut = nullptr;
     int lrUnitRows = 1, lrUnitCols = 1;
     unsigned long long *sse = nullptr;
@@ -2371,6 +2404,9 @@ Analyzer::~Analyzer() {
     if (s->motionGridReady) cudaEventDestroy(s->motionGridReady);
     if (s->mfUploaded) cudaEventDestroy(s->mfUploaded);
     if (s->compute) cudaStreamDestroy(s->compute);
+    for (auto stream : s->shapeStream) if (stream) cudaStreamDestroy(stream);
+    for (auto event : s->trialJoin) if (event) cudaEventDestroy(event);
+    if (s->trialFork) cudaEventDestroy(s->trialFork);
     cudaFree(s->cdefOut);
     cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
@@ -2585,6 +2621,11 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
     if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&s->compute, cudaStreamNonBlocking);
     if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->motionGridReady, cudaEventDisableTiming);
     if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->mfUploaded, cudaEventDisableTiming);
+    if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->trialFork, cudaEventDisableTiming);
+    for (int k = 0; k < kShapes; k++) {
+        if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&s->shapeStream[k], cudaStreamNonBlocking);
+        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->trialJoin[k], cudaEventDisableTiming);
+    }
     s->profile = getenv("AV1GPU_PF_PROFILE") != nullptr;
     if (s->profile) {
         for (auto &ev : s->ev) if (e == cudaSuccess) e = cudaEventCreate(&ev);
@@ -2801,7 +2842,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     commit<<<commitGrid, t16, 0, stream>>>(ca);
     fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
     mark(5);
-    if (st.modeRefine) {
+    if (st.modeRefine && st.modeRefinePasses > 0) {
         TileJob j{};
         setTileLayout(j, f.w8 * 2, f.h8 * 2, syntax.tileColsLog2, syntax.tileRowsLog2);
         j.fs.gcols = s->gcols;
@@ -2814,6 +2855,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         j.entries = s->modeEntries;
         j.entryCount = s->modeEntryCount;
         const int nSb = j.sbCols * j.sbRows;
+        const float origMvWeight = ea.mvWeight;
+        for (int pass = 0; pass < st.modeRefinePasses; ++pass) {
         cudaError_t e = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes, stream);
         if (e == cudaSuccess) e = cudaMemsetAsync(s->modeChanged, 0, nSb * 64, stream);
         if (e != cudaSuccess) {
@@ -2822,7 +2865,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         {
             FineTimer t("mode refinement proposals");
-            tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(j);
+            if (!pass) tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(j);
             refinementModeInfo<<<nSb, 64, 0, stream>>>(j);
             RefinementArgs ra{};
             ra.f = f;
@@ -2835,26 +2878,65 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.trialCount = s->modeCounts;
             std::copy_n(s->modeIndices, kShapes, ra.trialIndices);
             ra.lambda = lambda;
-            ra.origMvWeight = ea.mvWeight;
+            ra.origMvWeight = origMvWeight;
             ra.screenWeight = 3.f * lambdaSad;
-            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus);
+            ra.pass = pass;
+            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass);
             proposeMotion<<<nSb * 16, 128, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
         // and only accepted blocks overwrite their reconstruction, levels and transform types.
         ea.trials = s->modeTrials;
         ea.mvWeight = 0.f;
-        PF_EVAL(0, 8);
-        PF_EVAL(1, 16);
-        PF_EVAL(2, 32);
-        PF_EVAL(3, 64);
-        if (st.rectPartitions) { PF_EVAL_RECTS(); }
+        {
+            e = cudaEventRecord(s->trialFork, stream);
+            const int nTrialShapes = st.rectPartitions ? kShapes : kSizes;
+            for (int k = 0; e == cudaSuccess && k < nTrialShapes; k++)
+                e = cudaStreamWaitEvent(s->shapeStream[k], s->trialFork, 0);
+            if (e != cudaSuccess) {
+                snprintf(err, errLen, "P-frame mode refinement: %s", cudaGetErrorString(e));
+                return -1;
+            }
+            {
+#define PF_TRIAL(K, EVAL) { const cudaStream_t stream = s->shapeStream[K]; EVAL; }
+                PF_TRIAL(3, PF_EVAL(3, 64));
+                PF_TRIAL(2, PF_EVAL(2, 32));
+                PF_TRIAL(1, PF_EVAL(1, 16));
+                PF_TRIAL(0, PF_EVAL(0, 8));
+                if (st.rectPartitions) {
+                    PF_TRIAL(8, PF_REVAL(4, 64, 32)); PF_TRIAL(9, PF_REVAL(5, 32, 64));
+                    PF_TRIAL(12, PF_REVAL(8, 64, 16)); PF_TRIAL(13, PF_REVAL(9, 16, 64));
+                    PF_TRIAL(6, PF_REVAL(2, 32, 16)); PF_TRIAL(7, PF_REVAL(3, 16, 32));
+                    PF_TRIAL(10, PF_REVAL(6, 32, 8)); PF_TRIAL(11, PF_REVAL(7, 8, 32));
+                    PF_TRIAL(4, PF_REVAL(0, 16, 8)); PF_TRIAL(5, PF_REVAL(1, 8, 16));
+                }
+#undef PF_TRIAL
+            }
+            for (int k = 0; e == cudaSuccess && k < nTrialShapes; k++) {
+                e = cudaEventRecord(s->trialJoin[k], s->shapeStream[k]);
+                if (e == cudaSuccess) e = cudaStreamWaitEvent(stream, s->trialJoin[k], 0);
+            }
+            if (e != cudaSuccess) {
+                snprintf(err, errLen, "P-frame mode refinement: %s", cudaGetErrorString(e));
+                return -1;
+            }
+        }
         {
             FineTimer t("mode refinement commit");
             acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda);
             ca.changed = ta.changed = s->modeChanged;
             commit<<<commitGrid, t16, 0, stream>>>(ca);
             fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
+        }
+        if (s->refineStats) {
+            int counts[kShapes];
+            cudaMemcpyAsync(counts, s->modeCounts, sizeof(counts), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            fprintf(stderr, "refine pass %d trials:", pass);
+            int total = 0;
+            for (int k = 0; k < kShapes; k++) { fprintf(stderr, " %d", counts[k]); total += counts[k]; }
+            fprintf(stderr, " total %d\n", total);
+        }
         }
     }
 #undef PF_EVAL_RECTS

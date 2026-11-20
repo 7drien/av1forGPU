@@ -164,7 +164,7 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-mode-refine] [--pf-no-filters]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -334,6 +334,12 @@ int main(int argc, char **argv) {
             pfTmvp = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
             pfSettings.modeRefine = false;
+        } else if (!strcmp(argv[i], "--pf-refine-passes") && i + 1 < argc) {
+            pfSettings.modeRefinePasses = atoi(argv[++i]);
+            if (pfSettings.modeRefinePasses < 0 || pfSettings.modeRefinePasses > 8) {
+                fprintf(stderr, "--pf-refine-passes must be 0..8\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--pf-slow-cuts")) {
             pfCutPreset = false;
         } else if (!strcmp(argv[i], "--pf-cut-preset") && i + 1 < argc) {
