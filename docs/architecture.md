@@ -50,7 +50,7 @@ Pipeline (`encoder/apps/pframe.cu`, `pframe_tile.cuh`, `pframe_writer.h`):
 
 1. **Phase planes (GPU):** each reference is expanded into its 16 exact quarter-sample planes.
 2. **Search (GPU):** a quarter-resolution coarse search, then per-size refinement on the phase planes, then the LAST / ALTREF / compound choice.
-3. **Evaluation (GPU):** exact prediction, forward DCT, quantization, an AV1-context rate estimate, and an exact inverse transform. Bottom-up partition decisions, then commit of the reconstruction and levels.
+3. **Evaluation (GPU):** exact prediction, forward transform, quantization, an AV1-context rate estimate, and an exact inverse transform. The partition is chosen bottom-up. Motion refinement uses the entropy coder's block order and motion-vector stacks to test decoder candidates on that partition. The GPU screens them with luma SATD and mode/MV symbol costs, then reevaluates the residual, transform choices and reconstruction of shortlisted blocks before committing the winners.
 4. **Filters (GPU):** deblocking and CDEF searches on the reconstruction.
 5. **Entropy coding (GPU + host):** on a separate stream, one thread per superblock builds decode-order block lists. One thread per block then fills mode info and coefficient-context maps, chooses inter modes from the motion-vector candidate list (costs from the default CDFs, so blocks are independent), and emits symbol records with exact contexts. A host writer thread range-codes the records, which is the one inherently serial step. The all-GPU option range-codes on the GPU instead. The host writes the frame header and OBUs.
 6. **Rate control (host):** one quantizer per period, adjusted by the measured bits.

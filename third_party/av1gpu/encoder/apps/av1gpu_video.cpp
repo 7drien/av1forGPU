@@ -70,7 +70,7 @@ static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, 
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-filters]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-mode-refine] [--pf-no-filters]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -240,6 +240,8 @@ int main(int argc, char **argv) {
             pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
             pfTmvp = false;
+        } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
+            pfSettings.modeRefine = false;
         } else if (!strcmp(argv[i], "--pf-slow-cuts")) {
             pfCutPreset = false;
         } else if (!strcmp(argv[i], "--pf-cut-preset") && i + 1 < argc) {
@@ -708,20 +710,6 @@ int main(int argc, char **argv) {
             // moving content codes most blocks: search rectangular partitions only where the square clearly wins
             if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
-            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, spare, nullptr, nullptr, perr, sizeof perr)) {
-                fprintf(stderr, "%s\n", perr);
-                return 1;
-            }
-            pfMs += pfAnalyzer.lastMs();
-            const auto tf0 = std::chrono::steady_clock::now();
-            pf::FilterParams flt;
-            flt.lrAllowed = pfLr;
-            if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, true, flt, perr, sizeof perr)) {
-                fprintf(stderr, "%s\n", perr);
-                return 1;
-            }
-            const auto tw0 = std::chrono::steady_clock::now();
-            pfFilterMs += std::chrono::duration<double, std::milli>(tw0 - tf0).count();
             Job job;
             job.slot0 = slot0;
             job.outSlot = outSlot;
@@ -735,7 +723,6 @@ int main(int argc, char **argv) {
             ein.txModeSelect = pfSettings.txSplit;
             ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.switchableFilter = pfSettings.switchableFilter;
-            ein.lrLuma = flt.lrLuma;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -748,8 +735,6 @@ int main(int argc, char **argv) {
             fp.txModeSelect = pfSettings.txSplit;
             fp.reducedTxSet = pfSettings.txTypes < 2;
             fp.switchable = pfSettings.switchableFilter;
-            fp.lrType[0] = flt.lrLuma ? 2 : 0;   // lr_type 2: RESTORE_WIENER
-            pfLrFrames += flt.lrLuma;
             fp.refreshFlags = outSlot < 8 ? 1 << outSlot : 0;
             fp.showFrame = show;
             fp.persistent = persistentCdf;
@@ -770,6 +755,22 @@ int main(int argc, char **argv) {
                 ein.motionField = job.mf.data();
                 fp.useRefFrameMvs = true;
             }
+            if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, ein, spare, nullptr, nullptr, perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
+            pfMs += pfAnalyzer.lastMs();
+            const auto tf0 = std::chrono::steady_clock::now();
+            pf::FilterParams flt;
+            flt.lrAllowed = pfLr;
+            if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, true, flt, perr, sizeof perr)) {
+                fprintf(stderr, "%s\n", perr);
+                return 1;
+            }
+            pfFilterMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
+            ein.lrLuma = flt.lrLuma;
+            fp.lrType[0] = flt.lrLuma ? 2 : 0;   // lr_type 2: RESTORE_WIENER
+            pfLrFrames += flt.lrLuma;
             fp.grain = grain;
             fp.grainSeed = uint16_t(7391 + frameCount * 31847);
             for (int k = 0; k < 4; ++k) fp.lfLevel[k] = flt.lf[k];

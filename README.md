@@ -90,6 +90,7 @@ Options:
 - `--persistent-cdf` carries adapted probabilities between frames through each reference slot.
 - `--pf-tf-frames K` enables a GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display. Off by default: no gain on the sample clip.
 - `--pf-rdoq` enables greedy rate-distortion optimized quantization. Off by default: no gain on the sample clip.
+- `--pf-no-mode-refine` disables the final-partition motion refinement that tests the decoder's spatial and temporal vectors.
 - `--pf-no-filters` turns off in-loop filtering. `--pf-no-tx-split` and `--pf-no-rect` turn off transform split and rectangular partitions.
 
 On the 1,207-frame sample clip this path runs at about 41 fps on an RTX 3060 Ti, including FFmpeg's H.264 decode. Its output decodes byte-identically with dav1d, libaom and the GPU's NVDEC AV1 decoder. See [docs/benchmark.md](docs/benchmark.md) for rate-quality results.

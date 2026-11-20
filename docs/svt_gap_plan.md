@@ -221,3 +221,28 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Clean measurement after the fix (120 frames): video_2 +53.4% against SVT-AV1 preset 8 (+59.5% against libaom) at
   16.3 to 22.0 fps (SVT: 32 to 34 fps); video_1 +18.6% (+44.4%) at 21 to 25.5 fps (SVT: 36 to 37 fps).
 
+### Motion refinement on the final partition
+
+- Once the tile partition is fixed, one parallel pass builds the tile coder's spatial and temporal MV stacks
+  from the searched vectors. It prices NEAREST, NEAR at the available DRL indices, GLOBAL and compound modes
+  with the default inter CDFs. Mixed compound modes may keep one searched vector. Luma SATD shortlists a cheaper
+  candidate for each block. The regular evaluator recomputes exact prediction, chroma, transform type and depth,
+  skip, levels and reconstruction before deciding whether to take it. Entropy coding rebuilds the stacks from
+  the accepted vectors, so neighbouring changes can affect the final mode. `--pf-no-mode-refine` disables the pass.
+- The first implementation looked up trial flags in all shape grids. On video_2 at q50 it spent 5.84 ms per inter
+  frame on refinement, including about 4.72 ms on trial evaluation and 0.98 ms preparing and screening candidates.
+  The follow-up prices the stacks one thread per block, screens one warp per block and compacts trial indices
+  by shape before transform evaluation.
+- On 120-frame sweeps against SVT-AV1 preset 8 (q20/50/90/130), video_2 improved from +53.4% to +47.7% BD-rate
+  and video_1 from +18.6% to +13.1%. The compacted pass produced the same IVF at all eight clip/quantizer points
+  as the first implementation.
+- At q50, first-list NEWMV went from 79.6% to 56.0% of inter blocks on video_2 and from 23.2% to 17.6% on video_1
+  (CPU entropy counts). The adaptive MV share of inter bits went from 24.2% to 17.6% and from 8.7% to 6.8%,
+  respectively (`AV1GPU_PF_BITSTATS=1`).
+- The compacted pass took 5.14 ms per video_2 inter frame at q50, including 4.16 ms for trial evaluation and
+  0.83 ms to prepare and screen candidates (`AV1GPU_PF_PROFILE=1 AV1GPU_PF_PROFILE2=1`).
+- Median wall throughput across three alternating unprofiled q50 pairs was 19.50 → 17.56 fps on video_2
+  (−9.9%) and 24.33 → 22.98 fps on video_1 (−5.6%). GPU contention varied during the four-point sweeps.
+- The 120-frame video_2 reconstruction at q50 matched dav1d across all 373,248,000 bytes. Disabled refinement
+  reproduced the starting revision's IVF. The P-frame and legacy inter suites passed.
+

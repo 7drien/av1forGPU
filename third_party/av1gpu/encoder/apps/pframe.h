@@ -54,6 +54,7 @@ struct Settings {
     float pruneMargin = 2.f;     // rectangular search skipped unless the square's coded cost < margin * skip cost
     bool pruneRect = true;       // skip HORZ / VERT / 4:1 searches of nodes whose square evaluation chose skip
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
+    bool modeRefine = true;      // recheck motion vectors on the final partition
 };
 
 // In-loop filter parameters chosen for a P frame (the reconstruction already includes them).
@@ -116,8 +117,8 @@ public:
     // src: device planes with pitches; refs: device reference frames (refs[0] = LAST); recon: output frame.
     // When info / levels are non-null, also downloads the decisions (8x8 grid) and levels (spatial layout).
     int analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                const Settings &s, uint8_t *recon, std::vector<BlockInfo> *info, std::vector<int16_t> *levels,
-                char *err, int errLen);
+                const Settings &s, const EntropyIn &syntax, uint8_t *recon, std::vector<BlockInfo> *info,
+                std::vector<int16_t> *levels, char *err, int errLen);
     // Copy the last frame's decisions and levels into host buffers (pinned memory recommended).
     int download(BlockInfo *info, int16_t *levels, char *err, int errLen);
     // Copy the decisions grid only (after filter(): includes the loop restoration fields).

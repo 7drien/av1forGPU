@@ -645,6 +645,19 @@ struct TileCoder {
     }
     AV1G_HDI static bool isNewType(int m) { return m == NEWMV || m == NEW_NEWMV; }
     AV1G_HDI static bool hasNearmv(int m) { return m == NEARMV || m == NEAR_NEARMV || m == NEAR_NEWMV || m == NEW_NEARMV; }
+    AV1G_HDI static int firstMvIdx(int mode) { return hasNearmv(mode) ? 1 : 0; }
+    AV1G_HDI static int lastMvIdx(const Stack &s, int mode) {
+        if (isNewType(mode)) return imax(0, imin(2, s.num - 1));
+        if (hasNearmv(mode)) return imax(1, imin(3, s.num - 1));
+        return 0;
+    }
+    AV1G_HDI static void setParallelMvCtx(Stack &s) {
+        s.newMvCtx = s.closeMatches == 0 ? imin(s.totalMatches, 1) : s.closeMatches == 1 ? 3 : 5;
+    }
+    AV1G_HDI static pf::Mv modePredictor(const Stack &s, int mode, int idx, int list) {
+        if (mode == GLOBALMV) return {0, 0};
+        return s.mv[mode == NEARESTMV || (mode == NEWMV && s.num <= 1) ? 0 : idx][list];
+    }
     AV1G_HDI static int compoundModeCtx(const Stack &s) {
         const int map[3][5] = {{0, 1, 1, 1, 1}, {1, 2, 3, 4, 4}, {4, 4, 5, 6, 7}};
         return map[s.refMvCtx >> 1][imin(s.newMvCtx, 4)];
@@ -679,12 +692,7 @@ struct TileCoder {
         }
         for (int i = 0; i < 1 + compound; ++i) {
             const int cm = modeOfList(yMode, i);
-            pf::Mv p{0, 0};
-            if (cm != GLOBALMV) {
-                int pos = cm == NEARESTMV ? 0 : refMvIdx;
-                if (cm == NEWMV && s.num <= 1) pos = 0;
-                p = s.mv[pos][i];
-            }
+            const pf::Mv p = modePredictor(s, cm, refMvIdx, i);
             pred[i] = p;
             if (cm == NEWMV) c += mvCost(target[i], p);
             else if (!mvEq(target[i], p)) return -1.f;
@@ -864,6 +872,33 @@ struct TileCoder {
     }
 
     // ---- block ----
+    AV1G_HDI RefPair blockRefs(const pf::BlockInfo &bi) const {
+        const bool compound = bi.ref == 2;
+        return {fs->refName[bi.ref == 1 ? 1 : bi.ref == 3 ? 2 : 0], compound ? fs->refName[1] : -1, compound};
+    }
+
+    AV1G_HDI void fillModeInfo(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
+        const RefPair rp = blockRefs(bi);
+        const int depth = bi.skip ? 0 : bi.txSplit;
+        MiInfo m{};
+        m.wLog2 = (uint8_t)lw;
+        m.hLog2 = (uint8_t)lh;
+        m.skip = bi.skip;
+        m.isInter = 1;
+        m.ref[0] = (int8_t)rp.r0;
+        m.ref[1] = (int8_t)rp.r1;
+        m.mv[0] = bi.mv;
+        m.mv[1] = rp.compound ? bi.mv2 : pf::Mv{0, 0};
+        m.txW = (uint8_t)(imin(lw, 6) - (lw == lh ? depth : (depth && lw > lh)));
+        m.txH = (uint8_t)(imin(lh, 6) - (lw == lh ? depth : (depth && lh > lw)));
+        m.order = curOrder;
+        m.filter = bi.filter;
+        const int rowEnd = imin(miRow + (1 << (lh - 2)), fs->miRows);
+        const int colEnd = imin(miCol + (1 << (lw - 2)), fs->miCols);
+        for (int r = miRow; r < rowEnd; ++r)
+            for (int c = miCol; c < colEnd; ++c) at(r, c) = m;
+    }
+
     AV1G_HDI void block(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
         const int bw4 = 1 << (lw - 2), bh4 = 1 << (lh - 2);
         const int size = lw > lh ? lw : lh;   // log2 of the larger side
@@ -871,7 +906,7 @@ struct TileCoder {
         const bool compound = bi.ref == 2;
         const int depth = skip ? 0 : bi.txSplit;   // luma transform split depth (0..2)
         const bool split = depth > 0;
-        RefPair rp{fs->refName[bi.ref == 1 ? 1 : bi.ref == 3 ? 2 : 0], compound ? fs->refName[1] : -1, compound};
+        const RefPair rp = blockRefs(bi);
         if (phase == 1) {   // block list only
             curOrder = sbOrder | blockIndex++;
             BlockEntry &e = entries[nEntries++];
@@ -883,24 +918,7 @@ struct TileCoder {
             return;
         }
         if (phase == 4) {   // mode info and coefficient context maps
-            for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
-                for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
-                    MiInfo &m = at(r, c);
-                    m.wLog2 = (uint8_t)lw;
-                    m.hLog2 = (uint8_t)lh;
-                    m.skip = (uint8_t)skip;
-                    m.isInter = 1;
-                    m.mode = 0;
-                    m.refIdx = 0;
-                    m.ref[0] = (int8_t)rp.r0;
-                    m.ref[1] = (int8_t)(compound ? rp.r1 : -1);
-                    m.mv[0] = bi.mv;
-                    m.mv[1] = compound ? bi.mv2 : pf::Mv{0, 0};
-                    m.txW = (uint8_t)(imin(lw, 6) - (lw == lh ? depth : (depth && lw > lh)));
-                    m.txH = (uint8_t)(imin(lh, 6) - (lw == lh ? depth : (depth && lh > lw)));
-                    m.order = curOrder;
-                    m.filter = bi.filter;
-                }
+            fillModeInfo(miRow, miCol, lw, lh, bi);
             if (!skip) forTransformAreas(miRow, miCol, lw, lh, depth, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
             return;
         }
@@ -910,19 +928,14 @@ struct TileCoder {
         if (phase == 2) {
             // Mode choice from the frame-start CDFs, with the NEWMV context of a neighbourhood without NEWMV blocks:
             // it then depends only on decisions known before any mode is chosen, so blocks choose in parallel.
-            Stack sc = s;
-            sc.newMvCtx = sc.closeMatches == 0 ? imin(sc.totalMatches, 1) : sc.closeMatches == 1 ? 3 : 5;
+            setParallelMvCtx(s);
             float best = 1e30f;
             int bestMode = -1, bestIdx = 0;
             pf::Mv pred[2];
             const int first = compound ? NEAREST_NEARESTMV : NEARESTMV, last = compound ? NEW_NEWMV : NEWMV;
             for (int mode = first; mode <= last; ++mode) {
-                int k0 = 0, k1 = 0;
-                if (isNewType(mode)) { k0 = 0; k1 = 2; }
-                else if (hasNearmv(mode)) { k0 = 1; k1 = 3; }
-                for (int k = k0; k <= k1; ++k) {
-                    if (k > k0 && sc.num <= k) break;
-                    const float c = modeCost(sc, compound, mode, k, target, pred);
+                for (int k = firstMvIdx(mode); k <= lastMvIdx(s, mode); ++k) {
+                    const float c = modeCost(s, compound, mode, k, target, pred);
                     if (c >= 0.f && c < best) { best = c; bestMode = mode; bestIdx = k; }
                 }
             }

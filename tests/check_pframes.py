@@ -83,6 +83,8 @@ if __name__ == "__main__":
         # 56 visible rows in the last superblock row: blocks and transforms cross the bottom edge
         run(b, 448, 184, 16, ["--persistent-cdf", "--qindex", "50"])
         run(b, 448, 184, 12, ["--pf-no-filters", "--pf-gop", "1"])
+        # Final-partition re-evaluation also uses the unsplit evaluation kernel.
+        run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-no-tx-split", "--pf-no-rect"])
         run(b, 448, 256, 20, ["--persistent-cdf", "--pf-refs", "3", "--pf-gop", "16"])
         run(b, 712, 392, 18, ["--persistent-cdf", "--pf-lr", "--qindex", "120"])
         run(b, 448, 256, 12, ["--persistent-cdf", "--pf-lr", "--pf-cpu-entropy", "--pf-tiles", "1", "1"])

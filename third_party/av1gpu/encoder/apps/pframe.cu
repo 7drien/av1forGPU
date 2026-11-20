@@ -38,8 +38,8 @@ static struct BitReport { ~BitReport() { const double t = g_bitStats[0] + g_bitS
 static bool g_fine = getenv("AV1GPU_PF_PROFILE2") != nullptr;
 struct FineTimer {
     const char *name; std::chrono::steady_clock::time_point t;
-    explicit FineTimer(const char *n) : name(n) { if (g_fine) { cudaDeviceSynchronize(); t = std::chrono::steady_clock::now(); } }
-    ~FineTimer() { if (g_fine) { cudaDeviceSynchronize(); g_fineMs[name] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } }
+    explicit FineTimer(const char *n) : name(n) { if (g_fine && name) { cudaDeviceSynchronize(); t = std::chrono::steady_clock::now(); } }
+    ~FineTimer() { if (g_fine && name) { cudaDeviceSynchronize(); g_fineMs[name] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } }
 };
 static struct FineReport { ~FineReport() { for (auto &kv : g_fineMs) fprintf(stderr, "fine %-28s %9.1f ms\n", kv.first.c_str(), kv.second); } } g_fineReport;
 
@@ -57,6 +57,12 @@ struct Cand {
     uint8_t nzWhole, wholeType;
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
+};
+
+struct ModeTrial {
+    Cand cand;
+    float oldCost, rateSaving;
+    bool active;
 };
 
 struct Frame {
@@ -608,6 +614,15 @@ struct EvalArgs {
     float filterBias;   // scale of the SMOOTH / SHARP bit estimate
     int txExhaustive;   // price every type of the set (else a subset)
     int splitTypes;     // split transforms: 0 same search, 1 seven-type subset, 2 DCT_DCT only
+    ModeTrial *trials;   // optional sparse evaluation on the final partition
+    const int *trialCount, *trialIndices;
+
+    __device__ int blockCount() const { return trials ? *trialCount : cols * rows; }
+    __device__ int blockIndex(int i) const { return trials ? trialIndices[i] : i; }
+
+    __device__ Cand *candidate(int b, int x, int y) const {
+        return trials ? &trials[(y / 8) * (f.aw / 8) + x / 8].cand : cand + b;
+    }
 };
 // inter_tx_type default CDFs (spec Default_Inter_Tx_Type_Set1/2/3_Cdf) for the type bits of the search
 __constant__ uint16_t kTxSet1Cdf[2][16] = {
@@ -715,10 +730,11 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     __shared__ float tmpS[W][TS];
     __shared__ int16_t qS[W][TQ];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b = blockIdx.x * W + warp;
-    if (b >= a.cols * a.rows) return;
-    Cand &c = a.cand[b];
+    const int slot = blockIdx.x * W + warp;
+    if (slot >= a.blockCount()) return;
+    const int b = a.blockIndex(slot);
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    Cand &c = *a.candidate(b, x0, y0);
     if (BW != BH && c.pruned) {
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; c.filter = 0; }
         return;
@@ -1093,11 +1109,11 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     // transform by a.d2Margin (the others get an infinite depth-2 cost)
     const int per0 = dsel == 1 ? (G::sq ? 4 : 2) : dsel == 2 ? 16 : NSUB, off0 = dsel == 2 ? 4 : 0;
     const int idx = blockIdx.x * 4 + warp;
-    if (idx >= a.cols * a.rows * per0) return;
-    const int b = idx / per0, k = off0 + idx % per0;
-    const Cand &c = a.cand[b];
+    if (idx >= a.blockCount() * per0) return;
+    const int b = a.blockIndex(idx / per0), k = off0 + idx % per0;
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    const Cand &c = *a.candidate(b, x0, y0);
     if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
     if (dsel == 2) {
         float d1 = 0.f, r1 = 0.f;
@@ -1191,11 +1207,12 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
     __shared__ uint8_t pS[4][CW * CH], recS[4][CW * CH];
     __shared__ float tmpS[4][(CW + 1) * CH];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b = blockIdx.x * 4 + warp;
-    if (b >= a.cols * a.rows) return;
-    Cand &c = a.cand[b];
+    const int slot = blockIdx.x * 4 + warp;
+    if (slot >= a.blockCount()) return;
+    const int b = a.blockIndex(slot);
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    Cand &c = *a.candidate(b, x0, y0);
     if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
     float splitD[3] = {kInf, 0.f, 0.f}, splitBits[3] = {0.f, 0.f, 0.f};
     bool nzSplit[3] = {false, false, false};
@@ -1288,6 +1305,28 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         c.costCoded = dCoded + a.lambda * (modeBits + skipFlag0 + (G::sq ? 0.f : 0.5f) + bits);
         c.nz = nz;
     }
+}
+
+template <int BW, int BH>
+void launchEvaluation(EvalArgs a, bool splitExternal, const char *whole, const char *split, const char *final) {
+    constexpr int warps = EvalCfg<BW, BH>::warps;
+    const int nb = a.cols * a.rows;
+    const int blocks = (nb + warps - 1) / warps;
+    if (!a.recon2 || !splitExternal) {
+        evaluate<BW, BH><<<blocks, 32 * warps>>>(a);
+        return;
+    }
+    { FineTimer t(a.trials ? nullptr : whole); evaluate<BW, BH, true><<<blocks, 32 * warps>>>(a); }
+    {
+        FineTimer t(a.trials ? nullptr : split);
+        if constexpr (BW == BH && BW >= 16) {
+            evalSplit<BW, BH><<<nb, 128>>>(a, 1);
+            evalSplit<BW, BH><<<nb * 4, 128>>>(a, 2);
+        } else {
+            evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(a, 0);
+        }
+    }
+    { FineTimer t(a.trials ? nullptr : final); evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(a); }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1447,6 +1486,10 @@ __global__ void decideGrid(DecideArgs a) {
 
 // Gather the chosen reconstruction and levels. Shapes: 0..3 squares 8..64, 4 + (level - 1) * 2 + (0 HORZ, 1 VERT).
 constexpr int kShapes = 14;   // + 10 + (level - 2) * 2 + (0 HORZ_4, 1 VERT_4)
+__device__ int blockShape(const BlockInfo &bi) {
+    const int s = bi.log2 - 3;
+    return !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
+}
 struct CommitArgs {
     const BlockInfo *grid;
     int gcols, w, h, aw, ah;
@@ -1456,6 +1499,7 @@ struct CommitArgs {
     const int16_t *levels2[kShapes], *levels3[kSizes];
     uint8_t *out;
     int16_t *outLevels;
+    const uint8_t *changed;  // optional: commit only blocks replaced by mode refinement
 };
 template <class T, int K>
 __device__ __forceinline__ T pickN(int s, const T (&v)[K]) {
@@ -1470,15 +1514,17 @@ struct TypeArgs {
     BlockInfo *grid;
     int gcols, grows, tstride, enabled;
     const uint8_t *types1[kShapes], *types2[kShapes], *types3[kSizes];
+    const uint8_t *changed;
 };
 __global__ void fillTxTypes(TypeArgs a) {
     const int gx = blockIdx.x * blockDim.x + threadIdx.x, gy = blockIdx.y * blockDim.y + threadIdx.y;
     if (gx >= a.gcols || gy >= a.grows) return;
+    if (a.changed && !a.changed[gy * a.gcols + gx]) return;
     BlockInfo &bi = a.grid[gy * a.gcols + gx];
     uint16_t v = 0;
     if (a.enabled && bi.log2 && !bi.skip) {
         const int s = bi.log2 - 3;
-        const int shape = !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
+        const int shape = blockShape(bi);
         const uint8_t *m = bi.txSplit == 2 ? pickN(s, a.types3) : bi.txSplit ? pickN(shape, a.types2) : pickN(shape, a.types1);
         for (int q = 0; q < 4; q++)
             v |= uint16_t(m[size_t(gy * 2 + (q >> 1)) * a.tstride + gx * 2 + (q & 1)] & 15) << (4 * q);
@@ -1493,10 +1539,11 @@ __global__ void commit(CommitArgs a) {
     // samples beyond the frame (aligned area) belong to the block covering the last row / column of cells: their levels
     // are coefficients of transforms that start inside the frame (the grid is only filled inside the frame)
     const int gyc = min((y << sub) >> 3, (a.h + 7) / 8 - 1), gxc = min((x << sub) >> 3, (a.w + 7) / 8 - 1);
+    if (a.changed && !a.changed[gyc * a.gcols + gxc]) return;
     const BlockInfo bi = a.grid[gyc * a.gcols + gxc];
     const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
     const int s = bi.log2 - 3;
-    const int shape = !bi.part ? s : bi.part <= 2 ? 4 + (s - 1) * 2 + (bi.part - 1) : 10 + (s - 2) * 2 + (bi.part - 3);
+    const int shape = blockShape(bi);
     int16_t level = 0;
     if (bi.log2 && !bi.skip) {
         if (p == 0 && bi.txSplit) level = (bi.txSplit == 2 ? pickN(s, a.levels3) : pickN(shape, a.levels2))[size_t(y) * apw + x];
@@ -1589,6 +1636,17 @@ struct TileJob {
     uint8_t *out;
     int *sizes;
 };
+void setTileLayout(TileJob &j, int miCols, int miRows, int cl, int rl) {
+    j.fs.miCols = miCols;
+    j.fs.miRows = miRows;
+    j.sbCols = (miCols + 15) >> 4;
+    j.sbRows = (miRows + 15) >> 4;
+    const int wSb = (j.sbCols + (1 << cl) - 1) >> cl, hSb = (j.sbRows + (1 << rl) - 1) >> rl;
+    for (int sb = 0; sb < j.sbCols; sb += wSb) j.colStart[j.tileCols++] = sb * 16;
+    j.colStart[j.tileCols] = miCols;
+    for (int sb = 0; sb < j.sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
+    j.rowStart[j.tileRows] = miRows;
+}
 __device__ __host__ inline void tileOfSb(const TileJob &j, int miRow, int miCol, int &tr, int &tc) {
     tc = 0;
     while (tc + 1 < j.tileCols && j.colStart[tc + 1] <= miCol) ++tc;
@@ -1605,17 +1663,20 @@ __global__ void initFrameCdfs(pft2::EntropyState *out, const pft2::EntropyState 
         out->inter = *defaults;
     }
 }
-__device__ __host__ inline void setupCoder(pft2::TileCoder &t, const TileJob &j, int sb, int16_t *qv) {
+__device__ __host__ inline void setupMotionCoder(pft2::TileCoder &t, const TileJob &j, int sb) {
     const int miRow = (sb / j.sbCols) * 16, miCol = (sb % j.sbCols) * 16;
     int tr, tc;
     tileOfSb(j, miRow, miCol, tr, tc);
     t.fs = &j.fs;
     t.grid = j.grid;
     t.mf = j.mf;
-    t.levels = j.levels;
     t.mi = j.mi;
     t.rowStart = j.rowStart[tr]; t.rowEnd = j.rowStart[tr + 1];
     t.colStart = j.colStart[tc]; t.colEnd = j.colStart[tc + 1];
+}
+__device__ __host__ inline void setupCoder(pft2::TileCoder &t, const TileJob &j, int sb, int16_t *qv) {
+    setupMotionCoder(t, j, sb);
+    t.levels = j.levels;
     t.cdf = &j.frameInit->cdf;
     t.ic = &j.frameInit->inter;
     t.base = reinterpret_cast<const uint16_t *>(j.frameInit);
@@ -1632,15 +1693,193 @@ __device__ __host__ inline void setupCoder(pft2::TileCoder &t, const TileJob &j,
 __global__ void tilePhase1(TileJob j) {
     const int sb = blockIdx.x * blockDim.x + threadIdx.x;
     if (sb >= j.sbCols * j.sbRows) return;
-    int16_t qv[1024];
     pft2::TileCoder t;
-    setupCoder(t, j, sb, qv);
+    setupMotionCoder(t, j, sb);
+    t.st = {};
     t.phase = 1;
     t.entries = j.entries + size_t(sb) * 64;
     t.superblock((sb / j.sbCols) * 16, (sb % j.sbCols) * 16, (uint32_t)sb);
-    if (t.st.error) atomicMax(j.error, t.st.error);
+    if (t.st.error && j.error) atomicMax(j.error, t.st.error);
     j.entryCount[sb] = t.nEntries;
 }
+
+__global__ void refinementModeInfo(TileJob j) {
+    const int sb = blockIdx.x, k = threadIdx.x;
+    if (k >= (int)j.entryCount[sb]) return;
+    const auto &e = j.entries[sb * 64 + k];
+    pft2::TileCoder t;
+    t.fs = &j.fs;
+    t.mi = j.mi;
+    t.curOrder = e.order;
+    t.fillModeInfo(e.r, e.c, e.lw, e.lh, j.grid[(e.r / 2) * j.fs.gcols + e.c / 2]);
+}
+
+struct RefinementArgs {
+    Frame f;
+    const uint8_t *phases[kMaxRefs];
+    const Cand *candidates[kShapes];
+    int cols[kShapes];
+    ModeTrial *trials;
+    int *trialCount;
+    int *trialIndices[kShapes];
+    float lambda, origMvWeight, screenWeight;
+};
+
+struct MotionOption {
+    Mv mv[2];
+    float bits;
+};
+struct MotionOptions {
+    // 13 implied compound pairs including mixed NEW modes, plus the searched vector pair.
+    MotionOption option[14];
+    int count;
+};
+
+// Price each distinct vector pair once. A mixed compound mode keeps the searched vector on its NEWMV list.
+__device__ int motionOptions(pft2::TileCoder &t, const pft2::TileCoder::RefPair &rp, const pft2::TileCoder::Stack &s,
+                             const BlockInfo &bi, MotionOption *out) {
+    using namespace pft2;
+    out[0] = {{bi.mv, rp.compound ? bi.mv2 : Mv{0, 0}}, kInf};
+    int n = 1;
+    const int first = rp.compound ? NEAREST_NEARESTMV : NEARESTMV, last = rp.compound ? NEW_NEWMV : NEWMV;
+    for (int mode = first; mode <= last; ++mode) {
+        for (int idx = t.firstMvIdx(mode); idx <= t.lastMvIdx(s, mode); ++idx) {
+            Mv target[2] = {out[0].mv[0], out[0].mv[1]};
+            for (int list = 0; list < 1 + rp.compound; ++list) {
+                const int m = t.modeOfList(mode, list);
+                if (m != NEWMV) target[list] = t.modePredictor(s, m, idx, list);
+            }
+            Mv pred[2];
+            const float bits = t.modeCost(s, rp.compound, mode, idx, target, pred);
+            int k = 0;
+            while (k < n && !(target[0] == out[k].mv[0] && target[1] == out[k].mv[1])) ++k;
+            if (k == n) out[n++] = {{target[0], target[1]}, bits};
+            else out[k].bits = fminf(out[k].bits, bits);
+        }
+    }
+    return n;
+}
+
+__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus) {
+    const int sb = blockIdx.x, k = threadIdx.x;
+    if (k >= (int)j.entryCount[sb]) return;
+    const auto &b = j.entries[sb * 64 + k];
+    const BlockInfo &bi = j.grid[(b.r / 2) * j.fs.gcols + b.c / 2];
+    pft2::TileCoder t;
+    setupMotionCoder(t, j, sb);
+    t.ic = defaults;
+    t.curOrder = b.order;
+    const auto rp = t.blockRefs(bi);
+    pft2::TileCoder::Stack stack;
+    t.findMvStack(stack, b.r, b.c, 1 << (b.lw - 2), 1 << (b.lh - 2), rp);
+    t.setParallelMvCtx(stack);
+    MotionOption options[14];
+    const int n = motionOptions(t, rp, stack, bi, options);
+    MotionOptions &menu = menus[sb * 64 + k];
+    menu.option[0] = options[0];
+    int count = 1;
+    for (int i = 1; i < n; ++i)
+        if (options[i].bits < options[0].bits) menu.option[count++] = options[i];
+    menu.count = count;
+}
+
+// Screen with 4x4 luma SATD on the existing search planes. Final acceptance uses exact interpolation,
+// chroma and the quantized residual, including on boundaries and for compound prediction.
+__device__ int motionSatd(const RefinementArgs &a, const MotionOption &option, int ref, int x0, int y0, int lw,
+                          int lh) {
+    const Frame &f = a.f;
+    const int lane = threadIdx.x & 31, tw = 1 << (lw - 2), nt = 1 << (lw + lh - 4);
+    const int nref = ref == 2 ? 2 : 1;
+    const uint8_t *planes[2];
+    for (int i = 0; i < nref; ++i) {
+        const Mv mv = option.mv[i];
+        const int phase = ((mv.row & 6) << 1) + ((mv.col & 6) >> 1);
+        planes[i] = a.phases[i ? 1 : ref == 3 ? 2 : ref == 1 ? 1 : 0] + size_t(phase) * f.w * f.h;
+    }
+    int sum = 0;
+    for (int tile = lane >> 4; tile < nt; tile += 2) {
+        const int x = x0 + (tile & (tw - 1)) * 4 + (lane & 3), y = y0 + (tile / tw) * 4 + ((lane & 15) >> 2);
+        int d = 0;
+        if (x < f.w && y < f.h) {
+            int pred = 0;
+            for (int i = 0; i < nref; ++i) {
+                const Mv mv = option.mv[i];
+                const int px = min(max(x + (mv.col >> 3), 0), f.w - 1), py = min(max(y + (mv.row >> 3), 0), f.h - 1);
+                pred += planes[i][size_t(py) * f.w + px];
+            }
+            d = f.src[0][size_t(y) * f.pitch[0] + x] - (nref == 2 ? (pred + 1) >> 1 : pred);
+        }
+        for (int stride = 1; stride < 16; stride *= 2) {
+            const int other = __shfl_xor_sync(0xffffffffu, d, stride);
+            d = (lane & stride) ? other - d : d + other;
+        }
+        sum += abs(d);
+    }
+    return warp_sumi(sum);
+}
+
+__global__ void proposeMotion(TileJob j, RefinementArgs a, const MotionOptions *menus) {
+    constexpr int warps = 4;
+    const int e = blockIdx.x * warps + (threadIdx.x >> 5), sb = e / 64, lane = threadIdx.x & 31;
+    if (e % 64 >= (int)j.entryCount[sb]) return;
+    const auto &b = j.entries[e];
+    const int gy = b.r / 2, gx = b.c / 2, pos = gy * j.fs.gcols + gx;
+    ModeTrial &trial = a.trials[pos];
+    if (!lane) trial.active = false;
+    const MotionOptions &menu = menus[e];
+    if (menu.count == 1) return;
+    const BlockInfo &bi = j.grid[pos];
+    int best = 0;
+    float bestScore = kInf;
+    for (int i = 1; i < menu.count; ++i) {
+        const MotionOption option = menu.option[i];
+        const int satd = motionSatd(a, option, bi.ref, gx * 8, gy * 8, b.lw, b.lh);
+        const float score = satd * 0.125f + a.screenWeight * option.bits;
+        if (score < bestScore) { bestScore = score; best = i; }
+    }
+    const MotionOption orig = menu.option[0];
+    const int satd = motionSatd(a, orig, bi.ref, gx * 8, gy * 8, b.lw, b.lh);
+    if (!lane && bestScore < satd * 0.125f + a.screenWeight * orig.bits) {
+        const MotionOption option = menu.option[best];
+        const int shape = blockShape(bi);
+        const int index = (gy >> (b.lh - 3)) * a.cols[shape] + (gx >> (b.lw - 3));
+        const Cand &old = a.candidates[shape][index];
+        trial.cand.mv = option.mv[0];
+        trial.cand.mv2 = option.mv[1];
+        trial.cand.ref = bi.ref;
+        trial.cand.pruned = 0;
+        trial.cand.mvBits = 0;
+        trial.oldCost = (bi.skip ? old.costSkip : old.costCoded) - a.lambda * old.mvBits * a.origMvWeight;
+        trial.rateSaving = orig.bits - option.bits;
+        trial.active = true;
+        a.trialIndices[shape][atomicAdd(a.trialCount + shape, 1)] = index;
+    }
+}
+
+__global__ void acceptMotion(TileJob j, const ModeTrial *trials, BlockInfo *grid, uint8_t *changed, float lambda) {
+    const int sb = blockIdx.x, k = threadIdx.x;
+    if (k >= (int)j.entryCount[sb]) return;
+    const auto &b = j.entries[sb * 64 + k];
+    const int gx = b.c / 2, gy = b.r / 2, cols = j.fs.gcols;
+    const ModeTrial &trial = trials[gy * cols + gx];
+    if (!trial.active) return;
+    const Cand &c = trial.cand;
+    const bool skip = !c.nz || c.costSkip <= c.costCoded;
+    if ((skip ? c.costSkip : c.costCoded) >= trial.oldCost + lambda * trial.rateSaving) return;
+    const int endY = min(gy + (1 << (b.lh - 3)), j.fs.miRows / 2);
+    const int endX = min(gx + (1 << (b.lw - 3)), j.fs.miCols / 2);
+    for (int y = gy; y < endY; ++y)
+        for (int x = gx; x < endX; ++x) {
+            BlockInfo &bi = grid[y * cols + x];
+            bi.mv = c.mv;
+            bi.mv2 = c.mv2;
+            bi.skip = skip;
+            bi.txSplit = skip ? 0 : c.txSplit;
+            bi.filter = c.filter;
+            changed[y * cols + x] = 1;
+        }
+}
+
 // Phases 2 and 3: one thread per block of the lists.
 __device__ __host__ inline uint32_t blockRecCap(const pft2::BlockEntry &e) {
     return 96u + 24u * (1u << e.lw) * (1u << e.lh);   // 16 records per sample over luma and chroma
@@ -1998,6 +2237,13 @@ struct State {
     int16_t *rlevels2[10] = {};
     int16_t *levels2[kSizes] = {};
     BlockInfo *grid = nullptr, *prevGrid = nullptr;
+    ModeTrial *modeTrials = nullptr;
+    uint8_t *modeChanged = nullptr;
+    pft2::MiInfo *modeMi = nullptr;
+    pft2::BlockEntry *modeEntries = nullptr;
+    uint32_t *modeEntryCount = nullptr;
+    MotionOptions *modeMenus = nullptr;
+    int *modeCounts = nullptr, *modeIndices[kShapes] = {};
     bool havePrev = false;
     int dw = 0, dh = 0, ccols = 0, crows = 0;
     int cols[kSizes] = {}, rows[kSizes] = {};
@@ -2067,6 +2313,9 @@ Analyzer::~Analyzer() {
     for (int k = 0; k < 10; k++) { cudaFree(s->rsubD[k]); cudaFree(s->rsubR[k]); cudaFree(s->rsubNz[k]); cudaFree(s->rsubType[k]); }
     cudaFree(s->grid);
     cudaFree(s->prevGrid);
+    cudaFree(s->modeTrials); cudaFree(s->modeChanged); cudaFree(s->modeMi);
+    cudaFree(s->modeEntries); cudaFree(s->modeEntryCount);
+    cudaFree(s->modeMenus); cudaFree(s->modeCounts); cudaFree(s->modeIndices[0]);
     cudaFree(s->pfScratch);
     cudaFree(s->work);
     cudaFree(s->cdefOut);
@@ -2093,8 +2342,8 @@ Analyzer::~Analyzer() {
     for (auto *p : s->mode) cudaFree(p);
     for (auto *p : s->phases) cudaFree(p);
     if (s->profile && s->frames) {
-        const char *names[] = {"downsample+coarse", "refine", "evaluate", "decide", "commit", "download"};
-        for (int i = 0; i < 6; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
+        const char *names[] = {"downsample+coarse", "refine", "evaluate", "decide", "commit", "mode refinement", "download"};
+        for (int i = 0; i < 7; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
     }
     for (auto &e : s->ev) if (e) cudaEventDestroy(e);
     if (s->profile && s->entFrames) {
@@ -2208,6 +2457,20 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
             alloc(&s->ctxDc[p], size_t(s->ctxStride4[p]) * s->ctxRows4[p]);
         }
         const int nSb = (aw / 64) * (ah / 64);
+        alloc(&s->modeTrials, sizeof(ModeTrial) * nSb * 64);
+        alloc(&s->modeChanged, nSb * 64);
+        alloc(&s->modeMi, sizeof(pft2::MiInfo) * miCols * miRows);
+        alloc(&s->modeEntries, sizeof(pft2::BlockEntry) * nSb * 64);
+        alloc(&s->modeEntryCount, sizeof(uint32_t) * nSb);
+        alloc(&s->modeMenus, sizeof(MotionOptions) * nSb * 64);
+        alloc(&s->modeCounts, sizeof(int) * kShapes);
+        size_t offsets[kShapes + 1] = {};
+        for (int k = 0; k < kSizes; ++k) offsets[k + 1] = offsets[k] + size_t(s->cols[k]) * s->rows[k];
+        for (int k = 0; k < 10; ++k)
+            offsets[kSizes + k + 1] = offsets[kSizes + k] + size_t(s->rcols[k]) * s->rrows[k];
+        alloc(&s->modeIndices[0], sizeof(int) * offsets[kShapes]);
+        if (e == cudaSuccess)
+            for (int k = 1; k < kShapes; ++k) s->modeIndices[k] = s->modeIndices[0] + offsets[k];
         alloc(&s->sbCount, sizeof(uint32_t) * (nSb * 64 + 1));
         alloc(&s->sbOffset, sizeof(uint32_t) * (nSb * 64 + 1));
         alloc(&s->entries, sizeof(pft2::BlockEntry) * nSb * 64);
@@ -2277,7 +2540,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
 }
 
 int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                      const Settings &st, uint8_t *recon, std::vector<BlockInfo> *info,
+                      const Settings &st, const EntropyIn &syntax, uint8_t *recon, std::vector<BlockInfo> *info,
                       std::vector<int16_t> *levels, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     const auto t0 = std::chrono::steady_clock::now();
@@ -2286,7 +2549,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     for (int p = 0; p < 3; p++) { f.src[p] = src[p]; f.pitch[p] = pitch[p]; }
     for (int r = 0; r < refCount; r++) f.ref[r] = refs[r];
     f.w8 = (w + 7) >> 3; f.h8 = (h + 7) >> 3;
-    for (int r = 0; r < refCount; r++) f.tmv[r] = s->mfSet ? s->mfDev + size_t(s->mfNames[r]) * f.h8 * f.w8 : nullptr;
+    const bool useTmvp = s->mfSet;
+    for (int r = 0; r < refCount; r++) f.tmv[r] = useTmvp ? s->mfDev + size_t(s->mfNames[r]) * f.h8 * f.w8 : nullptr;
     s->mfSet = false;
     f.w = w; f.h = h; f.aw = aw; f.ah = ah;
     const float lambda = gp_lambda<8>(st.qindex, st.lambdaMul);
@@ -2348,47 +2612,36 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.filterBias = getenv("AV1GPU_PF_FBIAS") ? (float)atof(getenv("AV1GPU_PF_FBIAS")) : 16.f;
     ea.txExhaustive = st.txTypes == 3;
     ea.splitTypes = getenv("AV1GPU_PF_SPLITTX") ? atoi(getenv("AV1GPU_PF_SPLITTX")) : st.splitTypes;
-#define PF_EVAL(K, N)                                                                                           \
-    ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                          \
+#define PF_EVAL(K, N)                                                                                         \
+    ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                        \
     ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \
-    ea.recon2 = st.txSplit ? s->recon2[K] : nullptr; ea.levels2 = s->levels2[K];                               \
-    ea.recon3 = s->recon3[K]; ea.levels3 = s->levels3[K];                                                      \
-    ea.types1 = st.txTypes ? s->types1[K] : nullptr; ea.types2 = st.txTypes ? s->types2[K] : nullptr;          \
-    ea.types3 = st.txTypes ? s->types3[K] : nullptr;                                                           \
+    ea.recon2 = st.txSplit ? s->recon2[K] : nullptr; ea.levels2 = s->levels2[K];                              \
+    ea.recon3 = s->recon3[K]; ea.levels3 = s->levels3[K];                                                     \
+    ea.types1 = st.txTypes ? s->types1[K] : nullptr; ea.types2 = st.txTypes ? s->types2[K] : nullptr;         \
+    ea.types3 = st.txTypes ? s->types3[K] : nullptr;                                                          \
     ea.subD = s->subD[K]; ea.subR = s->subR[K]; ea.subNz = s->subNz[K]; ea.subType = s->subType[K];           \
-    { FineTimer ft_("evaluate " #N "x" #N);                                                                     \
-    if (ea.recon2 && splitExternal) {                                                                          \
-        const int nb = s->cols[K] * s->rows[K];                                                                \
-        { FineTimer t1_("eval whole " #N); evaluate<N, N, true><<<(nb + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps, 32 * EvalCfg<N, N>::warps>>>(ea); } \
-        { FineTimer t2_("eval split " #N);                                                                     \
-          if (N >= 16) {                                                                                       \
-              evalSplit<N, N><<<(nb * 4 + 3) / 4, 128>>>(ea, 1);                                                \
-              evalSplit<N, N><<<(nb * 16 + 3) / 4, 128>>>(ea, 2);                                               \
-          } else evalSplit<N, N><<<(nb * SplitGeo<N, N>::nsub + 3) / 4, 128>>>(ea, 0); }                       \
-        { FineTimer t3_("eval final " #N); evalFinal<N, N><<<(nb + 3) / 4, 128>>>(ea); }                        \
-    } else                                                                                                     \
-        evaluate<N, N><<<(s->cols[K] * s->rows[K] + EvalCfg<N, N>::warps - 1) / EvalCfg<N, N>::warps,             \
-                         32 * EvalCfg<N, N>::warps>>>(ea); }
+    ea.trialCount = s->modeCounts + (K); ea.trialIndices = s->modeIndices[K];                                 \
+    { FineTimer t(ea.trials ? "mode trial " #N "x" #N : "evaluate " #N "x" #N);                                      \
+      launchEvaluation<N, N>(ea, splitExternal, "eval whole " #N, "eval split " #N, "eval final " #N); }
     PF_EVAL(0, 8);
     PF_EVAL(1, 16);
     PF_EVAL(2, 32);
     PF_EVAL(3, 64);
-#define PF_REVAL(RK, BW, BH)                                                                                    \
-    ea.cand = s->rcand[RK]; ea.cols = s->rcols[RK]; ea.rows = s->rrows[RK];                                    \
+#define PF_REVAL(RK, BW, BH)                                                                                  \
+    ea.cand = s->rcand[RK]; ea.cols = s->rcols[RK]; ea.rows = s->rrows[RK];                                 \
     ea.pred = s->rpred[RK]; ea.recon = s->rrecon[RK]; ea.levels = s->rlevels[RK];                              \
-    ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                           \
-    ea.types1 = st.txTypes ? s->types1[4 + RK] : nullptr; ea.types2 = st.txTypes ? s->types2[4 + RK] : nullptr;  \
-    ea.types3 = nullptr;                                                                                       \
+    ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                          \
+    ea.types1 = st.txTypes ? s->types1[4 + RK] : nullptr; ea.types2 = st.txTypes ? s->types2[4 + RK] : nullptr; \
+    ea.types3 = nullptr;                                                                                     \
     ea.subD = s->rsubD[RK]; ea.subR = s->rsubR[RK]; ea.subNz = s->rsubNz[RK]; ea.subType = s->rsubType[RK];   \
-    { FineTimer ft_("evaluate " #BW "x" #BH);                                                                   \
-    const int nb = s->rcols[RK] * s->rrows[RK];                                                                \
-    if (ea.recon2 && splitExternal) {                                                                          \
-        { FineTimer t1_("eval whole " #BW "x" #BH); evaluate<BW, BH, true><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps, 32 * EvalCfg<BW, BH>::warps>>>(ea); } \
-        { FineTimer t2_("eval split " #BW "x" #BH); evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(ea, 0); } \
-        { FineTimer t3_("eval final " #BW "x" #BH); evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(ea); }             \
-    } else                                                                                                     \
-        evaluate<BW, BH><<<(nb + EvalCfg<BW, BH>::warps - 1) / EvalCfg<BW, BH>::warps,                           \
-                           32 * EvalCfg<BW, BH>::warps>>>(ea); }
+    ea.trialCount = s->modeCounts + 4 + (RK); ea.trialIndices = s->modeIndices[4 + RK];                        \
+    { FineTimer t(ea.trials ? "mode trial " #BW "x" #BH : "evaluate " #BW "x" #BH);                             \
+      launchEvaluation<BW, BH>(ea, splitExternal, "eval whole " #BW "x" #BH, "eval split " #BW "x" #BH,      \
+                               "eval final " #BW "x" #BH); }
+#define PF_EVAL_RECTS() \
+    PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16); PF_REVAL(3, 16, 32);                           \
+    PF_REVAL(4, 64, 32); PF_REVAL(5, 32, 64); PF_REVAL(6, 32, 8); PF_REVAL(7, 8, 32);                            \
+    PF_REVAL(8, 64, 16); PF_REVAL(9, 16, 64)
     if (st.rectPartitions) {
         for (int k = 0; k < 10; k++) {
             const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;
@@ -2422,15 +2675,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8); PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32);
         PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16); PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64);
     }
-    {
-        PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16);
-        PF_REVAL(3, 16, 32); PF_REVAL(4, 64, 32); PF_REVAL(5, 32, 64);
-        PF_REVAL(6, 32, 8); PF_REVAL(7, 8, 32); PF_REVAL(8, 64, 16); PF_REVAL(9, 16, 64);
+    { PF_EVAL_RECTS(); }
     }
-    }
-#undef PF_REVAL
 #undef PF_CHOOSE
-#undef PF_EVAL
     mark(3);
     DecideArgs da{};
     for (int k = 0; k < kSizes; k++) {
@@ -2459,16 +2706,74 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     }
     ca.out = recon;
     ca.outLevels = s->outLevels;
-    commit<<<dim3((aw + 15) / 16, (ah + 15) / 16, 3), t16>>>(ca);
-    {
-        TypeArgs ta{};
-        ta.grid = s->grid; ta.gcols = s->gcols; ta.grows = s->grows; ta.tstride = aw / 4; ta.enabled = st.txTypes;
-        for (int k = 0; k < kShapes; k++) { ta.types1[k] = s->types1[k]; ta.types2[k] = s->types2[k]; }
-        for (int k = 0; k < kSizes; k++) ta.types3[k] = s->types3[k];
-        fillTxTypes<<<dim3((s->gcols + 15) / 16, (s->grows + 15) / 16), t16>>>(ta);
-    }
+    const dim3 commitGrid((aw + 15) / 16, (ah + 15) / 16, 3);
+    const dim3 typeGrid((s->gcols + 15) / 16, (s->grows + 15) / 16);
+    TypeArgs ta{};
+    ta.grid = s->grid; ta.gcols = s->gcols; ta.grows = s->grows; ta.tstride = aw / 4; ta.enabled = st.txTypes;
+    for (int k = 0; k < kShapes; k++) { ta.types1[k] = s->types1[k]; ta.types2[k] = s->types2[k]; }
+    for (int k = 0; k < kSizes; k++) ta.types3[k] = s->types3[k];
+    commit<<<commitGrid, t16>>>(ca);
+    fillTxTypes<<<typeGrid, t16>>>(ta);
     mark(5);
+    cudaError_t status = cudaSuccess;
+    if (st.modeRefine) {
+        TileJob j{};
+        setTileLayout(j, f.w8 * 2, f.h8 * 2, syntax.tileColsLog2, syntax.tileRowsLog2);
+        j.fs.gcols = s->gcols;
+        std::copy_n(syntax.refName, 3, j.fs.refName);
+        std::copy_n(syntax.signBias, 8, j.fs.signBias);
+        j.fs.useTmvp = useTmvp && syntax.useTmvp;
+        j.grid = s->grid;
+        j.mf = s->mfDev;
+        j.mi = s->modeMi;
+        j.entries = s->modeEntries;
+        j.entryCount = s->modeEntryCount;
+        const int nSb = j.sbCols * j.sbRows;
+        status = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes);
+        if (status == cudaSuccess) status = cudaMemsetAsync(s->modeChanged, 0, nSb * 64);
+        {
+            FineTimer t("mode refinement proposals");
+            tilePhase1<<<(nSb + 63) / 64, 64>>>(j);
+            refinementModeInfo<<<nSb, 64>>>(j);
+            RefinementArgs ra{};
+            ra.f = f;
+            std::copy_n(s->phases, refCount, ra.phases);
+            std::copy_n(s->cand, kSizes, ra.candidates);
+            std::copy_n(s->rcand, 10, ra.candidates + kSizes);
+            std::copy_n(s->cols, kSizes, ra.cols);
+            std::copy_n(s->rcols, 10, ra.cols + kSizes);
+            ra.trials = s->modeTrials;
+            ra.trialCount = s->modeCounts;
+            std::copy_n(s->modeIndices, kShapes, ra.trialIndices);
+            ra.lambda = lambda;
+            ra.origMvWeight = ea.mvWeight;
+            ra.screenWeight = 3.f * lambdaSad;
+            priceMotion<<<nSb, 64>>>(j, s->defaultInter, s->modeMenus);
+            proposeMotion<<<nSb * 16, 128>>>(j, ra, s->modeMenus);
+        }
+        // The original output is already committed. Trials reuse the per-shape evaluation buffers,
+        // and only accepted blocks overwrite their reconstruction, levels and transform types.
+        ea.trials = s->modeTrials;
+        ea.mvWeight = 0.f;
+        PF_EVAL(0, 8);
+        PF_EVAL(1, 16);
+        PF_EVAL(2, 32);
+        PF_EVAL(3, 64);
+        if (st.rectPartitions) { PF_EVAL_RECTS(); }
+        {
+            FineTimer t("mode refinement commit");
+            acceptMotion<<<nSb, 64>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda);
+            ca.changed = ta.changed = s->modeChanged;
+            commit<<<commitGrid, t16>>>(ca);
+            fillTxTypes<<<typeGrid, t16>>>(ta);
+        }
+    }
+#undef PF_EVAL_RECTS
+#undef PF_REVAL
+#undef PF_EVAL
+    mark(6);
     cudaError_t e = cudaGetLastError();
+    if (status != cudaSuccess) e = status;
     const size_t gridCount = size_t(s->gcols) * s->grows;
     if (info) {
         info->resize(gridCount);
@@ -2486,9 +2791,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     }
     s->havePrev = true;
     if (s->profile) {
-        mark(6);
-        cudaEventSynchronize(s->ev[6]);
-        for (int i = 0; i < 6; i++) {
+        mark(7);
+        cudaEventSynchronize(s->ev[7]);
+        for (int i = 0; i < 7; i++) {
             float ms = 0;
             cudaEventElapsedTime(&ms, s->ev[i], s->ev[i + 1]);
             s->stageMs[i] += ms;
@@ -2506,14 +2811,8 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
     const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
-    auto maxLog2 = [](int sb) { int q = 0; while ((1 << q) < (sb < 64 ? sb : 64)) ++q; return q; };
-    const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
     TileJob j{};
-    const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
-    for (int sb = 0; sb < sbCols; sb += wSb) j.colStart[j.tileCols++] = sb * 16;
-    j.colStart[j.tileCols] = miCols;
-    for (int sb = 0; sb < sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
-    j.rowStart[j.tileRows] = miRows;
+    setTileLayout(j, miCols, miRows, in.tileColsLog2, in.tileRowsLog2);
     const int nTiles = j.tileCols * j.tileRows;
     if (nTiles > s->maxTiles || k < 0 || k >= kEntropySlots) {
         snprintf(err, errLen, "too many tiles (%d) or bad entropy slot", nTiles);
@@ -2541,7 +2840,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
         es.mfHost.assign(in.motionField, in.motionField + n);
         e = cudaMemcpyAsync(es.mf, es.mfHost.data(), n * sizeof(pf::Mv), cudaMemcpyHostToDevice, s->entStream);
     }
-    j.fs.miRows = miRows; j.fs.miCols = miCols; j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
+    j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
     j.mi = s->mi;
@@ -2550,7 +2849,6 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.packOff = s->packOff; j.tileCount = es.tileCount; j.packed = es.recs;
     j.save = in.saveSlot >= 0 ? s->slots + in.saveSlot : nullptr;
     j.contextTile = std::min(in.contextTile, nTiles - 1);
-    j.sbCols = sbCols; j.sbRows = sbRows;
     for (int p = 0; p < 3; p++) { j.ctxLevel[p] = s->ctxLevel[p]; j.ctxDc[p] = s->ctxDc[p]; j.ctxStride[p] = s->ctxStride4[p]; }
     j.sbCount = s->sbCount; j.sbOffset = s->sbOffset;
     j.entries = s->entries; j.entryCount = s->entryCount;
@@ -2781,14 +3079,8 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     auto *s = static_cast<HostState *>(state);
     const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
     const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
-    auto maxLog2 = [](int sb) { int k = 0; while ((1 << k) < (sb < 64 ? sb : 64)) ++k; return k; };
-    const int cl = std::min(in.tileColsLog2, maxLog2(sbCols)), rl = std::min(in.tileRowsLog2, maxLog2(sbRows));
-    const int wSb = (sbCols + (1 << cl) - 1) >> cl, hSb = (sbRows + (1 << rl) - 1) >> rl;
     TileJob j{};
-    for (int sb = 0; sb < sbCols; sb += wSb) j.colStart[j.tileCols++] = sb * 16;
-    j.colStart[j.tileCols] = miCols;
-    for (int sb = 0; sb < sbRows; sb += hSb) j.rowStart[j.tileRows++] = sb * 16;
-    j.rowStart[j.tileRows] = miRows;
+    setTileLayout(j, miCols, miRows, in.tileColsLog2, in.tileRowsLog2);
     const int nTiles = j.tileCols * j.tileRows;
     pft2::FrameSyntax fs{};
     fs.refName[0] = in.refName[0];
@@ -2817,7 +3109,6 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     j.levels = levels;
     j.mi = s->mi.data();
     j.frameInit = &init;
-    j.sbCols = sbCols; j.sbRows = sbRows;
     for (int p = 0; p < 3; p++) {
         j.ctxLevel[p] = s->ctxLevel[p].data();
         j.ctxDc[p] = s->ctxDc[p].data();
