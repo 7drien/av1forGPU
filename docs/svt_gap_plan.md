@@ -263,3 +263,17 @@ SVT-AV1 preset 8 runs at 32 to 34 fps on this clip; libaom `cpu-used 8` is at +9
 - Profile medians at qindex 50 (three alternating runs, first 60 frames): subtracting measured keyframe GPU time
   left 45.8 → 43.1 ms per inter frame on video_2 and 34.4 → 31.0 ms on video_1. Evaluation stayed at about 21.8 ms
   and 12.5 ms respectively. The filter result still gates entropy submission.
+
+### Integration of the final-partition refinement and the asynchronous pipeline
+
+Both were developed in parallel (separate worktrees) and merged in `7638583`. Verified on the merged build: byte
+identity with the refinement branch by default and with the previous main under `--pf-no-mode-refine`, in 8
+configurations (all three entropy paths, no TMVP, tiles + three references, temporal filter + overlays across key
+frames, no filters); both test suites; repeated runs identical; a full 120-frame video_2 stream decoded by dav1d and
+libaom equal to the encoder reconstruction.
+
+| Clip (120 frames) | BD-rate vs SVT-AV1 preset 8 | vs libaom cpu-used 8 | median fps at q50 (previous main) |
+| --- | ---: | ---: | ---: |
+| video_2 | +47.7% (was +53.4%) | +53.7% (was +59.5%) | 19.2 (20.3) |
+| video_1 | +13.1% (was +18.6%) | +37.7% (was +44.4%) | 25.5 (25.0) |
+
