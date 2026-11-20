@@ -29,6 +29,14 @@ constexpr int kEntropySlots = Analyzer::kEntropySlots;
 constexpr int kMaxRefs = 3;
 constexpr float kInf = 3.0e38f;
 constexpr int kFullPelPasses = 6;
+constexpr int kDeblockCandidates = 5;
+struct CdefStrength { int pri, sec; };
+constexpr CdefStrength kCdefCandidates[] = {{0, 0}, {1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}, {8, 2}, {10, 4}, {12, 4}};
+constexpr int kCdefCount = sizeof kCdefCandidates / sizeof kCdefCandidates[0];
+
+struct FilterSelection {
+    int lf[3], cdef[3], lrLuma;
+};
 
 __constant__ int16_t c_filter[6][16][8];
 // AV1GPU_PF_PROFILE2: per-launch GPU time by name (synchronizes after every timed launch)
@@ -1308,25 +1316,26 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
 }
 
 template <int BW, int BH>
-void launchEvaluation(EvalArgs a, bool splitExternal, const char *whole, const char *split, const char *final) {
+void launchEvaluation(EvalArgs a, bool splitExternal, cudaStream_t stream,
+                      const char *whole, const char *split, const char *final) {
     constexpr int warps = EvalCfg<BW, BH>::warps;
     const int nb = a.cols * a.rows;
     const int blocks = (nb + warps - 1) / warps;
     if (!a.recon2 || !splitExternal) {
-        evaluate<BW, BH><<<blocks, 32 * warps>>>(a);
+        evaluate<BW, BH><<<blocks, 32 * warps, 0, stream>>>(a);
         return;
     }
-    { FineTimer t(a.trials ? nullptr : whole); evaluate<BW, BH, true><<<blocks, 32 * warps>>>(a); }
+    { FineTimer t(a.trials ? nullptr : whole); evaluate<BW, BH, true><<<blocks, 32 * warps, 0, stream>>>(a); }
     {
         FineTimer t(a.trials ? nullptr : split);
         if constexpr (BW == BH && BW >= 16) {
-            evalSplit<BW, BH><<<nb, 128>>>(a, 1);
-            evalSplit<BW, BH><<<nb * 4, 128>>>(a, 2);
+            evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
         } else {
-            evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128>>>(a, 0);
+            evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128, 0, stream>>>(a, 0);
         }
     }
-    { FineTimer t(a.trials ? nullptr : final); evalFinal<BW, BH><<<(nb + 3) / 4, 128>>>(a); }
+    { FineTimer t(a.trials ? nullptr : final); evalFinal<BW, BH><<<(nb + 3) / 4, 128, 0, stream>>>(a); }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2209,9 +2218,9 @@ struct EntropySlot {
     uint32_t *tileCount = nullptr;
     pft2::SymRec *recs = nullptr;    // records-only mode output
     pf::Mv *mf = nullptr;            // motion field of the frame (use_ref_frame_mvs)
-    std::vector<pf::Mv> mfHost;      // staging copy (the caller's buffer may change before the upload runs)
     bool recordsOnly = false;
     cudaEvent_t staged = nullptr, done = nullptr;
+    cudaEvent_t profile[5] = {};
     cudaStream_t fetch = nullptr;
     int nTiles = 0;
 };
@@ -2250,8 +2259,13 @@ struct State {
     int gcols = 0, grows = 0;
     bool tablesReady = false;
     void *pfScratch = nullptr;
-    uint8_t *work = nullptr, *cdefOut = nullptr;
-    Mv *mfDev = nullptr; bool mfSet = false; int mfNames[kMaxRefs] = {1, 7, 6};
+    uint8_t *filterCandidates = nullptr, *cdefOut = nullptr;
+    FilterSelection *filterDev = nullptr, *filterHost = nullptr;
+    Mv *mfDev = nullptr, *mfHost = nullptr;
+    bool useTmvp = false;
+    BlockInfo *motionGridHost = nullptr;
+    cudaStream_t compute = nullptr;
+    cudaEvent_t mfUploaded = nullptr, motionGridReady = nullptr;
     float *lrCoef = nullptr; int8_t *lrQ = nullptr; unsigned long long *lrSse = nullptr; uint8_t *lrOut = nullptr;
     int lrUnitRows = 1, lrUnitCols = 1;
     unsigned long long *sse = nullptr;
@@ -2283,19 +2297,51 @@ struct State {
     int16_t *hphase = nullptr;
     uint8_t *phases[kMaxRefs] = {};
     bool profile = false;
-    cudaEvent_t ev[8] = {};
+    cudaEvent_t ev[10] = {};
     double stageMs[8] = {};
-    cudaEvent_t eev[5] = {};
+    bool profilePending = false, profileFiltered = false;
+    int filterFrames = 0;
     double entMs[4] = {};
     int entFrames = 0;
     int frames = 0;
 };
+
+static void collectAnalysisProfile(State &s) {
+    if (!s.profilePending) return;
+    cudaEventSynchronize(s.ev[s.profileFiltered ? 9 : 7]);
+    for (int i = 0; i < 7; i++) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, s.ev[i], s.ev[i + 1]);
+        s.stageMs[i] += ms;
+    }
+    s.frames++;
+    if (s.profileFiltered) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, s.ev[8], s.ev[9]);
+        s.stageMs[7] += ms;
+        s.filterFrames++;
+    }
+    s.profilePending = s.profileFiltered = false;
+}
+
+static void collectEntropyProfile(State &s, const EntropySlot &es) {
+    if (!s.profile) return;
+    for (int i = 0; i < 4; i++) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, es.profile[i], es.profile[i + 1]);
+        s.entMs[i] += ms;
+    }
+    s.entFrames++;
+}
 
 }  // namespace
 
 Analyzer::~Analyzer() {
     auto *s = static_cast<State *>(state);
     if (!s) return;
+    if (s->compute) cudaStreamSynchronize(s->compute);
+    if (s->entStream) cudaStreamSynchronize(s->entStream);
+    collectAnalysisProfile(*s);
     for (auto *p : s->ds) cudaFree(p);
     for (auto *p : s->coarse) cudaFree(p);
     for (auto *p : s->cand) cudaFree(p);
@@ -2317,7 +2363,14 @@ Analyzer::~Analyzer() {
     cudaFree(s->modeEntries); cudaFree(s->modeEntryCount);
     cudaFree(s->modeMenus); cudaFree(s->modeCounts); cudaFree(s->modeIndices[0]);
     cudaFree(s->pfScratch);
-    cudaFree(s->work);
+    cudaFree(s->filterCandidates);
+    cudaFree(s->filterDev);
+    if (s->filterHost) cudaFreeHost(s->filterHost);
+    if (s->motionGridHost) cudaFreeHost(s->motionGridHost);
+    if (s->mfHost) cudaFreeHost(s->mfHost);
+    if (s->motionGridReady) cudaEventDestroy(s->motionGridReady);
+    if (s->mfUploaded) cudaEventDestroy(s->mfUploaded);
+    if (s->compute) cudaStreamDestroy(s->compute);
     cudaFree(s->cdefOut);
     cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
@@ -2331,6 +2384,7 @@ Analyzer::~Analyzer() {
         if (es.staged) cudaEventDestroy(es.staged);
         if (es.done) cudaEventDestroy(es.done);
         if (es.fetch) cudaStreamDestroy(es.fetch);
+        for (auto event : es.profile) if (event) cudaEventDestroy(event);
     }
     if (s->entStream) cudaStreamDestroy(s->entStream);
     cudaFree(s->entries); cudaFree(s->entryCount); cudaFree(s->sbTotal);
@@ -2344,13 +2398,13 @@ Analyzer::~Analyzer() {
     if (s->profile && s->frames) {
         const char *names[] = {"downsample+coarse", "refine", "evaluate", "decide", "commit", "mode refinement", "download"};
         for (int i = 0; i < 7; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->stageMs[i] / s->frames);
+        if (s->filterFrames) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", "filters", s->stageMs[7] / s->filterFrames);
     }
     for (auto &e : s->ev) if (e) cudaEventDestroy(e);
     if (s->profile && s->entFrames) {
         const char *names[] = {"entropy phase 1", "entropy phase 2", "entropy phase 3", "entropy coder"};
         for (int i = 0; i < 4; i++) fprintf(stderr, "pframe %-18s %7.2f ms/frame\n", names[i], s->entMs[i] / s->entFrames);
     }
-    for (auto &e : s->eev) if (e) cudaEventDestroy(e);
     delete s;
 }
 
@@ -2419,14 +2473,19 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         av1g_frame_params fp{};
         fp.width = w; fp.height = h; fp.chroma_format = AV1G_CHROMA_420; fp.bit_depth = 8; fp.enable_cdef = 1;
         alloc((uint8_t **)&s->pfScratch, av1g_gpu_pf_scratch_size(&fp));
-        alloc(&s->work, frame);
+        // Deblock and CDEF reuse this workspace. All candidates are fully overwritten before use.
+        if (e == cudaSuccess) e = cudaMalloc(&s->filterCandidates, frame * kCdefCount);
+        alloc(&s->filterDev, sizeof(FilterSelection));
+        if (e == cudaSuccess) e = cudaMallocHost(&s->filterHost, sizeof(FilterSelection));
+        if (e == cudaSuccess) e = cudaMallocHost(&s->motionGridHost, gridCount() * sizeof(BlockInfo));
+        if (e == cudaSuccess) e = cudaMallocHost(&s->mfHost, sizeof(Mv) * size_t(w / 8) * (h / 8) * 8);
         alloc(&s->cdefOut, frame);
         alloc(&s->mfDev, sizeof(Mv) * 8 * size_t((w + 7) >> 3) * ((h + 7) >> 3));
         s->lrUnitRows = std::max((h + 32) / 64, 1); s->lrUnitCols = std::max((w + 32) / 64, 1);
         const int nu = s->lrUnitRows * s->lrUnitCols;
         alloc(&s->lrCoef, sizeof(float) * 6 * nu); alloc(&s->lrQ, 6 * nu);
         alloc(&s->lrSse, sizeof(unsigned long long) * 2 * nu); alloc(&s->lrOut, size_t(w) * h);
-        alloc(&s->sse, sizeof(unsigned long long) * 64);
+        alloc(&s->sse, sizeof(unsigned long long) * 3 * kCdefCount);
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
         for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
     }
@@ -2523,15 +2582,20 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         if (e == cudaSuccess) e = cudaMemcpy(s->defaultInter, &d, sizeof d, cudaMemcpyHostToDevice);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
+    if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&s->compute, cudaStreamNonBlocking);
+    if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->motionGridReady, cudaEventDisableTiming);
+    if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->mfUploaded, cudaEventDisableTiming);
+    s->profile = getenv("AV1GPU_PF_PROFILE") != nullptr;
+    if (s->profile) {
+        for (auto &ev : s->ev) if (e == cudaSuccess) e = cudaEventCreate(&ev);
+        for (auto &slot : s->eslot)
+            for (auto &ev : slot.profile) if (e == cudaSuccess) e = cudaEventCreate(&ev);
+    }
+    if (e == cudaSuccess) e = cudaStreamSynchronize(nullptr);   // finish default-stream initialization
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame allocation: %s", cudaGetErrorString(e));
         return -1;
     }
-    s->profile = getenv("AV1GPU_PF_PROFILE") != nullptr;
-    if (s->profile)
-        for (auto &ev : s->ev) cudaEventCreate(&ev);
-    if (s->profile)
-        for (auto &ev : s->eev) cudaEventCreate(&ev);
     if (gp_upload_tables_pframe(gp_host_tables())) {
         snprintf(err, errLen, "P-frame table upload failed");
         return -1;
@@ -2540,44 +2604,66 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
 }
 
 int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uint8_t *const *refs, int refCount,
-                      const Settings &st, const EntropyIn &syntax, uint8_t *recon, std::vector<BlockInfo> *info,
-                      std::vector<int16_t> *levels, char *err, int errLen) {
+                      const Settings &st, const EntropyIn &syntax, uint8_t *recon, const ProjectMotion &projectMotion,
+                      char *err, int errLen) {
     auto *s = static_cast<State *>(state);
+    const cudaStream_t stream = s->compute;
+    collectAnalysisProfile(*s);
     const auto t0 = std::chrono::steady_clock::now();
     refCount = refCount < 1 ? 1 : refCount > kMaxRefs ? kMaxRefs : refCount;
     Frame f{};
     for (int p = 0; p < 3; p++) { f.src[p] = src[p]; f.pitch[p] = pitch[p]; }
     for (int r = 0; r < refCount; r++) f.ref[r] = refs[r];
     f.w8 = (w + 7) >> 3; f.h8 = (h + 7) >> 3;
-    const bool useTmvp = s->mfSet;
-    for (int r = 0; r < refCount; r++) f.tmv[r] = useTmvp ? s->mfDev + size_t(s->mfNames[r]) * f.h8 * f.w8 : nullptr;
-    s->mfSet = false;
     f.w = w; f.h = h; f.aw = aw; f.ah = ah;
     const float lambda = gp_lambda<8>(st.qindex, st.lambdaMul);
     const float lambdaSad = sqrtf(lambda);
     const dim3 t16(16, 16);
     const dim3 gds((s->dw + 15) / 16, (s->dh + 15) / 16);
-    auto mark = [&](int i) { if (s->profile) cudaEventRecord(s->ev[i]); };
+    auto mark = [&](int i) { if (s->profile) cudaEventRecord(s->ev[i], stream); };
     mark(0);
-    downsample4<<<gds, t16>>>(src[0], pitch[0], w, h, s->ds[0], s->dw, s->dh);
+    downsample4<<<gds, t16, 0, stream>>>(src[0], pitch[0], w, h, s->ds[0], s->dw, s->dh);
     const int searchRange = getenv("AV1GPU_PF_RANGE") ? atoi(getenv("AV1GPU_PF_RANGE")) : st.searchRange;
     const int R = std::min(kCoarseMaxR, std::max(2, searchRange / 4));
     const int nCoarse = s->ccols * s->crows;
     for (int r = 0; r < refCount; r++) {
-        downsample4<<<gds, t16>>>(refs[r], w, w, h, s->ds[1 + r], s->dw, s->dh);
-        coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps>>>(
+        downsample4<<<gds, t16, 0, stream>>>(refs[r], w, w, h, s->ds[1 + r], s->dw, s->dh);
+        coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps, 0, stream>>>(
             s->ds[0], s->ds[1 + r], s->dw, s->dh, R, s->ccols, s->crows, lambdaSad * 0.5f, s->coarse[r]);
     }
     mark(1);
+    s->useTmvp = syntax.useTmvp;
+    if (s->useTmvp) {
+        // Coarse search does not need the projected vectors. Its kernels run while the host stores the previous
+        // referenced grid and projects this frame. The pinned upload is ordered before refinement.
+        if (!projectMotion) {
+            snprintf(err, errLen, "P-frame TMVP requires a motion field projection");
+            return -1;
+        }
+        const Mv *field = projectMotion();
+        if (!field) return -1;
+        const size_t cells = size_t(f.h8) * f.w8, bytes = 8 * cells * sizeof(Mv);
+        cudaError_t e = cudaEventSynchronize(s->mfUploaded);
+        if (e == cudaSuccess) {
+            memcpy(s->mfHost, field, bytes);
+            e = cudaMemcpyAsync(s->mfDev, s->mfHost, bytes, cudaMemcpyHostToDevice, stream);
+        }
+        if (e == cudaSuccess) e = cudaEventRecord(s->mfUploaded, stream);
+        if (e != cudaSuccess) {
+            snprintf(err, errLen, "P-frame motion field upload: %s", cudaGetErrorString(e));
+            return -1;
+        }
+        for (int r = 0; r < refCount; r++) f.tmv[r] = s->mfDev + size_t(syntax.refName[r]) * cells;
+    }
     const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
     for (int r = 0; r < refCount; r++) {
         { FineTimer ft_("phase planes");
-        horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8)>>>(refs[r], w, h, s->hphase);
-        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8)>>>(s->hphase, w, h, s->phases[r]); }
+        horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8), 0, stream>>>(refs[r], w, h, s->hphase);
+        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8), 0, stream>>>(s->hphase, w, h, s->phases[r]); }
 #define PF_REFINE(K, N)                                                                                         \
     FineTimer ft##K##_("refine " #N "x" #N);                                                                    \
     refine<N, N><<<(s->cols[K] * s->rows[K] + RefineCfg<N, N>::per() - 1) / RefineCfg<N, N>::per(),               \
-                   32 * RefineCfg<N, N>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,             \
+                   32 * RefineCfg<N, N>::warps, 0, stream>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,             \
                                                   K == 3 ? nullptr : s->cand[K + 1], K == 3 ? 0 : s->cols[K + 1],    \
                                                   2 * N, temporal, s->gcols, s->cand[K], s->cols[K], s->rows[K], lambdaSad)
         PF_REFINE(3, 64);
@@ -2589,7 +2675,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #define PF_CHOOSE(C, CO, R, BW, BH)                                                                             \
     { FineTimer ft_("choose " #BW "x" #BH);                                                                     \
     chooseInter<BW, BH><<<(CO * R + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),                     \
-                          32 * RefineCfg<BW, BH>::warps>>>(f, refCount, s->phases[0], s->phases[1], C, CO, R,        \
+                          32 * RefineCfg<BW, BH>::warps, 0, stream>>>(f, refCount, s->phases[0], s->phases[1], C, CO, R,        \
                                                            lambdaSad, st.compoundBias); }
     PF_CHOOSE(s->cand[3], s->cols[3], s->rows[3], 64, 64);
     PF_CHOOSE(s->cand[2], s->cols[2], s->rows[2], 32, 32);
@@ -2622,7 +2708,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.subD = s->subD[K]; ea.subR = s->subR[K]; ea.subNz = s->subNz[K]; ea.subType = s->subType[K];           \
     ea.trialCount = s->modeCounts + (K); ea.trialIndices = s->modeIndices[K];                                 \
     { FineTimer t(ea.trials ? "mode trial " #N "x" #N : "evaluate " #N "x" #N);                                      \
-      launchEvaluation<N, N>(ea, splitExternal, "eval whole " #N, "eval split " #N, "eval final " #N); }
+      launchEvaluation<N, N>(ea, splitExternal, stream, "eval whole " #N, "eval split " #N, "eval final " #N); }
     PF_EVAL(0, 8);
     PF_EVAL(1, 16);
     PF_EVAL(2, 32);
@@ -2636,7 +2722,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.subD = s->rsubD[RK]; ea.subR = s->rsubR[RK]; ea.subNz = s->rsubNz[RK]; ea.subType = s->rsubType[RK];   \
     ea.trialCount = s->modeCounts + 4 + (RK); ea.trialIndices = s->modeIndices[4 + RK];                        \
     { FineTimer t(ea.trials ? "mode trial " #BW "x" #BH : "evaluate " #BW "x" #BH);                             \
-      launchEvaluation<BW, BH>(ea, splitExternal, "eval whole " #BW "x" #BH, "eval split " #BW "x" #BH,      \
+      launchEvaluation<BW, BH>(ea, splitExternal, stream, "eval whole " #BW "x" #BH, "eval split " #BW "x" #BH, \
                                "eval final " #BW "x" #BH); }
 #define PF_EVAL_RECTS() \
     PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16); PF_REVAL(3, 16, 32);                           \
@@ -2647,7 +2733,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;
             const int n = 8 << K, div = k < 6 ? 2 : 4;
             const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
-            pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
+            pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128, 0, stream>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
                                                                      s->cand[K], s->cols[K], n, st.pruneRect,
                                                                      getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
         }
@@ -2655,7 +2741,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         #define PF_RREFINE(RK, K, BW, BH)                                                                               \
             { FineTimer ft_("refine " #BW "x" #BH);                                                                     \
             refine<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),   \
-                             32 * RefineCfg<BW, BH>::warps>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,          \
+                             32 * RefineCfg<BW, BH>::warps, 0, stream>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,          \
                                                               s->cand[K], s->cols[K], 8 << K, temporal, s->gcols,            \
                                                               s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad, true); }
                 {
@@ -2690,8 +2776,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     const float part[kSizes][2] = {{1.0f, 0.f}, {1.0f, 2.5f}, {1.0f, 2.5f}, {1.0f, 2.0f}};
     memcpy(da.partBits, part, sizeof part);
     for (int k = 0; k < kSizes; k++)
-        decideLevel<<<(s->cols[k] * s->rows[k] + 127) / 128, 128>>>(da, k, s->rows[k]);
-    decideGrid<<<dim3((s->gcols + 15) / 16, (s->grows + 15) / 16), t16>>>(da);
+        decideLevel<<<(s->cols[k] * s->rows[k] + 127) / 128, 128, 0, stream>>>(da, k, s->rows[k]);
+    decideGrid<<<dim3((s->gcols + 15) / 16, (s->grows + 15) / 16), t16, 0, stream>>>(da);
     mark(4);
     CommitArgs ca{};
     ca.grid = s->grid; ca.gcols = s->gcols; ca.w = w; ca.h = h; ca.aw = aw; ca.ah = ah;
@@ -2712,29 +2798,32 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ta.grid = s->grid; ta.gcols = s->gcols; ta.grows = s->grows; ta.tstride = aw / 4; ta.enabled = st.txTypes;
     for (int k = 0; k < kShapes; k++) { ta.types1[k] = s->types1[k]; ta.types2[k] = s->types2[k]; }
     for (int k = 0; k < kSizes; k++) ta.types3[k] = s->types3[k];
-    commit<<<commitGrid, t16>>>(ca);
-    fillTxTypes<<<typeGrid, t16>>>(ta);
+    commit<<<commitGrid, t16, 0, stream>>>(ca);
+    fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
     mark(5);
-    cudaError_t status = cudaSuccess;
     if (st.modeRefine) {
         TileJob j{};
         setTileLayout(j, f.w8 * 2, f.h8 * 2, syntax.tileColsLog2, syntax.tileRowsLog2);
         j.fs.gcols = s->gcols;
         std::copy_n(syntax.refName, 3, j.fs.refName);
         std::copy_n(syntax.signBias, 8, j.fs.signBias);
-        j.fs.useTmvp = useTmvp && syntax.useTmvp;
+        j.fs.useTmvp = s->useTmvp;
         j.grid = s->grid;
         j.mf = s->mfDev;
         j.mi = s->modeMi;
         j.entries = s->modeEntries;
         j.entryCount = s->modeEntryCount;
         const int nSb = j.sbCols * j.sbRows;
-        status = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes);
-        if (status == cudaSuccess) status = cudaMemsetAsync(s->modeChanged, 0, nSb * 64);
+        cudaError_t e = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes, stream);
+        if (e == cudaSuccess) e = cudaMemsetAsync(s->modeChanged, 0, nSb * 64, stream);
+        if (e != cudaSuccess) {
+            snprintf(err, errLen, "P-frame mode refinement: %s", cudaGetErrorString(e));
+            return -1;
+        }
         {
             FineTimer t("mode refinement proposals");
-            tilePhase1<<<(nSb + 63) / 64, 64>>>(j);
-            refinementModeInfo<<<nSb, 64>>>(j);
+            tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(j);
+            refinementModeInfo<<<nSb, 64, 0, stream>>>(j);
             RefinementArgs ra{};
             ra.f = f;
             std::copy_n(s->phases, refCount, ra.phases);
@@ -2748,8 +2837,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.lambda = lambda;
             ra.origMvWeight = ea.mvWeight;
             ra.screenWeight = 3.f * lambdaSad;
-            priceMotion<<<nSb, 64>>>(j, s->defaultInter, s->modeMenus);
-            proposeMotion<<<nSb * 16, 128>>>(j, ra, s->modeMenus);
+            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus);
+            proposeMotion<<<nSb * 16, 128, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
         // and only accepted blocks overwrite their reconstruction, levels and transform types.
@@ -2762,10 +2851,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         if (st.rectPartitions) { PF_EVAL_RECTS(); }
         {
             FineTimer t("mode refinement commit");
-            acceptMotion<<<nSb, 64>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda);
+            acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda);
             ca.changed = ta.changed = s->modeChanged;
-            commit<<<commitGrid, t16>>>(ca);
-            fillTxTypes<<<typeGrid, t16>>>(ta);
+            commit<<<commitGrid, t16, 0, stream>>>(ca);
+            fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
         }
     }
 #undef PF_EVAL_RECTS
@@ -2773,33 +2862,15 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #undef PF_EVAL
     mark(6);
     cudaError_t e = cudaGetLastError();
-    if (status != cudaSuccess) e = status;
-    const size_t gridCount = size_t(s->gcols) * s->grows;
-    if (info) {
-        info->resize(gridCount);
-        if (e == cudaSuccess) e = cudaMemcpy(info->data(), s->grid, gridCount * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
-    }
-    if (levels) {
-        levels->resize(size_t(aw) * ah * 3 / 2);
-        if (e == cudaSuccess)
-            e = cudaMemcpy(levels->data(), s->outLevels, levels->size() * sizeof(int16_t), cudaMemcpyDeviceToHost);
-    }
-    if (e == cudaSuccess) e = cudaMemcpyAsync(s->prevGrid, s->grid, gridCount * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(s->prevGrid, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice, stream);
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame analysis: %s", cudaGetErrorString(e));
         return -1;
     }
     s->havePrev = true;
-    if (s->profile) {
-        mark(7);
-        cudaEventSynchronize(s->ev[7]);
-        for (int i = 0; i < 7; i++) {
-            float ms = 0;
-            cudaEventElapsedTime(&ms, s->ev[i], s->ev[i + 1]);
-            s->stageMs[i] += ms;
-        }
-        s->frames++;
-    }
+    mark(7);
+    s->profilePending = s->profile;
     elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return 0;
 }
@@ -2810,7 +2881,6 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
     const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
-    const int sbCols = (miCols + 15) >> 4, sbRows = (miRows + 15) >> 4;
     TileJob j{};
     setTileLayout(j, miCols, miRows, in.tileColsLog2, in.tileRowsLog2);
     const int nTiles = j.tileCols * j.tileRows;
@@ -2820,9 +2890,14 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     }
     EntropySlot &es = s->eslot[k];
     es.nTiles = nTiles;
-    cudaError_t e = cudaMemcpyAsync(es.grid, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice);
-    if (e == cudaSuccess) e = cudaMemcpyAsync(es.levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToDevice);
-    if (e == cudaSuccess) e = cudaEventRecord(es.staged, 0);
+    cudaError_t e = cudaMemcpyAsync(es.grid, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToDevice, s->compute);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(es.levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToDevice, s->compute);
+    if (e == cudaSuccess && in.useTmvp && s->useTmvp) {
+        const size_t n = 8 * size_t(miRows / 2) * (miCols / 2);
+        e = cudaMemcpyAsync(es.mf, s->mfDev, n * sizeof(Mv), cudaMemcpyDeviceToDevice, s->compute);
+    }
+    if (e == cudaSuccess) e = cudaEventRecord(es.staged, s->compute);
     if (e == cudaSuccess) e = cudaStreamWaitEvent(s->entStream, es.staged, 0);
     j.fs.refName[0] = in.refName[0];
     j.fs.refName[1] = in.refName[1];
@@ -2833,13 +2908,8 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.switchable = in.switchableFilter;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
     for (int k = 0; k < 8; k++) j.fs.signBias[k] = in.signBias[k];
-    j.fs.useTmvp = in.useTmvp && in.motionField;
+    j.fs.useTmvp = in.useTmvp && s->useTmvp;
     j.mf = es.mf;
-    if (j.fs.useTmvp && e == cudaSuccess) {
-        const size_t n = 8 * size_t(miRows / 2) * (miCols / 2);
-        es.mfHost.assign(in.motionField, in.motionField + n);
-        e = cudaMemcpyAsync(es.mf, es.mfHost.data(), n * sizeof(pf::Mv), cudaMemcpyHostToDevice, s->entStream);
-    }
     j.fs.aw = aw; j.fs.ah = ah; j.fs.gcols = s->gcols;
     j.grid = es.grid;
     j.levels = es.levels;
@@ -2871,8 +2941,8 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     if (!in.recordsOnly)
         initFrameCdfs<<<1, 1, 0, st>>>(s->coderInit, in.primarySlot >= 0 ? s->slots + in.primarySlot : nullptr,
                                        s->defaultInter, in.qindex);
-    const int nSb = sbCols * sbRows;
-    auto emark = [&](int i) { if (s->profile) cudaEventRecord(s->eev[i], st); };
+    const int nSb = j.sbCols * j.sbRows;
+    auto emark = [&](int i) { if (s->profile) cudaEventRecord(es.profile[i], st); };
     emark(0);
     tilePhase1<<<(nSb + 63) / 64, 64, 0, st>>>(j);
     emark(1);
@@ -2886,6 +2956,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     if (in.recordsOnly) {
         packOffsets<<<1, 1, 0, st>>>(j);
         packRecords<<<nSb, 64, 0, st>>>(j);
+        emark(4);
         if (e == cudaSuccess) e = cudaEventRecord(es.done, st);
         if (e == cudaSuccess) e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -2896,11 +2967,6 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     }
     tileCode<<<nTiles, 64, 0, st>>>(j);
     emark(4);
-    if (s->profile) {
-        cudaEventSynchronize(s->eev[4]);
-        for (int i = 0; i < 4; i++) { float ms; cudaEventElapsedTime(&ms, s->eev[i], s->eev[i + 1]); s->entMs[i] += ms; }
-        s->entFrames++;
-    }
     packTiles<<<nTiles, 256, 0, st>>>(es.tileOut, j.ecCapPerTile, es.sizes, nTiles, es.packed);
     if (e == cudaSuccess) e = cudaEventRecord(es.done, s->entStream);
     if (e == cudaSuccess) e = cudaGetLastError();
@@ -2919,6 +2985,7 @@ int Analyzer::entropyFetch(int k, EntropyOut &out, char *err, int errLen) {
     int error = 0;
     // the fetch stream does not wait for later analysis or entropy work
     cudaError_t e = cudaEventSynchronize(es.done);
+    if (e == cudaSuccess) collectEntropyProfile(*s, es);
     if (e == cudaSuccess) e = cudaMemcpyAsync(sizes.data(), es.sizes, sizeof(int) * nTiles, cudaMemcpyDeviceToHost, es.fetch);
     if (e == cudaSuccess) e = cudaMemcpyAsync(&error, es.error, sizeof(int), cudaMemcpyDeviceToHost, es.fetch);
     if (e == cudaSuccess) e = cudaStreamSynchronize(es.fetch);
@@ -2954,6 +3021,7 @@ int Analyzer::entropyFetchRecords(int k, std::vector<uint32_t> &tileCounts, std:
     tileCounts.assign(es.nTiles, 0);
     int error = 0;
     cudaError_t e = cudaEventSynchronize(es.done);
+    if (e == cudaSuccess) collectEntropyProfile(*s, es);
     if (e == cudaSuccess)
         e = cudaMemcpyAsync(tileCounts.data(), es.tileCount, sizeof(uint32_t) * es.nTiles, cudaMemcpyDeviceToHost, es.fetch);
     if (e == cudaSuccess) e = cudaMemcpyAsync(&error, es.error, sizeof(int), cudaMemcpyDeviceToHost, es.fetch);
@@ -2980,33 +3048,40 @@ int Analyzer::entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLe
     return entropyLaunch(in, 0, err, errLen) ? -1 : entropyFetch(0, out, err, errLen);
 }
 
-int Analyzer::setMotionField(const Mv *field, const int refName[3], char *err, int errLen) {
-    auto *s = static_cast<State *>(state);
-    const size_t n = 8 * size_t((w + 7) >> 3) * ((h + 7) >> 3);
-    const cudaError_t e = cudaMemcpy(s->mfDev, field, n * sizeof(Mv), cudaMemcpyHostToDevice);
-    if (e != cudaSuccess) {
-        snprintf(err, errLen, "motion field upload: %s", cudaGetErrorString(e));
-        return -1;
-    }
-    for (int r = 0; r < kMaxRefs; r++) s->mfNames[r] = refName[r];
-    s->mfSet = true;
-    return 0;
+cudaStream_t Analyzer::stream() const {
+    return static_cast<State *>(state)->compute;
 }
-int Analyzer::downloadGrid(BlockInfo *info, char *err, int errLen) {
+
+int Analyzer::stageMotionGrid(char *err, int errLen) {
     auto *s = static_cast<State *>(state);
-    const cudaError_t e = cudaMemcpy(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
+    cudaError_t e = cudaMemcpyAsync(s->motionGridHost, s->prevGrid, gridCount() * sizeof(BlockInfo),
+                                    cudaMemcpyDeviceToHost, s->compute);
+    if (e == cudaSuccess) e = cudaEventRecord(s->motionGridReady, s->compute);
     if (e != cudaSuccess) {
-        snprintf(err, errLen, "grid download: %s", cudaGetErrorString(e));
+        snprintf(err, errLen, "P-frame motion grid download: %s", cudaGetErrorString(e));
         return -1;
     }
     return 0;
 }
-int Analyzer::download(BlockInfo *info, int16_t *levels, char *err, int errLen) {
+
+const BlockInfo *Analyzer::motionGrid(char *err, int errLen) {
     auto *s = static_cast<State *>(state);
-    cudaError_t e = cudaMemcpy(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess) e = cudaMemcpy(levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToHost);
+    const cudaError_t e = cudaEventSynchronize(s->motionGridReady);
     if (e != cudaSuccess) {
-        snprintf(err, errLen, "decision download: %s", cudaGetErrorString(e));
+        snprintf(err, errLen, "P-frame motion grid download: %s", cudaGetErrorString(e));
+        return nullptr;
+    }
+    return s->motionGridHost;
+}
+
+int Analyzer::download(BlockInfo *info, int16_t *levels, cudaEvent_t done, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    cudaError_t e = cudaMemcpyAsync(info, s->grid, gridCount() * sizeof(BlockInfo), cudaMemcpyDeviceToHost, s->compute);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(levels, s->outLevels, levelCount() * sizeof(int16_t), cudaMemcpyDeviceToHost, s->compute);
+    if (e == cudaSuccess) e = cudaEventRecord(done, s->compute);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "P-frame download: %s", cudaGetErrorString(e));
         return -1;
     }
     return 0;
@@ -3242,12 +3317,12 @@ int Analyzer::temporalFilter(const uint8_t *const center[3], const uint8_t *cons
     count = std::min(count, kTfMax);
     const dim3 t16(16, 16);
     const dim3 gds((s->dw + 15) / 16, (s->dh + 15) / 16);
-    downsample4<<<gds, t16>>>(center[0], aw, w, h, s->tfDs[0], s->dw, s->dh);
+    downsample4<<<gds, t16, 0, s->compute>>>(center[0], aw, w, h, s->tfDs[0], s->dw, s->dh);
     const int nCoarse = s->ccols * s->crows;
     TfArgs a{};
     for (int j = 0; j < count; j++) {
-        downsample4<<<gds, t16>>>(neighbors[0][j], aw, w, h, s->tfDs[1 + j], s->dw, s->dh);
-        coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps>>>(
+        downsample4<<<gds, t16, 0, s->compute>>>(neighbors[0][j], aw, w, h, s->tfDs[1 + j], s->dw, s->dh);
+        coarseSearch<<<(nCoarse + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps, 0, s->compute>>>(
             s->tfDs[0], s->tfDs[1 + j], s->dw, s->dh, 12, s->ccols, s->crows, 2.f, s->tfCoarse[j]);
         for (int p = 0; p < 3; p++) a.nb[j][p] = neighbors[p][j];
         a.coarse[j] = s->tfCoarse[j];
@@ -3257,10 +3332,10 @@ int Analyzer::temporalFilter(const uint8_t *const center[3], const uint8_t *cons
     const float step = av1g_ac_q(qindex) / 8.f;
     a.stepPix = step;
     a.step2 = std::max(1.f, step * step * strength);
-    temporalFilterKernel<<<dim3((w + 15) / 16, (h + 15) / 16), 256>>>(a);
+    temporalFilterKernel<<<dim3((w + 15) / 16, (h + 15) / 16), 256, 0, s->compute>>>(a);
     for (int p = 0; p < 3; p++) {
         const int pw = p ? w / 2 : w, phh = p ? h / 2 : h, pitch = p ? aw / 2 : aw, pah = p ? ah / 2 : ah;
-        padFrame<<<dim3((pitch + 31) / 32, (pah + 7) / 8), dim3(32, 8)>>>(out[p], pitch, pw, phh, pah);
+        padFrame<<<dim3((pitch + 31) / 32, (pah + 7) / 8), dim3(32, 8), 0, s->compute>>>(out[p], pitch, pw, phh, pah);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -3279,7 +3354,6 @@ void Analyzer::resetTemporal() {
 // Loop restoration: luma Wiener filter in 64-sample units (spec 7.17). The unit of a sample uses the stripe offset:
 // unitRow = Min(unitRows - 1, (y + 8) / 64). Samples outside the 64-row stripe of the sample being filtered come from
 // the deblocked frame (two rows at most), inside it from the CDEF output.
-__constant__ float c_lrBits;
 struct LrArgs {
     const uint8_t *dbk, *cdef;   // luma planes (w x h, pitch w)
     const uint8_t *src;
@@ -3400,121 +3474,134 @@ __global__ void lrApply(LrArgs a) {
 }
 // Per unit: keep the filter when its SSE saving pays for its bits; write the decision into the grid (the unit's
 // top-left 8x8 entry) and the chosen samples into dst.
-__global__ void lrDecide(LrArgs a, float lambda, BlockInfo *grid, int gcols, uint8_t *dst) {
+__global__ void lrDecide(LrArgs a, float bitCost, BlockInfo *grid, int gcols, uint8_t *dst, FilterSelection *selection) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= a.w || y >= a.h) return;
     int ur, uc;
     const int u = lrUnitOf(a, x, y, &ur, &uc);
     const float gain = (float)a.sse[2 * u] - (float)a.sse[2 * u + 1];
-    const bool use = gain > lambda * c_lrBits;   // use_wiener plus the coefficient bits (estimate)
+    const bool use = gain > bitCost;
     dst[y * a.w + x] = use ? a.out[y * a.w + x] : a.cdef[y * a.w + x];
     if (x == uc * 64 && y == ur * 64) {
+        if (use) atomicExch(&selection->lrLuma, 1);
         BlockInfo &b = grid[(ur * 8) * gcols + uc * 8];
         b.lrUse = use;
         for (int k = 0; k < 6; k++) b.lrCoef[k / 3][k % 3] = use ? a.q[u * 6 + k] : 0;
     }
 }
 
+// Both filters evaluate every candidate from the same input. Deblocking is plane-local and CDEF chroma
+// uses the same luma directions for all strengths, so choosing each plane from the saved pixels is exact.
+template<bool Cdef>
+__global__ void selectFilter(const unsigned long long *sse, int count, bool zeroLevel, FilterSelection *selection) {
+    int *indices = Cdef ? selection->cdef : selection->lf;
+    for (int p = 0; p < (Cdef ? 2 : 3); ++p) {
+        unsigned long long best = ~0ull;
+        for (int i = 0; i < count; ++i) {
+            auto error = sse[3 * i + p];
+            if (Cdef && p == 1) error += sse[3 * i + 2];
+            if (error < best) {
+                best = error;
+                indices[p] = i;
+            }
+        }
+    }
+    if (Cdef) indices[2] = indices[1];
+    // AV1 signals chroma deblocking levels only when at least one luma level is nonzero.
+    if (!Cdef && zeroLevel && indices[0] == 0) indices[1] = indices[2] = 0;
+}
+
+template<bool Cdef>
+__global__ void gatherFilter(const uint32_t *candidates, size_t luma, size_t chroma, uint32_t *recon,
+                             uint32_t *lumaOut, const FilterSelection *selection) {
+    const size_t frame = luma + 2 * chroma;
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= frame) return;
+    const int p = i < luma ? 0 : i < luma + chroma ? 1 : 2;
+    const int candidate = Cdef ? selection->cdef[p] : selection->lf[p];
+    uint32_t *dst = p == 0 ? lumaOut : recon;
+    dst[i] = candidates[frame * candidate + i];
+}
+
 int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *recon, int qindex, bool cdefAllowed,
-                     bool search, FilterParams &out, char *err, int errLen) {
+                     FilterParams &out, char *err, int errLen) {
     auto *s = static_cast<State *>(state);
+    const cudaStream_t stream = s->compute;
     av1g_frame_params fp{};
     fp.width = w; fp.height = h; fp.chroma_format = AV1G_CHROMA_420; fp.bit_depth = 8;
     fp.enable_cdef = cdefAllowed;
     av1g_pf_frame f;
     av1g_gpu_pf_attach(&fp, s->pfScratch, &f);
     const dim3 t16(16, 16);
-    buildFilterMaps<<<dim3((f.MiCols + 15) / 16, (f.MiRows + 15) / 16), t16>>>(s->grid, s->gcols, f);
-    buildCdefIdx<<<(f.sbCols * f.sbRows + 63) / 64, 64>>>(s->grid, s->gcols, s->grows, f);
+    cudaError_t e = cudaSuccess;
+    if (s->profile) e = cudaEventRecord(s->ev[8], stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(s->filterDev, 0, sizeof(FilterSelection), stream);
+    buildFilterMaps<<<dim3((f.MiCols + 15) / 16, (f.MiRows + 15) / 16), t16, 0, stream>>>(s->grid, s->gcols, f);
+    buildCdefIdx<<<(f.sbCols * f.sbRows + 63) / 64, 64, 0, stream>>>(s->grid, s->gcols, s->grows, f);
     const int cw = w / 2, ch = h / 2;
     const size_t ysz = size_t(w) * h, csz = size_t(cw) * ch, frame = ysz + 2 * csz;
-    uint8_t *planesOf[2][3] = {{recon, recon + ysz, recon + ysz + csz},
-                               {s->work, s->work + ysz, s->work + ysz + csz}};
     const int pw[3] = {w, cw, cw}, ph[3] = {h, ch, ch};
-    cudaError_t e = cudaSuccess;
-    // candidate errors accumulate in device slots (3 per candidate) and are read back once per search
     auto sseOf = [&](uint8_t *const planes[3], int slot) {
         for (int p = 0; p < 3; p++)
-            planeSse<<<dim3((pw[p] + 31) / 32, (ph[p] + 7) / 8), dim3(32, 8)>>>(src[p], pitch[p], planes[p], pw[p], ph[p],
-                                                                               s->sse + 3 * slot + p);
+            planeSse<<<dim3((pw[p] + 31) / 32, (ph[p] + 7) / 8), dim3(32, 8), 0, stream>>>(
+                src[p], pitch[p], planes[p], pw[p], ph[p], s->sse + 3 * slot + p);
+        return cudaGetLastError();
     };
-    unsigned long long slotSse[3 * 21];
-    auto fetch = [&](int slots) {
-        e = cudaMemcpy(slotSse, s->sse, sizeof(unsigned long long) * 3 * slots, cudaMemcpyDeviceToHost);
-    };
-    // deblocking level: libaom's inter-frame estimate, optionally refined per plane by SSE
+    auto *candidates = reinterpret_cast<const uint32_t *>(s->filterCandidates);
+    auto *dstWords = reinterpret_cast<uint32_t *>(recon);
+    const unsigned blocks = (frame / sizeof(uint32_t) + 255) / 256;
+
+    // Keep the candidate order and strict SSE comparisons so tied candidates keep the first level.
     const int acq = av1g_ac_q(qindex);
     const int guess = std::max(0, std::min(63, (int)(((long)acq * 20723 + 1015158 + (1 << 17)) >> 18)));
-    int best[3] = {guess, guess, guess};
-    if (search) {
-        unsigned long long bestSse[3] = {~0ull, ~0ull, ~0ull};
-        const int deltas[] = {-12, -6, 0, 6, 12};
-        int levels[5], n = 0;
-        cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * 5);
-        for (int d : deltas) {
-            const int L = std::max(0, std::min(63, guess + d));
-            if (d && L == std::max(0, std::min(63, guess + d - (d > 0 ? 6 : -6)))) continue;
-            e = cudaMemcpyAsync(s->work, recon, frame, cudaMemcpyDeviceToDevice);
-            for (int p = 0; p < 3; p++) { f.plane[p] = planesOf[1][p]; f.stride[p] = pw[p]; }
-            for (int k = 0; k < 4; k++) f.lfLevel[k] = L;
-            if (L) av1g_gpu_deblock(&f, 0);
-            sseOf(planesOf[1], n);
-            levels[n++] = L;
-        }
-        fetch(n);
-        for (int i = 0; i < n; i++)
-            for (int p = 0; p < 3; p++)
-                if (slotSse[3 * i + p] < bestSse[p]) { bestSse[p] = slotSse[3 * i + p]; best[p] = levels[i]; }
+    constexpr int deltas[kDeblockCandidates] = {-12, -6, 0, 6, 12};
+    int levels[kDeblockCandidates], n = 0;
+    if (e == cudaSuccess) e = cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * kDeblockCandidates, stream);
+    for (int d : deltas) {
+        if (e != cudaSuccess) break;
+        const int L = std::max(0, std::min(63, guess + d));
+        if (d && L == std::max(0, std::min(63, guess + d - (d > 0 ? 6 : -6)))) continue;
+        uint8_t *work = s->filterCandidates + n * frame;
+        e = cudaMemcpyAsync(work, recon, frame, cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) break;
+        f.plane[0] = work; f.plane[1] = work + ysz; f.plane[2] = work + ysz + csz;
+        for (int p = 0; p < 3; p++) f.stride[p] = pw[p];
+        for (int k = 0; k < 4; k++) f.lfLevel[k] = L;
+        e = (cudaError_t)av1g_gpu_deblock(&f, stream);
+        if (e == cudaSuccess) e = sseOf(f.plane, n);
+        levels[n++] = L;
     }
-    out.lf[0] = out.lf[1] = best[0];
-    out.lf[2] = best[0] ? best[1] : 0;
-    out.lf[3] = best[0] ? best[2] : 0;
-    out.sharpness = 0;
-    for (int p = 0; p < 3; p++) { f.plane[p] = planesOf[0][p]; f.stride[p] = pw[p]; }
-    for (int k = 0; k < 4; k++) f.lfLevel[k] = out.lf[k];
-    f.sharpness = 0;
-    if (out.lf[0] || out.lf[1]) av1g_gpu_deblock(&f, 0);
+    if (e == cudaSuccess) {
+        selectFilter<false><<<1, 1, 0, stream>>>(s->sse, n, levels[0] == 0, s->filterDev);
+        gatherFilter<false><<<blocks, 256, 0, stream>>>(candidates, ysz / 4, csz / 4, dstWords, dstWords, s->filterDev);
+        e = cudaGetLastError();
+    }
+
     out.cdef = cdefAllowed;
-    if (cdefAllowed) {
+    if (cdefAllowed && e == cudaSuccess) {
         out.damping = 3 + std::min(3, qindex >> 6);
-        f.enableCdef = 1;
+        f.plane[0] = recon; f.plane[1] = recon + ysz; f.plane[2] = recon + ysz + csz;
         f.cdefDamping = out.damping;
-        av1g_gpu_cdef_dir(&f, 0);
-        uint8_t *dst[3] = {s->cdefOut, s->cdefOut + ysz, s->cdefOut + ysz + csz};
-        const int strides[3] = {w, cw, cw};
-        struct Str { int pri, sec; };
-        const Str cands[] = {{0, 0}, {1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}, {8, 2}, {10, 4}, {12, 4}};
-        int by = 0, buv = 0;
-        if (search) {
-            unsigned long long bY = ~0ull, bUV = ~0ull;
-            const int nc = (int)(sizeof cands / sizeof cands[0]);
-            cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * nc);
-            for (int k = 0; k < nc; k++) {
-                f.cdefYPri[0] = cands[k].pri; f.cdefYSec[0] = cands[k].sec;
-                f.cdefUVPri[0] = cands[k].pri; f.cdefUVSec[0] = cands[k].sec;
-                av1g_gpu_cdef(&f, dst, strides, 0);
-                sseOf(dst, k);
-            }
-            fetch(nc);
-            for (int k = 0; k < nc; k++) {
-                const unsigned long long *r = slotSse + 3 * k;
-                if (r[0] < bY) { bY = r[0]; by = k; }
-                if (r[1] + r[2] < bUV) { bUV = r[1] + r[2]; buv = k; }
-            }
-        } else {
-            by = buv = std::min(8, qindex / 32);
+        e = (cudaError_t)av1g_gpu_cdef_dir(&f, stream);
+        if (e == cudaSuccess) e = cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * kCdefCount, stream);
+        for (int k = 0; k < kCdefCount && e == cudaSuccess; k++) {
+            f.cdefYPri[0] = f.cdefUVPri[0] = kCdefCandidates[k].pri;
+            f.cdefYSec[0] = f.cdefUVSec[0] = kCdefCandidates[k].sec;
+            auto *candidate = s->filterCandidates + k * frame;
+            uint8_t *dst[3] = {candidate, candidate + ysz, candidate + ysz + csz};
+            e = (cudaError_t)av1g_gpu_cdef(&f, dst, pw, stream);
+            if (e == cudaSuccess) e = sseOf(dst, k);
         }
-        out.yPri = cands[by].pri; out.ySec = cands[by].sec;
-        out.uvPri = cands[buv].pri; out.uvSec = cands[buv].sec;
-        f.cdefYPri[0] = out.yPri; f.cdefYSec[0] = out.ySec;
-        f.cdefUVPri[0] = out.uvPri; f.cdefUVSec[0] = out.uvSec;
-        av1g_gpu_cdef(&f, dst, strides, 0);
-        if (!out.lrAllowed) e = cudaMemcpy(recon, s->cdefOut, frame, cudaMemcpyDeviceToDevice);
-        else e = cudaMemcpy(recon + ysz, s->cdefOut + ysz, 2 * csz, cudaMemcpyDeviceToDevice);   // luma below
+        if (e == cudaSuccess) {
+            selectFilter<true><<<1, 1, 0, stream>>>(s->sse, kCdefCount, false, s->filterDev);
+            auto *lumaOut = out.lrAllowed ? reinterpret_cast<uint32_t *>(s->cdefOut) : dstWords;
+            gatherFilter<true><<<blocks, 256, 0, stream>>>(candidates, ysz / 4, csz / 4, dstWords, lumaOut, s->filterDev);
+            e = cudaGetLastError();
+        }
     }
-    out.lrLuma = false;
+
     if (out.lrAllowed && e == cudaSuccess) {
-        // luma Wiener: the deblocked luma is still in recon, the CDEF output in cdefOut (or recon without CDEF)
+        // Luma Wiener uses both the deblocked luma in recon and the CDEF luma in cdefOut.
         LrArgs la{};
         la.dbk = recon; la.cdef = cdefAllowed ? s->cdefOut : recon;
         la.src = src[0]; la.srcPitch = pitch[0];
@@ -3522,26 +3609,40 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
         la.coef = s->lrCoef; la.q = s->lrQ; la.sse = s->lrSse; la.out = s->lrOut;
         const int nu = la.unitRows * la.unitCols;
         const float lrBits = getenv("AV1GPU_PF_LRBITS") ? (float)atof(getenv("AV1GPU_PF_LRBITS")) : 26.f;
-        cudaMemcpyToSymbolAsync(c_lrBits, &lrBits, sizeof lrBits);
-        cudaMemsetAsync(s->lrCoef, 0, sizeof(float) * 6 * nu);
-        lrSolve<<<nu, 256>>>(la, 1);   // horizontal given an identity vertical pass
-        lrSolve<<<nu, 256>>>(la, 0);   // vertical given the horizontal pass
-        lrSolve<<<nu, 256>>>(la, 1);
-        lrQuantize<<<(nu + 127) / 128, 128>>>(la);
-        const dim3 g16((w + 15) / 16, (h + 15) / 16);
-        lrApply<<<g16, t16>>>(la);
-        lrDecide<<<g16, t16>>>(la, gp_lambda<8>(qindex, 0.7f), s->grid, s->gcols, recon);
-        std::vector<unsigned long long> sse(2 * nu);
-        e = cudaMemcpy(sse.data(), s->lrSse, sizeof(unsigned long long) * 2 * nu, cudaMemcpyDeviceToHost);
-        const float lambda = gp_lambda<8>(qindex, 0.7f);
-        for (int u = 0; u < nu && e == cudaSuccess; u++)
-            if ((float)sse[2 * u] - (float)sse[2 * u + 1] > lambda * lrBits) out.lrLuma = true;
+        e = cudaMemsetAsync(s->lrCoef, 0, sizeof(float) * 6 * nu, stream);
+        if (e == cudaSuccess) {
+            lrSolve<<<nu, 256, 0, stream>>>(la, 1);   // horizontal given an identity vertical pass
+            lrSolve<<<nu, 256, 0, stream>>>(la, 0);   // vertical given the horizontal pass
+            lrSolve<<<nu, 256, 0, stream>>>(la, 1);
+            lrQuantize<<<(nu + 127) / 128, 128, 0, stream>>>(la);
+            const dim3 g16((w + 15) / 16, (h + 15) / 16);
+            lrApply<<<g16, t16, 0, stream>>>(la);
+            lrDecide<<<g16, t16, 0, stream>>>(la, gp_lambda<8>(qindex, 0.7f) * lrBits, s->grid, s->gcols, recon,
+                                             s->filterDev);
+            e = cudaGetLastError();
+        }
     }
-    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e == cudaSuccess && s->profile) e = cudaEventRecord(s->ev[9], stream);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(s->filterHost, s->filterDev, sizeof(FilterSelection), cudaMemcpyDeviceToHost, stream);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame filters: %s", cudaGetErrorString(e));
         return -1;
     }
+    s->profileFiltered = s->profile;
+    const auto &selection = *s->filterHost;
+    out.lf[0] = out.lf[1] = levels[selection.lf[0]];
+    out.lf[2] = levels[selection.lf[1]];
+    out.lf[3] = levels[selection.lf[2]];
+    out.sharpness = 0;
+    if (cdefAllowed) {
+        out.yPri = kCdefCandidates[selection.cdef[0]].pri;
+        out.ySec = kCdefCandidates[selection.cdef[0]].sec;
+        out.uvPri = kCdefCandidates[selection.cdef[1]].pri;
+        out.uvSec = kCdefCandidates[selection.cdef[1]].sec;
+    }
+    out.lrLuma = selection.lrLuma != 0;
     return 0;
 }
 

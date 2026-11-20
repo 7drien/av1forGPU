@@ -55,6 +55,12 @@ Pipeline (`encoder/apps/pframe.cu`, `pframe_tile.cuh`, `pframe_writer.h`):
 5. **Entropy coding (GPU + host):** on a separate stream, one thread per superblock builds decode-order block lists. One thread per block then fills mode info and coefficient-context maps, chooses inter modes from the motion-vector candidate list (costs from the default CDFs, so blocks are independent), and emits symbol records with exact contexts. A host writer thread range-codes the records, which is the one inherently serial step. The all-GPU option range-codes on the GPU instead. The host writes the frame header and OBUs.
 6. **Rate control (host):** one quantizer per period, adjusted by the measured bits.
 
+Raw inter inputs are padded into two pinned staging buffers and copied on a dedicated stream. The host uploads the ALTREF first, then prefetches the remaining pictures in pyramid coding order while analysis runs. Events protect staging reuse, input readiness, and device input reuse across mini-GOPs. The optional temporal filter waits for its center and neighbors on the compute stream.
+
+Inter analysis and in-loop filters use a non-default compute stream. The accepted decisions of a referenced frame are downloaded before filtering. The host stores those decisions and projects the next frame's motion field while that frame's coarse search runs. The per-size search and final-partition refinement use the same uploaded projection. GPU entropy snapshots that projection along with the decisions and coefficients. The CPU entropy writer uses a copy of the host projection and waits for its pinned decision and coefficient downloads.
+
+Deblocking and CDEF select their candidates on the GPU, keeping the first candidate on an SSE tie. The selected pixels feed the next filter directly. One compact readback supplies the loop filter levels, CDEF strengths, and loop restoration flag for frame and tile syntax.
+
 Every feature is validated by decoding with dav1d and comparing to the encoder reconstruction. Full-clip streams are also cross-checked with libaom and NVDEC.
 
 See [svt_gap_plan.md](svt_gap_plan.md) for the full list of SVT-AV1 tools still missing.
