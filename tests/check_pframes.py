@@ -86,6 +86,7 @@ if __name__ == "__main__":
         # Final-partition re-evaluation also uses the unsplit evaluation kernel.
         run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-no-tx-split", "--pf-no-rect"])
         run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-refine-passes", "1"])
+        run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--kf-tiles", "0.01,1,1"])
         run(b, 448, 256, 20, ["--persistent-cdf", "--pf-refs", "3", "--pf-gop", "16"])
         # Temporal filtering consumes both sides of the ALTREF before its original is reused for the overlay.
         run(b, 448, 184, 27, ["--persistent-cdf", "--pf-tf-frames", "2", "--pf-gop", "7", "--keyint", "13"])

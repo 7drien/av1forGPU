@@ -333,3 +333,50 @@ libaom equal to the encoder reconstruction.
   +9.8%), video_2's long shot about 1.0-1.6.
 - video_2 +34.6% → +33.6% against SVT-AV1 preset 8 (+37.9% against libaom), video_1 unchanged at +7.9%; fps unchanged.
 
+## Five-clip benchmark (`tests/bench_all.py`)
+
+`python3 tests/bench_all.py BINARY --tag TAG [--ours ARGS]` runs `tests/compare.py` on every `benckmark/video_*` clip
+(first 120 frames, q 20/50/90/130) and prints BD-rate against SVT-AV1 preset 8 and libaom cpu-used 8 with the median
+fps. `compare.py` now computes PSNR one frame at a time (4K clips no longer exhaust memory; same values) and keeps
+full-range sources (video_3) in full range.
+
+| Clip | Content | vs SVT | vs libaom | fps (SVT / libaom) |
+| --- | --- | ---: | ---: | ---: |
+| video_1 | 1080x1920, static | +7.9% | +31.3% | 23.3 (36.7 / 10.6) |
+| video_2 | 1080p concert, cuts | +33.6% | +37.9% | 16.3 (33.1 / 4.9) |
+| video_3 | 4K handheld street, dark | +69.3% | +192.8% | 6.0 (17.6 / 3.2) |
+| video_4 | 4K advert, logos, cuts | -11.3% | +36.5% | 5.9 (16.2 / 1.3) |
+| video_5 | 1080p animation | -3.8% | +12.9% | 15.0 (41.9 / 7.9) |
+| mean | | +19.1% | +62.3% | |
+
+### video_3 investigation (not solved)
+
+- Not noise (estimated sigma 0.5), not range clipping (luma 20..137), not the key frames (ours are as good as
+  SVT's / libaom's and cheaper), not the in-loop filters, not 1/8-pel vectors (best 64x64 prediction 3.75 → 3.68),
+  not global / warped motion or OBMC (disabling them in libaom changes nothing on this clip).
+- The loss is in the inter frames, in textured areas (stone wall): about 0.7 dB at the same GOP structure and frame
+  sizes as SVT. Our predicted frames are 98% skipped blocks, 84% of the area in 64x64 blocks; the best 64x64
+  translational prediction of the wall has MSE 3.75 against 2.08 for 16x16 blocks (source to source).
+- Tried on video_3: ALTREF temporal filter (rewritten: libaom-style non-local-means weights from the estimated noise
+  and the inter quantizer, quarter-pel alignment; the old weights used the ALTREF's own quantizer, near 1 after the
+  boost, so they filtered almost nothing on any clip) +73.7% / +81.0% with 2 / 4 frames (off by default);
+  ALTREF boost 40 / 80 +75.3% / +68.4%; fixed 32-frame GOP +71.7%; `--pf-switchable` +65.0%; `--pf-lambda` 0.5
+  +63.3% (0.35: +67.1%); 3 references +65.1%; geometric pyramid quantizers (boost halved per level) worse on every
+  clip.
+
+## Speed: profile and parallelism (all clips)
+
+GPU busy 91-93% of the wall time (nsys, video_2 1080p and video_3 4K at q50), so the host pipeline is not the limit.
+GPU time: evaluation 48-55%, motion search 25%, key-frame encoder 20-25%, filters + entropy + refinement about 15%.
+
+- Key frames used one tile (`slow` preset): the intra reconstruction wavefront runs at most 15 (1080p) / 30 (4K)
+  CTAs, and the key-frame entropy coder one CTA (255 ms per 4K key frame). `--kf-tiles MIN_MP,C,R` (default 2,2,2:
+  4x4 tiles from 2 MP; 0 = one tile): one key frame 470 → 237 ms at 1080p, 1170 → 587 ms at 4K. Five clips: mean
+  BD-rate +19.1% → +19.4%, fps +4% (video_1, video_2), +2% (video_3), 0 (video_4), +11% (video_5).
+- Coarse search: four candidates per lane with packed byte SADs (`__vsadu4`, funnel shifts on word-aligned rows)
+  instead of 64 byte loads and differences per candidate. Same output.
+- Evaluation: the four square sizes run concurrently (one stream each); each rectangle's pruning, refinement, choice
+  and evaluation follow its square size on its own stream; all join before the decision. Same output.
+- Both together, byte-identical on video_1 / 2 / 3 / 4: video_2 q20 14.3 → 17.2 fps, q90 17.1 → 20.7, video_1 q50
+  22.4 → 27.0 (+21%); 4K (video_3, video_4 q50) 5.6 → 6.1 (+9%: 4K kernels already fill the GPU).
+

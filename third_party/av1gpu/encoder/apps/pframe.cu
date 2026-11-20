@@ -194,35 +194,56 @@ __global__ void downsample4(const uint8_t *src, int pitch, int w, int h, uint8_t
     dst[y * dw + x] = (uint8_t)((s + 8) >> 4);
 }
 
-// Exhaustive search of 8x8 blocks on the quarter-resolution luma (32x32 full-resolution areas).
+// Exhaustive search of 8x8 blocks on the quarter-resolution luma (32x32 full-resolution areas). Each lane scores four
+// horizontally adjacent candidates at once with packed byte SADs (__vsadu4) on word-aligned window rows; the costs and the
+// choice (lowest cost, then lowest candidate index) are those of a plain per-candidate search.
 constexpr int kCoarseWarps = 4;
 constexpr int kCoarseMaxR = 48;
+constexpr int kCoarseStride = ((8 + 2 * kCoarseMaxR + 3) & ~3) + 4;   // window row pitch: word aligned, 4 bytes slack
 __global__ void coarseSearch(const uint8_t *cur, const uint8_t *ref, int dw, int dh, int R, int cols, int rows,
                              float lambda, Mv *out) {
-    __shared__ uint8_t win[kCoarseWarps][(8 + 2 * kCoarseMaxR) * (8 + 2 * kCoarseMaxR)];
-    __shared__ uint8_t blk[kCoarseWarps][64];
+    __shared__ __align__(16) uint8_t win[kCoarseWarps][kCoarseStride * (8 + 2 * kCoarseMaxR)];
+    __shared__ __align__(16) uint8_t blk[kCoarseWarps][64];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int b = blockIdx.x * kCoarseWarps + warp;
     if (b >= cols * rows) return;
     const int bx = b % cols, by = b / cols, x0 = bx * 8, y0 = by * 8;
-    const int ws = 8 + 2 * R;
+    const int ws = 8 + 2 * R, stride = ((ws + 3) & ~3) + 4;
     for (int i = lane; i < 64; i += 32)
         blk[warp][i] = cur[min(y0 + i / 8, dh - 1) * dw + min(x0 + i % 8, dw - 1)];
-    for (int i = lane; i < ws * ws; i += 32) {
-        const int r = i / ws, c = i - r * ws;
+    for (int i = lane; i < ws * stride; i += 32) {
+        const int r = i / stride, c = i - r * stride;
         win[warp][i] = ref[min(max(y0 - R + r, 0), dh - 1) * dw + min(max(x0 - R + c, 0), dw - 1)];
     }
     __syncwarp();
-    const int side = 2 * R + 1;
+    uint32_t q[16];
+    const uint32_t *b32 = reinterpret_cast<const uint32_t *>(blk[warp]);
+#pragma unroll
+    for (int i = 0; i < 16; i++) q[i] = b32[i];
+    const int side = 2 * R + 1, groups = (side + 3) >> 2, words = stride >> 2;
     float best = kInf;
     int bestIdx = R * side + R;
-    for (int k = lane; k < side * side; k += 32) {
-        const int dy = k / side, dx = k - dy * side;
-        int s = 0;
-        for (int r = 0; r < 8; r++)
-            for (int c = 0; c < 8; c++) s += abs((int)blk[warp][r * 8 + c] - (int)win[warp][(dy + r) * ws + dx + c]);
-        const float cost = (float)s + lambda * (float)(abs(dx - R) + abs(dy - R));
-        if (cost < best || (cost == best && k < bestIdx)) { best = cost; bestIdx = k; }
+    for (int k = lane; k < side * groups; k += 32) {
+        const int dy = k / groups, dx0 = (k - dy * groups) * 4;
+        const uint32_t *w = reinterpret_cast<const uint32_t *>(win[warp] + dy * stride + dx0);
+        int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t a = w[r * words], c = w[r * words + 1], e = w[r * words + 2];
+            s0 += __vsadu4(q[2 * r], a) + __vsadu4(q[2 * r + 1], c);
+            s1 += __vsadu4(q[2 * r], __funnelshift_r(a, c, 8)) + __vsadu4(q[2 * r + 1], __funnelshift_r(c, e, 8));
+            s2 += __vsadu4(q[2 * r], __funnelshift_r(a, c, 16)) + __vsadu4(q[2 * r + 1], __funnelshift_r(c, e, 16));
+            s3 += __vsadu4(q[2 * r], __funnelshift_r(a, c, 24)) + __vsadu4(q[2 * r + 1], __funnelshift_r(c, e, 24));
+        }
+        const int sads[4] = {s0, s1, s2, s3};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int dx = dx0 + j;
+            if (dx >= side) break;
+            const float cost = (float)sads[j] + lambda * (float)(abs(dx - R) + abs(dy - R));
+            const int idx = dy * side + dx;
+            if (cost < best || (cost == best && idx < bestIdx)) { best = cost; bestIdx = idx; }
+        }
     }
     for (int o = 16; o; o >>= 1) {
         const float ob = __shfl_xor_sync(0xffffffffu, best, o);
@@ -2145,26 +2166,48 @@ __global__ void packTiles(const uint8_t *out, size_t capPerTile, const int *size
 
 // ------------------------------------------------------------------------------------------------
 // Temporal filter (ALTREF source denoising). One CTA per 16x16 luma block: for every neighbour frame, a full-pel search
-// of +-kTfRange around the coarse vector, then the motion-compensated samples are blended with weights from the
-// block error relative to the quantizer step.
-constexpr int kTfMax = 8, kTfRange = 6, kTfWin = 16 + 2 * kTfRange;
+// of +-kTfRange around the coarse vector refined to quarter-pel (8-tap regular filter; integer alignment blurs fine
+// texture), then the motion-compensated samples are blended with non-local-means weights
+// as in libaom: exp(-(5 * window error + block error) / 120 / decay), the window error being the mean squared
+// difference over the 5x5 window of the pixel (inside the block), decay = (0.5 + ln(2 sigma + 5)) * q decay * strength
+// with sigma the estimated noise of the centre frame and the q decay from the inter-frame quantizer.
+constexpr int kTfMax = 8, kTfRange = 6, kTfPad = 4, kTfWin = 16 + 2 * (kTfRange + kTfPad);
 struct TfArgs {
     const uint8_t *center[3];
     const uint8_t *nb[kTfMax][3];
     const Mv *coarse[kTfMax];
     int count, w, h, aw, ccols, crows;
-    float step2;   // (quantizer step)^2 in sample units, times the strength
-    float stepPix; // quantizer step in sample units
+    const unsigned long long *noise;   // luma noise estimate: sum of |Laplacian| over flat pixels, pixel count
+    float qDecay, strength;
     uint8_t *out[3];
 };
+// libaom av1_estimate_noise_from_single_plane: mean |3x3 Laplacian| over pixels whose Sobel gradient is below 50.
+__global__ void estimateNoise(const uint8_t *p, int pitch, int w, int h, unsigned long long *out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x + 1, y = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    unsigned v = 0, n = 0;
+    if (x < w - 1 && y < h - 1) {
+        const uint8_t *c = p + size_t(y) * pitch + x;
+        const int gx = (c[-pitch - 1] - c[-pitch + 1]) + (c[pitch - 1] - c[pitch + 1]) + 2 * (c[-1] - c[1]);
+        const int gy = (c[-pitch - 1] - c[pitch - 1]) + (c[-pitch + 1] - c[pitch + 1]) + 2 * (c[-pitch] - c[pitch]);
+        if (abs(gx) + abs(gy) < 50) {
+            v = abs(4 * c[0] - 2 * (c[-1] + c[1] + c[-pitch] + c[pitch]) +
+                    (c[-pitch - 1] + c[-pitch + 1] + c[pitch - 1] + c[pitch + 1]));
+            n = 1;
+        }
+    }
+    for (int o = 16; o; o >>= 1) { v += __shfl_xor_sync(0xffffffffu, v, o); n += __shfl_xor_sync(0xffffffffu, n, o); }
+    if ((threadIdx.x & 31) == 0 && n) { atomicAdd(out, (unsigned long long)v); atomicAdd(out + 1, (unsigned long long)n); }
+}
 __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
     __shared__ uint8_t cur[256];
     __shared__ uint8_t win[kTfWin * kTfWin];
     __shared__ int sads[(2 * kTfRange + 1) * (2 * kTfRange + 1)];
-    __shared__ float wsum[256], acc[256];
+    __shared__ float wsum[256], acc[256], wl[256];
+    __shared__ int d2[256];
     __shared__ float cw[2][64], cacc[2][64];
-    __shared__ int bestOff;
-    __shared__ float blockW;
+    __shared__ int bestOff, bestSub;
+    __shared__ float blockMse;
+    __shared__ int subSad[8];
     __shared__ float warpE[8];
     const int t = threadIdx.x;
     const int bx = blockIdx.x * 16, by = blockIdx.y * 16;
@@ -2181,6 +2224,13 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
             cacc[p][t] = a.center[1 + p][uy * caw + ux];
         }
     }
+    float decay;
+    {
+        const double sum = (double)a.noise[0], cnt = (double)a.noise[1];
+        const float sigma = cnt >= 16 ? (float)(sum / (6.0 * cnt) * 1.25331413731550025) : 0.f;   // sqrt(pi / 2)
+        decay = (0.5f + logf(2.f * sigma + 5.f)) * a.qDecay * a.strength;
+    }
+    const float inv = 1.f / (120.f * decay);
     __syncthreads();
     const int side = 2 * kTfRange + 1;
     for (int j = 0; j < a.count; j++) {
@@ -2189,7 +2239,8 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
         const uint8_t *ny = a.nb[j][0];
         for (int i = t; i < kTfWin * kTfWin; i += 256) {
             const int r = i / kTfWin, c = i % kTfWin;
-            const int x = min(max(bx + mx - kTfRange + c, 0), a.w - 1), y = min(max(by + my - kTfRange + r, 0), a.h - 1);
+            const int x = min(max(bx + mx - kTfRange - kTfPad + c, 0), a.w - 1);
+            const int y = min(max(by + my - kTfRange - kTfPad + r, 0), a.h - 1);
             win[i] = ny[y * a.aw + x];
         }
         __syncthreads();
@@ -2197,7 +2248,8 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
             const int oy = t / side, ox = t % side;
             int s = 0;
             for (int r = 0; r < 16; r++)
-                for (int c = 0; c < 16; c++) s += abs((int)cur[r * 16 + c] - (int)win[(oy + r) * kTfWin + ox + c]);
+                for (int c = 0; c < 16; c++)
+                    s += abs((int)cur[r * 16 + c] - (int)win[(kTfPad + oy + r) * kTfWin + kTfPad + ox + c]);
             sads[t] = s;
         }
         __syncthreads();
@@ -2210,8 +2262,40 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
         }
         __syncthreads();
         const int oy = bestOff / side, ox = bestOff % side;
-        const int d = (int)cur[t] - (int)win[(oy + (t >> 4)) * kTfWin + ox + (t & 15)];
-        // block mean squared error
+        // quarter-pel refinement: half-pel ring, then quarter-pel ring around the best (1/16 units)
+        const int r0p = t >> 4, c0p = t & 15;
+        auto predAt = [&](int y16, int x16) {   // window position of the block origin, 1/16 sample units
+            const int iy = (y16 >> 4) + r0p, ix = (x16 >> 4) + c0p, fy = y16 & 15, fx = x16 & 15;
+            int v = 0;
+            for (int r = 0; r < 8; r++) {
+                const uint8_t *row = win + (iy + r - 3) * kTfWin + ix - 3;
+                int hsum = 0;
+                for (int c = 0; c < 8; c++) hsum += c_filter[0][fx][c] * row[c];
+                v += c_filter[0][fy][r] * hsum;
+            }
+            return min(max((v + 8192) >> 14, 0), 255);
+        };
+        int by16 = (kTfPad + oy) * 16, bx16 = (kTfPad + ox) * 16;
+        for (int step = 8; step >= 4; step >>= 1) {
+            int best = 0, bestS = 0;
+            for (int k = 0; k <= 8; k++) {
+                const int dy = (k / 3 - 1) * step, dx = (k % 3 - 1) * step;
+                int s;
+                int e = abs((int)cur[t] - predAt(by16 + dy, bx16 + dx));
+                for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+                if ((t & 31) == 0) subSad[t >> 5] = e;
+                __syncthreads();
+                s = 0;
+                for (int w8 = 0; w8 < 8; w8++) s += subSad[w8];
+                __syncthreads();
+                if (k == 0 || s < bestS) { bestS = s; best = k; }
+            }
+            by16 += (best / 3 - 1) * step;
+            bx16 += (best % 3 - 1) * step;
+        }
+        const int nv = predAt(by16, bx16);
+        const int d = (int)cur[t] - nv;
+        d2[t] = d * d;
         float e = (float)(d * d);
         for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
         if ((t & 31) == 0) warpE[t >> 5] = e;
@@ -2219,23 +2303,37 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
         if (t == 0) {
             float tot = 0.f;
             for (int k = 0; k < 8; k++) tot += warpE[k];
-            const float mse = tot / 256.f;
-            blockW = __expf(-mse / (2.f * a.step2));
+            blockMse = tot / 256.f;
         }
         __syncthreads();
-        // pixel weight: reject clear mismatches
-        const float wpix = fabsf((float)d) > 3.f * a.stepPix + 2.f ? 0.f : blockW;
-        acc[t] += wpix * (float)win[(oy + (t >> 4)) * kTfWin + ox + (t & 15)];
+        // 5x5 window error inside the block
+        const int r0 = t >> 4, c0 = t & 15;
+        int we = 0, wn = 0;
+        for (int r = max(r0 - 2, 0); r <= min(r0 + 2, 15); r++)
+            for (int c = max(c0 - 2, 0); c <= min(c0 + 2, 15); c++) { we += d2[r * 16 + c]; wn++; }
+        const float wpix = __expf(-fminf(7.f, (5.f * (float)we / (float)wn + blockMse) * inv));
+        wl[t] = wpix;
+        acc[t] += wpix * (float)nv;
         wsum[t] += wpix;
+        __syncthreads();
         if (t < 64) {
-            const int dx = mx - kTfRange + ox, dy = my - kTfRange + oy;   // full-pel luma displacement
+            // luma displacement in 1/16 samples = chroma displacement in 1/32: use the 1/16 phase of half of it
+            const int dy16 = (my - kTfRange - kTfPad) * 16 + by16, dx16 = (mx - kTfRange - kTfPad) * 16 + bx16;
+            const int cy16 = dy16 >> 1, cx16 = dx16 >> 1;
             const int ux = bx / 2 + (t & 7), uy = by / 2 + (t >> 3);
-            const int sx = min(max(ux + (dx >> 1), 0), cw2 - 1), sy = min(max(uy + (dy >> 1), 0), ch2 - 1);
-            const int uxc = min(ux, cw2 - 1), uyc = min(uy, ch2 - 1);
+            const int iy = uy + (cy16 >> 4), ix = ux + (cx16 >> 4), fy = cy16 & 15, fx = cx16 & 15;
+            const int l = (t >> 3) * 32 + (t & 7) * 2;   // top-left of the colocated 2x2 luma samples
+            const float wc = 0.25f * (wl[l] + wl[l + 1] + wl[l + 16] + wl[l + 17]);
             for (int p = 0; p < 2; p++) {
-                const int v = a.nb[j][1 + p][sy * caw + sx];
-                const int c0 = a.center[1 + p][uyc * caw + uxc];
-                const float wc = fabsf((float)(c0 - v)) > 3.f * a.stepPix + 2.f ? 0.f : blockW;
+                const uint8_t *pl = a.nb[j][1 + p];
+                int v = 0;
+                for (int r = 0; r < 8; r++) {
+                    const int yy = min(max(iy + r - 3, 0), ch2 - 1);
+                    int hsum = 0;
+                    for (int c = 0; c < 8; c++) hsum += c_filter[0][fx][c] * pl[yy * caw + min(max(ix + c - 3, 0), cw2 - 1)];
+                    v += c_filter[0][fy][r] * hsum;
+                }
+                v = min(max((v + 8192) >> 14, 0), 255);
                 cacc[p][t] += wc * v;
                 cw[p][t] += wc;
             }
@@ -2321,7 +2419,7 @@ struct State {
     // mode refinement trials: the per-shape evaluations are independent and mostly latency bound, so they run
     // concurrently, one stream per shape (forked from and joined into the compute stream)
     cudaStream_t shapeStream[kShapes] = {};
-    cudaEvent_t trialFork = nullptr, trialJoin[kShapes] = {};
+    cudaEvent_t trialFork = nullptr, trialJoin[kShapes] = {}, sqDone[kSizes] = {};
     float *lrCoef = nullptr; int8_t *lrQ = nullptr; unsigned long long *lrSse = nullptr; uint8_t *lrOut = nullptr;
     int lrUnitRows = 1, lrUnitCols = 1;
     unsigned long long *sse = nullptr;
@@ -2350,6 +2448,7 @@ struct State {
     EntropySlot eslot[kEntropySlots];
     uint8_t *tfDs[kTfMax + 1] = {};
     Mv *tfCoarse[kTfMax] = {};
+    unsigned long long *tfNoise = nullptr;
     int16_t *hphase = nullptr;
     uint8_t *phases[kMaxRefs] = {};
     bool profile = false;
@@ -2430,6 +2529,7 @@ Analyzer::~Analyzer() {
     for (auto stream : s->shapeStream) if (stream) cudaStreamDestroy(stream);
     for (auto event : s->trialJoin) if (event) cudaEventDestroy(event);
     if (s->trialFork) cudaEventDestroy(s->trialFork);
+    for (auto event : s->sqDone) if (event) cudaEventDestroy(event);
     cudaFree(s->cdefOut);
     cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
@@ -2451,6 +2551,7 @@ Analyzer::~Analyzer() {
     for (int p = 0; p < 3; p++) { cudaFree(s->ctxLevel[p]); cudaFree(s->ctxDc[p]); }
     for (auto *p : s->tfDs) cudaFree(p);
     for (auto *p : s->tfCoarse) cudaFree(p);
+    cudaFree(s->tfNoise);
     for (auto *p : s->best) cudaFree(p);
     for (auto *p : s->mode) cudaFree(p);
     for (auto *p : s->phases) cudaFree(p);
@@ -2487,6 +2588,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
     for (auto *&p : s->coarse) alloc(&p, sizeof(Mv) * s->ccols * s->crows);
     for (auto *&p : s->tfDs) alloc(&p, size_t(s->dw) * s->dh);
     for (auto *&p : s->tfCoarse) alloc(&p, sizeof(Mv) * s->ccols * s->crows);
+    alloc(&s->tfNoise, 2 * sizeof(unsigned long long));
     const size_t frame = size_t(w) * h * 3 / 2, aframe = size_t(aw) * ah * 3 / 2;
     for (int k = 0; k < kSizes; k++) {
         const int n = 8 << k;
@@ -2645,6 +2747,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
     if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->motionGridReady, cudaEventDisableTiming);
     if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->mfUploaded, cudaEventDisableTiming);
     if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->trialFork, cudaEventDisableTiming);
+    for (int k = 0; k < kSizes; k++)
+        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->sqDone[k], cudaEventDisableTiming);
     for (int k = 0; k < kShapes; k++) {
         if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&s->shapeStream[k], cudaStreamNonBlocking);
         if (e == cudaSuccess) e = cudaEventCreateWithFlags(&s->trialJoin[k], cudaEventDisableTiming);
@@ -2773,10 +2877,6 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.trialCount = s->modeCounts + (K); ea.trialIndices = s->modeIndices[K];                                 \
     { FineTimer t(ea.trials ? "mode trial " #N "x" #N : "evaluate " #N "x" #N);                                      \
       launchEvaluation<N, N>(ea, splitExternal, stream, "eval whole " #N, "eval split " #N, "eval final " #N); }
-    PF_EVAL(0, 8);
-    PF_EVAL(1, 16);
-    PF_EVAL(2, 32);
-    PF_EVAL(3, 64);
 #define PF_REVAL(RK, BW, BH)                                                                                  \
     ea.cand = s->rcand[RK]; ea.cols = s->rcols[RK]; ea.rows = s->rrows[RK];                                 \
     ea.pred = s->rpred[RK]; ea.recon = s->rrecon[RK]; ea.levels = s->rlevels[RK];                              \
@@ -2792,12 +2892,30 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     PF_REVAL(0, 16, 8); PF_REVAL(1, 8, 16); PF_REVAL(2, 32, 16); PF_REVAL(3, 16, 32);                           \
     PF_REVAL(4, 64, 32); PF_REVAL(5, 32, 64); PF_REVAL(6, 32, 8); PF_REVAL(7, 8, 32);                            \
     PF_REVAL(8, 64, 16); PF_REVAL(9, 16, 64)
+    // The four square evaluations run concurrently, one stream each (they are latency bound and write per-shape
+    // buffers only); the rectangular searches of a square size (pruning, refinement, choice, evaluation) follow that
+    // size's square evaluation on one stream per rectangle. Everything joins the compute stream before the decision.
+    {
+        cudaError_t fe = cudaEventRecord(s->trialFork, stream);
+        for (int k = 0; fe == cudaSuccess && k < kShapes; k++) fe = cudaStreamWaitEvent(s->shapeStream[k], s->trialFork, 0);
+        if (fe != cudaSuccess) {
+            snprintf(err, errLen, "P-frame evaluation fork: %s", cudaGetErrorString(fe));
+            return -1;
+        }
+    }
+#define PF_ON(K, BODY) { const cudaStream_t stream = s->shapeStream[K]; BODY; }
+    PF_ON(3, PF_EVAL(3, 64));
+    PF_ON(2, PF_EVAL(2, 32));
+    PF_ON(1, PF_EVAL(1, 16));
+    PF_ON(0, PF_EVAL(0, 8));
+    for (int K = 1; K < kSizes; K++) cudaEventRecord(s->sqDone[K], s->shapeStream[K]);
     if (st.rectPartitions) {
         for (int k = 0; k < 10; k++) {
             const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;
             const int n = 8 << K, div = k < 6 ? 2 : 4;
             const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
-            pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128, 0, stream>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
+            cudaStreamWaitEvent(s->shapeStream[4 + k], s->sqDone[K], 0);
+            pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128, 0, s->shapeStream[4 + k]>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
                                                                      s->cand[K], s->cols[K], n, st.pruneRect,
                                                                      getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
         }
@@ -2805,7 +2923,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         #define PF_RREFINE(RK, K, BW, BH)                                                                               \
             { FineTimer ft_("refine " #BW "x" #BH);                                                                     \
             refine<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),   \
-                             32 * RefineCfg<BW, BH>::warps, 0, stream>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,          \
+                             32 * RefineCfg<BW, BH>::warps, 0, s->shapeStream[4 + (RK)]>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows, \
                                                               s->cand[K], s->cols[K], 8 << K, temporal, s->gcols,            \
                                                               s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad, true); }
                 {
@@ -2819,14 +2937,29 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 
         }
     {
-        PF_CHOOSE(s->rcand[0], s->rcols[0], s->rrows[0], 16, 8); PF_CHOOSE(s->rcand[1], s->rcols[1], s->rrows[1], 8, 16);
-        PF_CHOOSE(s->rcand[2], s->rcols[2], s->rrows[2], 32, 16); PF_CHOOSE(s->rcand[3], s->rcols[3], s->rrows[3], 16, 32);
-        PF_CHOOSE(s->rcand[4], s->rcols[4], s->rrows[4], 64, 32); PF_CHOOSE(s->rcand[5], s->rcols[5], s->rrows[5], 32, 64);
-        PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8); PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32);
-        PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16); PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64);
+        PF_ON(4, PF_CHOOSE(s->rcand[0], s->rcols[0], s->rrows[0], 16, 8)); PF_ON(5, PF_CHOOSE(s->rcand[1], s->rcols[1], s->rrows[1], 8, 16));
+        PF_ON(6, PF_CHOOSE(s->rcand[2], s->rcols[2], s->rrows[2], 32, 16)); PF_ON(7, PF_CHOOSE(s->rcand[3], s->rcols[3], s->rrows[3], 16, 32));
+        PF_ON(8, PF_CHOOSE(s->rcand[4], s->rcols[4], s->rrows[4], 64, 32)); PF_ON(9, PF_CHOOSE(s->rcand[5], s->rcols[5], s->rrows[5], 32, 64));
+        PF_ON(10, PF_CHOOSE(s->rcand[6], s->rcols[6], s->rrows[6], 32, 8)); PF_ON(11, PF_CHOOSE(s->rcand[7], s->rcols[7], s->rrows[7], 8, 32));
+        PF_ON(12, PF_CHOOSE(s->rcand[8], s->rcols[8], s->rrows[8], 64, 16)); PF_ON(13, PF_CHOOSE(s->rcand[9], s->rcols[9], s->rrows[9], 16, 64));
     }
-    { PF_EVAL_RECTS(); }
+    PF_ON(4, PF_REVAL(0, 16, 8)); PF_ON(5, PF_REVAL(1, 8, 16)); PF_ON(6, PF_REVAL(2, 32, 16)); PF_ON(7, PF_REVAL(3, 16, 32));
+    PF_ON(8, PF_REVAL(4, 64, 32)); PF_ON(9, PF_REVAL(5, 32, 64)); PF_ON(10, PF_REVAL(6, 32, 8)); PF_ON(11, PF_REVAL(7, 8, 32));
+    PF_ON(12, PF_REVAL(8, 64, 16)); PF_ON(13, PF_REVAL(9, 16, 64));
     }
+    {
+        const int nShapes = st.rectPartitions ? kShapes : kSizes;
+        cudaError_t je = cudaSuccess;
+        for (int k = 0; je == cudaSuccess && k < nShapes; k++) {
+            je = cudaEventRecord(s->trialJoin[k], s->shapeStream[k]);
+            if (je == cudaSuccess) je = cudaStreamWaitEvent(stream, s->trialJoin[k], 0);
+        }
+        if (je != cudaSuccess) {
+            snprintf(err, errLen, "P-frame evaluation join: %s", cudaGetErrorString(je));
+            return -1;
+        }
+    }
+#undef PF_ON
 #undef PF_CHOOSE
     mark(3);
     DecideArgs da{};
@@ -3434,9 +3567,13 @@ int Analyzer::temporalFilter(const uint8_t *const center[3], const uint8_t *cons
     }
     for (int p = 0; p < 3; p++) { a.center[p] = center[p]; a.out[p] = out[p]; }
     a.count = count; a.w = w; a.h = h; a.aw = aw; a.ccols = s->ccols; a.crows = s->crows;
-    const float step = av1g_ac_q(qindex) / 8.f;
-    a.stepPix = step;
-    a.step2 = std::max(1.f, step * step * strength);
+    cudaMemsetAsync(s->tfNoise, 0, 2 * sizeof(unsigned long long), s->compute);
+    estimateNoise<<<dim3((w + 29) / 32, (h + 5) / 8), dim3(32, 8), 0, s->compute>>>(center[0], aw, w, h, s->tfNoise);
+    a.noise = s->tfNoise;
+    // libaom: q factor = ac quantizer / 4 of the inter frames; full strength from 20, weaker below
+    const float qf = av1g_ac_q(qindex) / 4.f;
+    a.qDecay = qf >= 128.f ? 0.5f * (qf / 64.f) * (qf / 64.f) : std::min(1.f, std::max(1e-5f, (qf / 20.f) * (qf / 20.f)));
+    a.strength = strength;
     temporalFilterKernel<<<dim3((w + 15) / 16, (h + 15) / 16), 256, 0, s->compute>>>(a);
     for (int p = 0; p < 3; p++) {
         const int pw = p ? w / 2 : w, phh = p ? h / 2 : h, pitch = p ? aw / 2 : aw, pah = p ? ah / 2 : ah;

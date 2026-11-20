@@ -164,7 +164,7 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters] [--kf-tiles MIN_MP,C,R | 0]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -214,7 +214,19 @@ int main(int argc, char **argv) {
     GpConfig cfg;
     cfg.qindex = 100;
     bool kfPresetSet = false;
+    float kfTileMp = 2.f;
+    int kfTileC = 2, kfTileR = 2;
     for (int i = 6; i < argc; ++i) {
+        if (!strcmp(argv[i], "--kf-tiles") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "0")) kfTileMp = 0.f;
+            else if (sscanf(v, "%f,%d,%d", &kfTileMp, &kfTileC, &kfTileR) != 3 || kfTileMp <= 0 || kfTileC < 0 ||
+                     kfTileC > 6 || kfTileR < 0 || kfTileR > 6) {
+                fprintf(stderr, "--kf-tiles takes MIN_MP,C,R (log2 tile columns / rows 0..6) or 0\n");
+                return 2;
+            }
+            continue;
+        }
         if (!strcmp(argv[i], "--kf-preset") && i + 1 < argc) {
             if (!apply_preset(cfg, argv[++i])) { fprintf(stderr, "unknown --kf-preset\n"); return 2; }
             kfPresetSet = true;
@@ -558,6 +570,11 @@ int main(int argc, char **argv) {
     GpEncoder encoder;
     std::string err;
     if (usePframes && !kfPresetSet) apply_preset(cfg, "slow");   // key frames carry much of the quality (--kf-preset)
+    if (usePframes && kfTileMp > 0) {
+        // key frames of at least kfTileMp megapixels use 2^C x 2^R tiles: independent intra wavefronts and entropy
+        // coders (one tile reconstructs at most one superblock diagonal at a time)
+        cfg.tileMinMp = kfTileMp; cfg.tileColsLog2 = kfTileC; cfg.tileRowsLog2 = kfTileR;
+    }
     if (usePframes && !pfFilters) cfg.fCdef = 0;   // enable_cdef follows the inter frames (they code no CDEF params)
     if (usePframes && pfFilters) {
         // keyframes: deblocking and CDEF searches; enable_cdef = 1 in the sequence header lets P frames use CDEF
@@ -732,6 +749,10 @@ int main(int argc, char **argv) {
                         const cudaError_t e = cudaEventSynchronize(buf.ready);
                         if (e != cudaSuccess) snprintf(werr, sizeof werr, "CPU entropy download: %s", cudaGetErrorString(e));
                         ok = e == cudaSuccess && !hostEntropy.code(job.ein, buf.grid, buf.levels, eout, werr, sizeof werr);
+                        if (ok && getenv("AV1GPU_PF_DUMP_GRID")) {   // debug: decision grid of each coded frame
+                            static FILE *gf = fopen(getenv("AV1GPU_PF_DUMP_GRID"), "wb");
+                            if (gf) fwrite(buf.grid, sizeof(pf::BlockInfo), pfAnalyzer.gridCount(), gf);
+                        }
                         {
                             std::lock_guard<std::mutex> lock(mtx);
                             freeBufs.push_back(job.buf);
@@ -1215,7 +1236,7 @@ int main(int argc, char **argv) {
                     const uint8_t *const center[3] = {inBuf[n - 1][0], inBuf[n - 1][1], inBuf[n - 1][2]};
                     const uint8_t *const *nbp[3] = {nbs[0].data(), nbs[1].data(), nbs[2].data()};
                     uint8_t *const outp[3] = {tfBuf[0], tfBuf[1], tfBuf[2]};
-                    if (pfAnalyzer.temporalFilter(center, nbp, int(nbs[0].size()), std::max(1, pfSettings.qindex - pfAltrefBoost),
+                    if (pfAnalyzer.temporalFilter(center, nbp, int(nbs[0].size()), pfSettings.qindex,
                                                   pfTfStrength, outp, perr, sizeof perr)) {
                         fprintf(stderr, "%s\n", perr);
                         return 1;
