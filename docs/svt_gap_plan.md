@@ -311,3 +311,25 @@ libaom equal to the encoder reconstruction.
 - Verified: both suites (plus a single-pass case), repeated runs identical, a full 120-frame video_2 stream decoded
   by dav1d equal to the encoder reconstruction.
 
+### Where the remaining video_2 gap is (after 6 refinement passes)
+
+- Key frames are not the problem: on seven scene frames of video_2 coded all-intra, the base intra encoder is +1.3%
+  BD-rate against SVT-AV1 preset 8 forced to `keyint=1`. Key frames are 15% of our q50 stream (cuts at 5, 10, 17, 23).
+- Per segment against SVT CRF 32 (similar PSNR): the cut-heavy frames 0-22 are close (31% more bytes at +0.8 dB);
+  the long handheld concert shot 23-119 (dark, noisy) takes 15% more bytes at 0.5 dB lower luma PSNR. SVT codes it
+  with 16-frame mini-GOPs although configured for 32.
+- Bit split at q50: coefficients 77.5%, MV 9.2%, modes / partition 11.5%; NEWMV 29% of inter blocks (56% with one
+  pass).
+- Rechecked on video_2 (all tuned on video_1 before): ALTREF temporal filter 2 / 4 frames +37.2% / +37.8% (worse than
+  +34.6%), `--pf-rdoq` +34.8%, `--pf-lambda` 0.5 +33.8% and 1.0 +37.6%, `--pf-altref-boost 80` +35.8%,
+  `--pf-switchable` +33.6% (video_1 +8.0% against +7.9%; costs 7% fps, so still off), `--pf-gop 16` +34.2%,
+  `--pf-gop 8` +33.5%.
+
+### Motion-adaptive mini-GOP length
+
+- With `--pf-adaptive` (default), a mini-GOP is cut to 16 frames when the block-mean motion of the next eight frames
+  from the anchor is at least 0.7, and to 8 frames from 1.0 (`AV1GPU_PF_GOP16` / `AV1GPU_PF_GOP8` override the
+  thresholds). video_1 measures about 0.05 (rising to 0.4-0.56 late in the clip, where 0.3 / 0.8 thresholds made it
+  +9.8%), video_2's long shot about 1.0-1.6.
+- video_2 +34.6% → +33.6% against SVT-AV1 preset 8 (+37.9% against libaom), video_1 unchanged at +7.9%; fps unchanged.
+

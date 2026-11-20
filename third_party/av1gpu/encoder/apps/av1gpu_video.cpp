@@ -164,7 +164,7 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -195,6 +195,9 @@ int main(int argc, char **argv) {
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
+    // --pf-adaptive: mini-GOP length 16 / 8 from this block-mean motion of the next eight frames
+    const double gopMotion16 = getenv("AV1GPU_PF_GOP16") ? atof(getenv("AV1GPU_PF_GOP16")) : 0.7;
+    const double gopMotion8 = getenv("AV1GPU_PF_GOP8") ? atof(getenv("AV1GPU_PF_GOP8")) : 1.0;
     uint64_t pfCuts = 0;
     double pfSceneCut = 15.0;
     int pfCutQoffset = 60;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
@@ -352,6 +355,8 @@ int main(int argc, char **argv) {
             pfSettings.pruneRect = false;
         } else if (!strcmp(argv[i], "--pf-switchable")) {
             pfSettings.switchableFilter = true;
+        } else if (!strcmp(argv[i], "--pf-no-switchable")) {
+            pfSettings.switchableFilter = false;
         } else if (!strcmp(argv[i], "--pf-no-tx-types")) {
             pfSettings.txTypes = 0;
         } else if (!strcmp(argv[i], "--pf-tx-types-reduced")) {
@@ -1154,6 +1159,13 @@ int main(int argc, char **argv) {
             size_t g = std::min<size_t>(G, untilKey);
             readMore(g + pfTfFrames);
             g = std::max<size_t>(1, firstCut(std::min(g, pending.size())));   // end the mini-GOP before a cut
+            if (pfAdaptive && !prevFrame.empty() && g > 8 && pending.size() > 1) {
+                // moving content: shorter mini-GOPs (distant references predict poorly); measured over the next
+                // eight frames from the anchor
+                const double m = motionOf(&prevFrame, 0, std::min<size_t>(7, pending.size() - 1));
+                if (m >= gopMotion8) g = 8;
+                else if (m >= gopMotion16) g = std::min<size_t>(g, 16);
+            }
             const size_t n = std::min(g, pending.size());
             if (n == 1) {
                 // single P frame from the last shown picture
