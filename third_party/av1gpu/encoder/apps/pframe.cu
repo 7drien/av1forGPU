@@ -624,6 +624,19 @@ __global__ void pruneRect(Cand *rc, int rcols, int rrows, int bw, int bh, const 
     const Cand &p = parent[(y0 / n) * pcols + x0 / n];
     rc[b].pruned = enabled && !(p.nz && p.costCoded < p.costSkip * margin);
 }
+// Square children (n x n inside a 2n x 2n parent) are searched only when the parent is not a clear skip:
+// same rule as pruneRect. A pruned parent prunes its children; a parent crossing the frame edge (which must split)
+// never prunes them.
+__global__ void pruneSquare(Cand *cc, int ccols, int crows, int n, const Cand *parent, int pcols, int w, int h,
+                            float margin) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= ccols * crows) return;
+    const int x0 = (b % ccols) * n, y0 = (b / ccols) * n;
+    const int px = x0 / (2 * n) * (2 * n), py = y0 / (2 * n) * (2 * n);
+    const Cand &p = parent[(py / (2 * n)) * pcols + px / (2 * n)];
+    const bool mustSplit = px + n >= w || py + n >= h;
+    cc[b].pruned = margin > 0.f && !mustSplit && (p.pruned || !(p.nz && p.costCoded < p.costSkip * margin));
+}
 template <int BW, int BH>
 struct EvalCfg {
     static constexpr int warps = BW * BH >= 1024 ? 1 : BW * BH >= 256 ? 2 : 4;
@@ -773,7 +786,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     const int b = a.blockIndex(slot);
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     Cand &c = *a.candidate(b, x0, y0);
-    if (BW != BH && c.pruned) {
+    if (c.pruned) {
         if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; c.filter = 0; }
         return;
     }
@@ -1152,7 +1165,7 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     const Cand &c = *a.candidate(b, x0, y0);
-    if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
+    if (x0 >= f.w || y0 >= f.h || c.pruned) return;
     if (dsel == 2) {
         float d1 = 0.f, r1 = 0.f;
         for (int j = 0; j < 4; j++) { d1 += a.subD[size_t(b) * NSUB + j]; r1 += a.subR[size_t(b) * NSUB + j]; }
@@ -1251,7 +1264,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     Cand &c = *a.candidate(b, x0, y0);
-    if (x0 >= f.w || y0 >= f.h || (!G::sq && c.pruned)) return;
+    if (x0 >= f.w || y0 >= f.h || c.pruned) return;
     float splitD[3] = {kInf, 0.f, 0.f}, splitBits[3] = {0.f, 0.f, 0.f};
     bool nzSplit[3] = {false, false, false};
     for (int k = 0; k < NSUB; k++) {
@@ -2904,11 +2917,23 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
     }
 #define PF_ON(K, BODY) { const cudaStream_t stream = s->shapeStream[K]; BODY; }
-    PF_ON(3, PF_EVAL(3, 64));
-    PF_ON(2, PF_EVAL(2, 32));
-    PF_ON(1, PF_EVAL(1, 16));
-    PF_ON(0, PF_EVAL(0, 8));
-    for (int K = 1; K < kSizes; K++) cudaEventRecord(s->sqDone[K], s->shapeStream[K]);
+    // square pruning (Settings::squarePrune margin, AV1GPU_PF_SQPRUNE overrides, 0 off): sizes in order
+    // 64 -> 32 -> 16 -> 8, each size's children pruned from its result; otherwise the four sizes run concurrently
+    // (every square block searched)
+    const float sqMargin = getenv("AV1GPU_PF_SQPRUNE") ? (float)atof(getenv("AV1GPU_PF_SQPRUNE")) : st.squarePrune;
+    for (int K = kSizes - 1; K >= 0; K--) {
+        const cudaStream_t ks = s->shapeStream[K];
+        if (K < kSizes - 1) {
+            if (sqMargin > 0.f) cudaStreamWaitEvent(ks, s->sqDone[K + 1], 0);
+            pruneSquare<<<(s->cols[K] * s->rows[K] + 127) / 128, 128, 0, ks>>>(s->cand[K], s->cols[K], s->rows[K], 8 << K,
+                                                                           s->cand[K + 1], s->cols[K + 1], w, h, sqMargin);
+        }
+        if (K == 3) PF_ON(3, PF_EVAL(3, 64));
+        if (K == 2) PF_ON(2, PF_EVAL(2, 32));
+        if (K == 1) PF_ON(1, PF_EVAL(1, 16));
+        if (K == 0) PF_ON(0, PF_EVAL(0, 8));
+        cudaEventRecord(s->sqDone[K], ks);
+    }
     if (st.rectPartitions) {
         for (int k = 0; k < 10; k++) {
             const int K = k < 6 ? k / 2 + 1 : (k - 6) / 2 + 2;

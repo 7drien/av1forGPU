@@ -380,3 +380,22 @@ GPU time: evaluation 48-55%, motion search 25%, key-frame encoder 20-25%, filter
 - Both together, byte-identical on video_1 / 2 / 3 / 4: video_2 q20 14.3 → 17.2 fps, q90 17.1 → 20.7, video_1 q50
   22.4 → 27.0 (+21%); 4K (video_3, video_4 q50) 5.6 → 6.1 (+9%: 4K kernels already fill the GPU).
 
+### Square-children pruning on moving content
+
+- Rectangles were already skipped when their square node clearly prefers skip (`pruneRect`). The same rule now
+  applies to square children: sizes are evaluated 64 -> 32 -> 16 -> 8 and a child is searched only when its parent
+  codes a residual and its coded cost is below the skip cost times the margin (a pruned parent prunes its children;
+  a parent crossing the frame edge, which must split, never does).
+- Always on (margin 1): five-clip mean +19.4% → +20.3%, but video_1 +8.6% → +17.9% (static content loses 0.3 to
+  0.75 dB: detail is refined in small blocks over frames; a limit on the parent's skip distortion did not help, even
+  0.002 squared quantizer steps per sample gave +11.1%), while the moving clips improved (video_3 +69.5% → +66.3%,
+  video_4 -11.3% → -12.3%, video_5 -3.6% → -4.3%) and ran 11 to 31% faster. Margin 2: similar (+20.6%).
+- Enabled only for mini-GOPs whose motion (block-mean difference, as `--pf-adaptive`) is at least 0.6 (video_1 at most
+  0.3; video_5 0.72; video_2 / 3 / 4 up to 6-10). `--pf-square-prune M` forces a margin (0: off).
+- Five clips: video_1 +8.6% (unchanged), video_2 +33.8%, video_3 +66.3%, video_4 -13.2%, video_5 -4.3%; mean
+  +19.4% → +18.2%. fps: video_2 20.4, video_3 7.7, video_4 6.7, video_5 21.0 (the machine was rebooted between
+  runs with a new kernel and driver, and identical encodes now run about 15% faster, so the speed gain is measured
+  only within one session: margin-1 pruning +11% to +31%).
+- The gains on moving clips mean the decision favours splitting too much there: children win the cost comparison
+  but lose in BD-rate, so their side-information cost is probably underestimated.
+

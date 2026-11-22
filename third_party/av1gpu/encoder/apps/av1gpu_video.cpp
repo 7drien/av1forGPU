@@ -164,7 +164,7 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-no-filters] [--kf-tiles MIN_MP,C,R | 0]]\n");
+        fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..4 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-square-prune M] [--pf-no-filters] [--kf-tiles MIN_MP,C,R | 0]]\n");
         return 2;
     }
     const int w = atoi(argv[1]), h = atoi(argv[2]), fpsNum = atoi(argv[3]), fpsDen = atoi(argv[4]);
@@ -194,6 +194,7 @@ int main(int argc, char **argv) {
     constexpr int kOrderHintBits = 7;   // --pframes streams: enable_order_hint with 7-bit hints
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float pfSquarePrune = -1.f;  // --pf-square-prune M: fixed square-children pruning margin (default: motion-adaptive)
     bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
     // --pf-adaptive: mini-GOP length 16 / 8 from this block-mean motion of the next eight frames
     const double gopMotion16 = getenv("AV1GPU_PF_GOP16") ? atof(getenv("AV1GPU_PF_GOP16")) : 0.7;
@@ -349,6 +350,9 @@ int main(int argc, char **argv) {
             pfTmvp = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
             pfSettings.modeRefine = false;
+        } else if (!strcmp(argv[i], "--pf-square-prune") && i + 1 < argc) {
+            pfSquarePrune = strtof(argv[++i], nullptr);
+            if (!(pfSquarePrune >= 0.f && pfSquarePrune <= 16.f)) { fprintf(stderr, "--pf-square-prune must be 0..16\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-refine-passes") && i + 1 < argc) {
             pfSettings.modeRefinePasses = atoi(argv[++i]);
             if (pfSettings.modeRefinePasses < 0 || pfSettings.modeRefinePasses > 8) {
@@ -868,6 +872,8 @@ int main(int argc, char **argv) {
             st.qindex = qindex;
             // moving content codes most blocks: search rectangular partitions only where the square clearly wins
             if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
+            // square-children pruning: moving content only (static content refines detail in small blocks over frames)
+            st.squarePrune = pfSquarePrune >= 0.f ? pfSquarePrune : pfAdaptive && gopMotion >= 0.6 ? 1.f : 0.f;
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
             Job job;
             job.slot0 = slot0;
