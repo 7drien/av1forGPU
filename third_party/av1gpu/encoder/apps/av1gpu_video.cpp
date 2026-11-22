@@ -874,6 +874,14 @@ int main(int argc, char **argv) {
             if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
             // square-children pruning: moving content only (static content refines detail in small blocks over frames)
             st.squarePrune = pfSquarePrune >= 0.f ? pfSquarePrune : pfAdaptive && gopMotion >= 0.6 ? 1.f : 0.f;
+            // per-block mode cost of the evaluation: moving content pays more side information per block (larger
+            // values there stop splits that win the estimate but lose in BD-rate); 2 bits for static content
+            if (pfAdaptive) {
+                static const double moving = getenv("AV1GPU_PF_MODEBITS_MOVING") ? atof(getenv("AV1GPU_PF_MODEBITS_MOVING")) : 12.0;
+                static const double hi = getenv("AV1GPU_PF_MODEBITS_HI") ? atof(getenv("AV1GPU_PF_MODEBITS_HI")) : 1.5;
+                const double t = std::min(1.0, std::max(0.0, (gopMotion - 0.3) / (hi - 0.3)));
+                st.modeBits = (float)(2.0 + (moving - 2.0) * t);
+            }
             const uint8_t *src[3] = {fb[0], fb[1], fb[2]};
             Job job;
             job.slot0 = slot0;

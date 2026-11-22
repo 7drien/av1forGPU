@@ -399,3 +399,15 @@ GPU time: evaluation 48-55%, motion search 25%, key-frame encoder 20-25%, filter
 - The gains on moving clips mean the decision favours splitting too much there: children win the cost comparison
   but lose in BD-rate, so their side-information cost is probably underestimated.
 
+### Per-block mode cost follows motion
+
+- The evaluation charged every block 2 bits of mode information besides its vectors. Raising it (`AV1GPU_PF_MODEBITS`)
+  helps moving content and hurts static content: 4 bits video_1 +0.3, video_2 -1.0, video_3 -3.1, video_5 -0.4 points;
+  8 bits video_1 +1.8, video_2 -1.6, video_3 -5.4, video_5 -0.4. Full-weight vector bits (`AV1GPU_PF_MVW` 1.0
+  instead of 0.5) changed nothing overall (video_3 -1.0, video_1 +0.7, video_2 +0.3).
+- With `--pf-adaptive` the charge now ramps from 2 bits (motion <= 0.3) to 12 bits (motion >= 1.5;
+  `AV1GPU_PF_MODEBITS_MOVING`, `AV1GPU_PF_MODEBITS_HI` for tuning). Maximum 8: mean +16.4%; 12: +16.2%; a ramp ending at
+  0.8 moved video_3 -0.7 and video_5 +0.3 (kept 1.5).
+- Five clips: video_1 +8.5%, video_2 +32.4%, video_3 +61.3%, video_4 -16.5%, video_5 -4.7%; mean +18.2% → +16.2%.
+  Same speed.
+

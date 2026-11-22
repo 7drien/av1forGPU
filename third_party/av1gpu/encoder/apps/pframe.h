@@ -54,6 +54,7 @@ struct Settings {
     int splitTypes = 0;          // split luma transforms: 0 same type search, 1 seven types, 2 DCT_DCT only (--pf-fast)
     float pruneMargin = 2.f;     // rectangular search skipped unless the square's coded cost < margin * skip cost
     bool pruneRect = true;       // skip HORZ / VERT / 4:1 searches of nodes whose square evaluation chose skip
+    float modeBits = 2.f;        // bits charged per block for its mode info besides the vectors (evaluation)
     float squarePrune = 0.f;     // > 0: skip the square children of nodes that clearly prefer skip (margin as pruneMargin);
                                  // the app enables it (1) for moving content only (static content gains from children)
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)

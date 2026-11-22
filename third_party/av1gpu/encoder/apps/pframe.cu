@@ -653,6 +653,7 @@ struct EvalArgs {
     int qindex, qctx;
     float lambda, rnd, zbin;
     float mvWeight;
+    float modeBase;      // bits charged per block for its mode info besides the vectors
     int rdoq;
     // luma transform types per 4x4 unit (stride aw / 4) of the whole-block transform and of the depth 1 / 2 splits;
     // null: DCT_DCT only
@@ -1123,7 +1124,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         return;
     }
     if (!lane) {
-        const float modeBits = 2.f + c.mvBits * a.mvWeight;
+        const float modeBits = a.modeBase + c.mvBits * a.mvWeight;
         const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
         c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
         if (depth) {
@@ -1342,7 +1343,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         __syncwarp();
     }
     if (!lane) {
-        const float modeBits = 2.f + c.mvBits * a.mvWeight;
+        const float modeBits = a.modeBase + c.mvBits * a.mvWeight;
         const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
         c.costSkip = c.dSkipAll + a.lambda * (modeBits + skipFlag1);
         float dCoded = lumaD + dC, bits = lumaBits + bC;
@@ -2871,6 +2872,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.rnd = getenv("AV1GPU_PF_RND") ? (float)atof(getenv("AV1GPU_PF_RND")) : st.rnd;
     ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
+    ea.modeBase = getenv("AV1GPU_PF_MODEBITS") ? (float)atof(getenv("AV1GPU_PF_MODEBITS")) : st.modeBits;
     ea.rdoq = st.rdoq;
     ea.d2Margin = getenv("AV1GPU_PF_D2MARGIN") ? (float)atof(getenv("AV1GPU_PF_D2MARGIN")) : 1.0f;
     static const bool splitExternal = !getenv("AV1GPU_PF_INKERNEL") ;
