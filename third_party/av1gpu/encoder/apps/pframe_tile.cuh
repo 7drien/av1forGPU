@@ -36,6 +36,7 @@ struct InterCdfs {
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
     uint16_t skipMode[3][3];
+    uint16_t pad_;   // keep the state a multiple of 4 bytes (it is copied in 32-bit words)
 };
 // Default_Skip_Mode_Cdf (spec): skip_mode, context = above skip_mode + left skip_mode
 inline constexpr uint16_t kDefaultSkipModeCdf[3][3] = {{32621, 32768, 0}, {20708, 32768, 0}, {8127, 32768, 0}};
@@ -44,6 +45,7 @@ struct EntropyState {
     av1g_cdfs cdf;
     InterCdfs inter;
 };
+static_assert(sizeof(EntropyState) % 4 == 0, "EntropyState is copied in 32-bit words");
 
 // Inter transform sets (spec 5.11.48 get_tx_set, is_inter = 1) and the position of a type in its set's
 // inter_tx_type alphabet (inverse of Tx_Type_Inter_Inv_Set1/2/3).

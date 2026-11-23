@@ -576,4 +576,8 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   mean -1.56%.
 - Five clips against SVT-AV1 preset 8: video_1 +4.9%, video_2 +22.8%, video_3 +30.4%, video_4 -21.3%, video_5 -9.8%;
   mean +5.4% (libaom: +42.7%). The filtered clips run 4 to 10% slower (filter and overlay frames): video_3 6.9 → 6.2 fps.
+- Bug fixed: adding the 9-entry skip_mode CDF made the entropy state 2 bytes short of a multiple of 4; the GPU range
+  coder (`--pf-gpu-entropy`) copies it in 32-bit words, so the last skip_mode CDF entry was left uninitialized in
+  shared memory and some streams did not decode (found by the P-frame suite once the filters were on by default).
+  The inter CDFs are padded and a static_assert guards the size. The default path (host range coder) was unaffected.
 
