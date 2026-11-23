@@ -460,4 +460,10 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   types, square / split pruning, rectangles), so pruning alone cannot double the speed; the kernels' efficiency must.
 - Peak GPU memory: 2.1 GB at 1080p, 6.6 GB at 4K (of 8 GB): a second analyzer for frame-level parallelism (independent
   leaf frames of the pyramid) fits at 1080p only.
+- Frame-level parallelism tried (reverted): a second analyzer coded the second leaf of each independent pair of
+  pyramid leaves (lo + 1 and lo + 3 of each interval of four), its analysis queued before the first leaf's filters,
+  frames finishing in coding order. Deterministic and correct, but video_2 19.11 → 19.21 fps: nsys shows the second
+  analyzer's kernels overlapping the first's for only 3% of their time. With the 14 shape streams of one frame the
+  SMs' registers and shared memory are already taken, so another frame's kernels cannot become resident: the GPU is
+  resource-saturated, and only less work or kernels that need fewer resources per unit of work can make it faster.
 
