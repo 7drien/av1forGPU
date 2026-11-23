@@ -1141,6 +1141,8 @@ int main(int argc, char **argv) {
             return va > 0 && vb > 0 ? cov / std::sqrt(va * vb) : 0.0;
         };
         static const double cutCorr = getenv("AV1GPU_PF_CUTCORR") ? atof(getenv("AV1GPU_PF_CUTCORR")) : 0.7;
+        // extra key-frame quality for static content (periodic key frames; AV1GPU_PF_KEYSTILL)
+        static const int keyStill = getenv("AV1GPU_PF_KEYSTILL") ? atoi(getenv("AV1GPU_PF_KEYSTILL")) : 40;
         auto firstCut = [&](size_t limit) -> size_t {
             if (pfSceneCut <= 0) return limit;
             readMore(limit + 1);
@@ -1172,7 +1174,7 @@ int main(int argc, char **argv) {
                 if (!cutNow) {
                     readMore(size_t(G));
                     const size_t last = std::min(pending.size(), size_t(G)) - 1;
-                    keyOffset = pfAdaptive && last ? (int)std::lround(adaptive(motionOf(nullptr, 0, last), pfQoffset + 40, pfQoffset))
+                    keyOffset = pfAdaptive && last ? (int)std::lround(adaptive(motionOf(nullptr, 0, last), pfQoffset + keyStill, pfQoffset))
                                                    : pfQoffset;
                 }
                 const bool restoreQ = cutNow || keyOffset != pfQoffset;

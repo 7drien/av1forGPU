@@ -521,4 +521,8 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   +23.9 / +23.9 / +24.2 / +25.4 / +28.0%).
 - Five clips: video_1 +6.7%, video_2 +25.4% → +22.8%, video_3 +47.8%, video_4 -21.0% → -21.3%, video_5 -9.0%;
   mean +10.0% → +9.4%.
+- video_3 against SVT at similar quality: our first key frame is 473 KB at 48.2 dB (SVT 298 KB at 45.4 dB) because the
+  key-frame offset adapts up to qoffset + 40 on static openings; the moving second half then ends 0.5-0.8 dB below SVT.
+  A smaller static bonus (`AV1GPU_PF_KEYSTILL`) helps video_3 but not the others: 20 → mean +9.8% (video_3 -1.8,
+  video_1 +1.6, video_4 +1.3, video_5 +1.0), 0 → +10.4%; 40 kept.
 
