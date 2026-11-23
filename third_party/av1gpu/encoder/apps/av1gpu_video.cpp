@@ -203,7 +203,7 @@ int main(int argc, char **argv) {
     const double gopMotion8 = getenv("AV1GPU_PF_GOP8") ? atof(getenv("AV1GPU_PF_GOP8")) : 1.0;
     uint64_t pfCuts = 0;
     double pfSceneCut = 15.0;
-    int pfCutQoffset = 60;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
+    int pfCutQoffset = 30;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
     int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
     int pfTfFrames = 0;
@@ -1121,6 +1121,26 @@ int main(int argc, char **argv) {
         };
         // index of the first pending frame (< limit) that starts a new scene, or limit: a large change that is not
         // followed by a comparable one (sustained motion changes every frame)
+        // correlation of the 16x16 block means (subsampled) of two frames
+        auto blockMeanCorr = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+            double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+            int nb = 0;
+            for (int by = 0; by + 16 <= h; by += 16)
+                for (int bx = 0; bx + 16 <= w; bx += 16) {
+                    int ma = 0, mb = 0;
+                    for (int y = 0; y < 16; y += 2)
+                        for (int x = 0; x < 16; x += 2) {
+                            ma += a[size_t(by + y) * w + bx + x];
+                            mb += b[size_t(by + y) * w + bx + x];
+                        }
+                    sa += ma; sb += mb; saa += double(ma) * ma; sbb += double(mb) * mb; sab += double(ma) * mb;
+                    ++nb;
+                }
+            if (!nb) return 0.0;
+            const double va = saa - sa * sa / nb, vb = sbb - sb * sb / nb, cov = sab - sa * sb / nb;
+            return va > 0 && vb > 0 ? cov / std::sqrt(va * vb) : 0.0;
+        };
+        static const double cutCorr = getenv("AV1GPU_PF_CUTCORR") ? atof(getenv("AV1GPU_PF_CUTCORR")) : 0.7;
         auto firstCut = [&](size_t limit) -> size_t {
             if (pfSceneCut <= 0) return limit;
             readMore(limit + 1);
@@ -1130,7 +1150,9 @@ int main(int argc, char **argv) {
                 const double d = blockMeanDiff(prev, pending[i]);
                 if (d <= pfSceneCut) continue;
                 const double next = i + 1 < pending.size() ? blockMeanDiff(pending[i], pending[i + 1]) : 0.0;
-                if (d > 2.0 * next) return i;
+                // a lighting change (strobe, colour wash) keeps the picture's structure: its block means stay
+                // correlated (video_2's flashes 0.86-0.96, video_4's cut 0.10); only a structural change is a cut
+                if (d > 2.0 * next && blockMeanCorr(prev, pending[i]) < cutCorr) return i;
             }
             return limit;
         };

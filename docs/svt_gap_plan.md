@@ -511,3 +511,14 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   rates; with the queried quantizers shifted so the inter quantizers match (q 40/70/110/150), it is +11.3% against
   +10.9%. BD-rate depends on where the curves overlap, so allocation changes are compared at matched quantizers.
 
+### Scene cuts: lighting changes are not cuts
+
+- video_2's four "scene cuts" (frames 5, 10, 17, 22/23) are strobes and colour washes over the same concert view: the
+  16x16 block means shift by 18-32 levels but stay correlated (0.86-0.96), while video_4's real cut at frame 60 has
+  correlation 0.10. A cut now also needs a block-mean correlation below 0.7 (`AV1GPU_PF_CUTCORR`). Without key frames
+  at those flashes video_2 improves; disabling cut detection entirely (`--pf-scene-cut 0`) costs video_4 8.6 points.
+- Scene-cut key frames: inter quantizer minus 30 instead of 60 (`--pf-cut-qoffset`; 20 / 30 / 40 / 60 / 80 on video_2:
+  +23.9 / +23.9 / +24.2 / +25.4 / +28.0%).
+- Five clips: video_1 +6.7%, video_2 +25.4% → +22.8%, video_3 +47.8%, video_4 -21.0% → -21.3%, video_5 -9.0%;
+  mean +10.0% → +9.4%.
+
