@@ -1122,7 +1122,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
             for (int i = lane; i < bw * bh; i += 32) res[i] = bak[i];
             __syncwarp();
             e.txType = type;
-            warp_fwd_rt(res, tmpS[warp], bw, bh, txSz, type);
+            if (p == 0) warp_fwd_ct<BW, BH>(res, tmpS[warp], txSz, type);
+            else warp_fwd_ct<BW / 2, BH / 2>(res, tmpS[warp], txSz, type);
             if (mode == 0) return fwdScore(tmpS[warp], bw, bh, txSz, type);
             warp_quant_rate_rt<8>(tmpS[warp], q, e, o, bw, bh);
             if (mode == 1) return 0.f;
@@ -1224,7 +1225,7 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
                     for (int i = lane; i < SW * SH; i += 32) res[i] = bk[i];
                     __syncwarp();
                     es.txType = type;
-                    warp_fwd_rt(res, tmpS[warp], SW, SH, stx, type);
+                    warp_fwd_ct<SW, SH>(res, tmpS[warp], stx, type);
                     if (mode == 0) return fwdScore(tmpS[warp], SW, SH, stx, type);
                     warp_quant_rate_rt<8>(tmpS[warp], q, es, os, SW, SH);
                     if (mode == 1) return 0.f;
@@ -1304,7 +1305,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
                         for (int i = lane; i < hn * hn; i += 32) res[i] = bk[i];
                         __syncwarp();
                         es.txType = type;
-                        warp_fwd_rt(res, tmpS[warp], hn, hn, stx, type);
+                        if (d == 1) warp_fwd_ct<BW / 2, BW / 2>(res, tmpS[warp], stx, type);
+                        else warp_fwd_ct<(BW / 4 < 4 ? 4 : BW / 4), (BW / 4 < 4 ? 4 : BW / 4)>(res, tmpS[warp], stx, type);
                         if (mode == 0) return fwdScore(tmpS[warp], hn, hn, stx, type);
                         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
                         if (mode == 1) return 0.f;
@@ -1482,7 +1484,9 @@ __device__ __forceinline__ void evalSplitOne(EvalArgs a, const int dsel, const i
         for (int i = lane; i < hw * hh; i += 32) res[i] = bk[i];
         __syncwarp();
         es.txType = type;
-        warp_fwd_rt(res, tmpS[warp], hw, hh, stx, type);
+        if (!G::sq) warp_fwd_ct<G::sw, G::sh>(res, tmpS[warp], stx, type);
+        else if (d == 1) warp_fwd_ct<BW / 2, BH / 2>(res, tmpS[warp], stx, type);
+        else warp_fwd_ct<(BW / 4 < 4 ? 4 : BW / 4), (BH / 4 < 4 ? 4 : BH / 4)>(res, tmpS[warp], stx, type);
         if (mode == 0) return fwdScore(tmpS[warp], hw, hh, stx, type);
         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hw, hh);
         if (mode == 1) return 0.f;
@@ -1854,7 +1858,7 @@ __device__ __forceinline__ void evalFinalOne(EvalArgs a, const int slot) {
         e.resEnergy = warp_sum(en);
         e.qmDist = 0; e.qmRnd = 0;
         EvalOut o;
-        warp_fwd_rt(res, tmpS[warp], CW, CH, txSz, e.txType);
+        warp_fwd_ct<CW, CH>(res, tmpS[warp], txSz, e.txType);
         warp_quant_rate_rt<8>(tmpS[warp], q, e, o, CW, CH);
         inverseAddCt<lw, lh>(q, txSz, e.txType, dcQ, acQ, res, pred, rec);
         bC += o.R;

@@ -1398,8 +1398,10 @@ int main(int argc, char **argv) {
             if (boostSlope != 0.0) gopBoost *= std::pow(pfSettings.qindex / 165.0, boostSlope);
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
+            // boost share of a pyramid level: (1 - depth / depthMax) ^ AV1GPU_PF_LAYERGAMMA (1: linear)
+            static const double layerGamma = getenv("AV1GPU_PF_LAYERGAMMA") ? atof(getenv("AV1GPU_PF_LAYERGAMMA")) : 1.0;
             auto qAt = [&](int depth) {
-                const double frac = depthMax ? 1.0 - double(depth) / depthMax : 1.0;
+                const double frac = std::pow(depthMax ? 1.0 - double(depth) / depthMax : 1.0, layerGamma);
                 return std::max(1, (int)std::lround(pfSettings.qindex - gopBoost * frac));
             };
             const uint64_t base = frameCount - 1;   // display index of the anchor (lastShown)
