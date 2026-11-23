@@ -335,25 +335,45 @@ __global__ void coarseSearch(const uint8_t *cur, const uint8_t *ref, int dw, int
 
 // Quarter-sample phase planes of a reference luma plane: phase (fy / 4) * 4 + fx / 4 holds the exact AV1 prediction
 // sample at every integer position (two-stage filter with the spec's intermediate rounding and edge clamping).
+// Quarter-sample phase planes of a reference for the motion search: the four horizontal phases of each sample (one
+// thread, one tap window), then the four vertical phases of eight rows of each horizontal phase (one thread, one
+// 15-row window).
 __global__ void horizontalPhases(const uint8_t *ref, int w, int h, int16_t *out) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int fx = blockIdx.z;
     if (x >= w || y >= h) return;
     const uint8_t *row = ref + size_t(y) * w;
-    int s = 0;
+    int v[8];
 #pragma unroll
-    for (int t = 0; t < 8; t++) s += c_filter[0][fx * 4][t] * row[min(max(x + t - 3, 0), w - 1)];
-    out[(size_t(fx) * h + y) * w + x] = (int16_t)round2(s, 3);
+    for (int t = 0; t < 8; t++) v[t] = row[min(max(x + t - 3, 0), w - 1)];
+#pragma unroll
+    for (int fx = 0; fx < 4; fx++) {
+        int s = 0;
+#pragma unroll
+        for (int t = 0; t < 8; t++) s += c_filter[0][fx * 4][t] * v[t];
+        out[(size_t(fx) * h + y) * w + x] = (int16_t)round2(s, 3);
+    }
 }
+constexpr int kPhaseRows = 8;
 __global__ void verticalPhases(const int16_t *hp, int w, int h, uint8_t *out) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int phase = blockIdx.z, fy = phase >> 2, fx = phase & 3;
-    if (x >= w || y >= h) return;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y0 = (blockIdx.y * blockDim.y + threadIdx.y) * kPhaseRows;
+    const int fx = blockIdx.z;
+    if (x >= w || y0 >= h) return;
     const int16_t *col = hp + size_t(fx) * h * w + x;
-    int s = 0;
+    int v[kPhaseRows + 7];
 #pragma unroll
-    for (int t = 0; t < 8; t++) s += c_filter[0][fy * 4][t] * col[size_t(min(max(y + t - 3, 0), h - 1)) * w];
-    out[(size_t(phase) * h + y) * w + x] = (uint8_t)min(max(round2(s, 11), 0), 255);
+    for (int k = 0; k < kPhaseRows + 7; k++) v[k] = col[size_t(min(max(y0 + k - 3, 0), h - 1)) * w];
+#pragma unroll
+    for (int fy = 0; fy < 4; fy++) {
+        uint8_t *o = out + size_t(fy * 4 + fx) * h * w + x;
+#pragma unroll
+        for (int r = 0; r < kPhaseRows; r++) {
+            if (y0 + r >= h) break;
+            int s = 0;
+#pragma unroll
+            for (int t = 0; t < 8; t++) s += c_filter[0][fy * 4][t] * v[r + t];
+            o[size_t(y0 + r) * w] = (uint8_t)min(max(round2(s, 11), 0), 255);
+        }
+    }
 }
 
 // Lanes cooperating on one block: 8 for 8x8 blocks (4 blocks per warp), else the whole warp.
@@ -3361,8 +3381,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
                                                                             s->cand[1], s->cols[1], w, h, 0.f, 1);
     for (int r = 0; r < refCount; r++) {
         { FineTimer ft_("phase planes");
-        horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8), 0, stream>>>(refs[r], w, h, s->hphase);
-        verticalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 16), dim3(32, 8), 0, stream>>>(s->hphase, w, h, s->phases[r]); }
+        horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), 0, stream>>>(refs[r], w, h, s->hphase);
+        verticalPhases<<<dim3((w + 31) / 32, (h + 8 * kPhaseRows - 1) / (8 * kPhaseRows), 4), dim3(32, 8), 0, stream>>>(
+            s->hphase, w, h, s->phases[r]); }
 #define PF_REFINE(K, N)                                                                                         \
     FineTimer ft##K##_("refine " #N "x" #N);                                                                    \
     refine<N, N><<<(s->cols[K] * s->rows[K] + RefineCfg<N, N>::per() - 1) / RefineCfg<N, N>::per(),               \
