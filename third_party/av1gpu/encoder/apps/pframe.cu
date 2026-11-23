@@ -127,7 +127,7 @@ __device__ __forceinline__ uint32_t ldu32(const uint8_t *a) {
 // Horizontal eight-tap pass of an inter prediction (rows iy - 3 .. iy + h + 3, Round2(sum, 3) into tmp, row stride w).
 // Blocks whose taps stay inside the plane (with 12 samples of margin on the right for the word loads) take four outputs
 // per lane step from three word loads; others clamp every tap.
-__device__ __noinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
+__device__ __forceinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
                                         const int16_t *filt, int16_t *tmp) {
     const int lane = threadIdx.x & 31, ih = h + 7;
     int f[8];
@@ -169,7 +169,7 @@ __device__ __noinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix,
 }
 // Vertical eight-tap pass: four output rows per lane step from eleven intermediate rows; emit(i, sum) per output.
 template <class Emit>
-__device__ __noinline__ void interpV(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
+__device__ __forceinline__ void interpV(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
     const int lane = threadIdx.x & 31;
     int f[8];
 #pragma unroll
@@ -189,6 +189,27 @@ __device__ __noinline__ void interpV(const int16_t *tmp, int w, int lw, int h, c
     }
     __syncwarp();
 }
+// Out-of-line copies for the 64-wide evaluations (inlined there they push the kernels past 255 registers).
+__device__ __noinline__ void interpHCall(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
+                                         const int16_t *filt, int16_t *tmp) {
+    interpH(ref, pw, ph, ix, iy, w, lw, h, filt, tmp);
+}
+template <class Emit>
+__device__ __noinline__ void interpVCall(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
+    interpV(tmp, w, lw, h, filt, emit);
+}
+template <bool OUT>
+__device__ __forceinline__ void interpHSel(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
+                                           const int16_t *filt, int16_t *tmp) {
+    if constexpr (OUT) interpHCall(ref, pw, ph, ix, iy, w, lw, h, filt, tmp);
+    else interpH(ref, pw, ph, ix, iy, w, lw, h, filt, tmp);
+}
+template <bool OUT, class Emit>
+__device__ __forceinline__ void interpVSel(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
+    if constexpr (OUT) interpVCall(tmp, w, lw, h, filt, emit);
+    else interpV(tmp, w, lw, h, filt, emit);
+}
+
 // ------------------------------------------------------------------------------------------------
 // Exact AV1 single-reference inter prediction (spec 7.11.3.3 / 7.11.3.4, unscaled reference, regular
 // eight-tap filter; blocks of width or height 4 use the four-tap variant). One warp predicts a w x h block.
@@ -196,6 +217,7 @@ __device__ __noinline__ void interpV(const int16_t *tmp, int w, int lw, int h, c
 // Subpel_Filters row of interp_filter f (0 EIGHTTAP, 1 SMOOTH, 2 SHARP) for a block side of n samples: sides of 4 use
 // the four-tap rows (4: regular and sharp, 5: smooth), spec 7.11.3.4.
 __device__ __forceinline__ int filterRow(int f, int n) { return n <= 4 ? (f == 1 ? 5 : 4) : f; }
+template <bool OUT = false>
 __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, int w, int h, Mv mv, int sub,
                             int16_t *tmp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
@@ -213,12 +235,13 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
         __syncwarp();
         return;
     }
-    interpH(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
-    interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { out[i] = (uint8_t)min(max(round2(sum, 11), 0), 255); });
+    interpHSel<OUT>(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
+    interpVSel<OUT>(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { out[i] = (uint8_t)min(max(round2(sum, 11), 0), 255); });
 }
 
 // Exact AV1 compound-average prediction (spec 7.11.3.1 with InterRound1 = 7 and InterPostRound = 4):
 // Clip1(Round2(p0 + p1, 5)). hp holds w * h int16 values.
+template <bool OUT = false>
 __device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, int pw, int ph, int x0, int y0, int w,
                                     int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
@@ -230,9 +253,9 @@ __device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, in
         const int X = (x0 << 4) + ((2 * mv.col) >> sub);
         const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
         const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
-        interpH(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
-        if (!k) interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { hp[i] = (int16_t)round2(sum, 7); });
-        else interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) {
+        interpHSel<OUT>(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
+        if (!k) interpVSel<OUT>(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { hp[i] = (int16_t)round2(sum, 7); });
+        else interpVSel<OUT>(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) {
             out[i] = (uint8_t)min(max(round2(hp[i] + round2(sum, 7), 5), 0), 255);
         });
     }
@@ -863,8 +886,8 @@ __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhausti
 }
 
 // Evaluate skip and coded options of every block of one shape.
-template <int BW, int BH, bool EXT = false>
-__global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs a) {
+template <int BW, int BH, bool EXT>
+__device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
     constexpr int W = EvalCfg<BW, BH>::warps;
     constexpr int AREA = BW * BH;
     constexpr int TQ = (BW > 32 ? 32 : BW) * (BH > 32 ? 32 : BH);   // stored luma coefficients
@@ -877,8 +900,6 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     __shared__ float tmpS[W][TS];
     __shared__ int16_t qS[W][TQ];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int slot = blockIdx.x * W + warp;
-    if (slot >= a.blockCount()) return;
     const int b = a.blockIndex(slot);
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     Cand &c = *a.candidate(b, x0, y0);
@@ -913,9 +934,9 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
 #pragma unroll 1
         for (int t = 0; t < 3; t++) {
             if (c.ref == 2)
-                warpPredictCompound(f.ref[0], ref2, f.w, f.h, x0, y0, BW, BH, c.mv, c.mv2, 0, interp[warp], hpS[warp], pl, t);
+                warpPredictCompound<(BW == 64 || BH == 64)>(f.ref[0], ref2, f.w, f.h, x0, y0, BW, BH, c.mv, c.mv2, 0, interp[warp], hpS[warp], pl, t);
             else
-                warpPredict(ref, f.w, f.h, x0, y0, BW, BH, c.mv, 0, interp[warp], pl, t);
+                warpPredict<(BW == 64 || BH == 64)>(ref, f.w, f.h, x0, y0, BW, BH, c.mv, 0, interp[warp], pl, t);
             int v = 0;
             for (int i = lane; i < AREA; i += 32) {
                 const int r = i / BW, col = i % BW;
@@ -952,10 +973,10 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
         if (p == 0 && searched) {
         } else if (c.ref == 2)
-            warpPredictCompound(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, bw, bh, c.mv, c.mv2, sub,
+            warpPredictCompound<(BW == 64 || BH == 64)>(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, bw, bh, c.mv, c.mv2, sub,
                                 interp[warp], hpS[warp], pred, filt);
         else
-            warpPredict(refP, pw, ph, px, py, bw, bh, c.mv, sub, interp[warp], pred, filt);
+            warpPredict<(BW == 64 || BH == 64)>(refP, pw, ph, px, py, bw, bh, c.mv, sub, interp[warp], pred, filt);
         const uint8_t *src = f.src[p];
         const int pitch = f.pitch[p];
         int sse = 0;
@@ -1256,6 +1277,20 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
 }
 
 
+// One warp per block; grid-stride, so the sparse refinement trials launch a small grid (a full-size grid of mostly
+// empty CTAs delays every concurrent stream while it drains).
+template <int BW, int BH, bool EXT = false, bool LOOP = false>
+__global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs a) {
+    constexpr int W = EvalCfg<BW, BH>::warps;
+    const int n = a.blockCount();
+    const int slot = blockIdx.x * W + (threadIdx.x >> 5);
+    if constexpr (LOOP) {
+        for (int i = slot; i < n; i += gridDim.x * W) evaluateOne<BW, BH, EXT>(a, i);
+    } else if (slot < n) {
+        evaluateOne<BW, BH, EXT>(a, slot);
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // Split-external evaluation of square blocks: one warp per split transform (all blocks of a size at once), from the
 // prediction evaluate<.., true> stored in a.pred. Writes the depth-1 / depth-2 levels, reconstruction and types like the
@@ -1267,7 +1302,7 @@ struct SplitGeo {   // split-external evaluation: split transforms per block and
     static constexpr int sw = sq ? BW / 2 : (BW > BH ? BW / 2 : BW), sh = sq ? BH / 2 : (BW > BH ? BH : BH / 2);
 };
 template <int BW, int BH>
-__global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
+__device__ __forceinline__ void evalSplitOne(EvalArgs a, const int dsel, const int idx) {
     using G = SplitGeo<BW, BH>;
     constexpr int NSUB = G::nsub, SA = G::sw * G::sh;   // largest split transform area
     __shared__ int16_t resS[4][SA], bkS[4][SA], qS[4][SA];
@@ -1277,8 +1312,6 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     // dsel 0: every split transform; 1: depth 1 only; 2: depth 2 only, for blocks whose depth 1 beat the whole
     // transform by a.d2Margin (the others get an infinite depth-2 cost)
     const int per0 = dsel == 1 ? (G::sq ? 4 : 2) : dsel == 2 ? 16 : NSUB, off0 = dsel == 2 ? 4 : 0;
-    const int idx = blockIdx.x * 4 + warp;
-    if (idx >= a.blockCount() * per0) return;
     const int b = a.blockIndex(idx / per0), k = off0 + idx % per0;
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
@@ -1375,6 +1408,19 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
         a.subR[size_t(b) * NSUB + k] = os.R;
         a.subNz[size_t(b) * NSUB + k] = nzS;
         a.subType[size_t(b) * NSUB + k] = (uint8_t)ty;
+    }
+}
+
+template <int BW, int BH, bool LOOP = false>
+__global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
+    using G = SplitGeo<BW, BH>;
+    const int per0 = dsel == 1 ? (G::sq ? 4 : 2) : dsel == 2 ? 16 : G::nsub;
+    const int n = a.blockCount() * per0;
+    const int idx = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if constexpr (LOOP) {
+        for (int i = idx; i < n; i += gridDim.x * 4) evalSplitOne<BW, BH>(a, dsel, i);
+    } else if (idx < n) {
+        evalSplitOne<BW, BH>(a, dsel, idx);
     }
 }
 
@@ -1638,15 +1684,13 @@ __global__ void __launch_bounds__(TCfg<LN>::threads) evalSplitT(EvalArgs a, int 
 // Split-external evaluation, last step: luma depth from the evalSplit results, chroma with the type of the top-left
 // luma transform, and the block's skip / coded costs.
 template <int BW, int BH>
-__global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
+__device__ __forceinline__ void evalFinalOne(EvalArgs a, const int slot) {
     using G = SplitGeo<BW, BH>;
     constexpr int NSUB = G::nsub, CW = BW / 2, CH = BH / 2;   // chroma block (one transform: CW, CH <= 32)
     __shared__ int16_t resS[4][CW * CH], bkS[4][CW * CH], qS[4][CW * CH];
     __shared__ uint8_t pS[4][CW * CH], recS[4][CW * CH];
     __shared__ float tmpS[4][(CW + 1) * CH];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int slot = blockIdx.x * 4 + warp;
-    if (slot >= a.blockCount()) return;
     const int b = a.blockIndex(slot);
     const Frame &f = a.f;
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
@@ -1745,17 +1789,41 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
     }
 }
 
+template <int BW, int BH, bool LOOP = false>
+__global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
+    const int n = a.blockCount();
+    const int slot = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if constexpr (LOOP) {
+        for (int i = slot; i < n; i += gridDim.x * 4) evalFinalOne<BW, BH>(a, i);
+    } else if (slot < n) {
+        evalFinalOne<BW, BH>(a, slot);
+    }
+}
+
 template <int BW, int BH>
 void launchEvaluation(EvalArgs a, bool splitExternal, cudaStream_t stream,
                       const char *whole, const char *split, const char *final) {
     constexpr int warps = EvalCfg<BW, BH>::warps;
     const int nb = a.cols * a.rows;
+    // sparse refinement trials: a few CTAs per SM walk the trial list (grid-stride kernels)
+    static const int trialGrid = [] {
+        int dev = 0, sms = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        return getenv("AV1GPU_PF_TRIALGRID") ? atoi(getenv("AV1GPU_PF_TRIALGRID")) * sms : 4 * sms;
+    }();
+    auto grid = [&](int g) { return a.trials ? std::min(g, trialGrid) : g; };
     const int blocks = (nb + warps - 1) / warps;
     if (!a.recon2 || !splitExternal) {
-        evaluate<BW, BH><<<blocks, 32 * warps, 0, stream>>>(a);
+        if (a.trials) evaluate<BW, BH, false, true><<<grid(blocks), 32 * warps, 0, stream>>>(a);
+        else evaluate<BW, BH><<<blocks, 32 * warps, 0, stream>>>(a);
         return;
     }
-    { FineTimer t(a.trials ? nullptr : whole); evaluate<BW, BH, true><<<blocks, 32 * warps, 0, stream>>>(a); }
+    {
+        FineTimer t(a.trials ? nullptr : whole);
+        if (a.trials) evaluate<BW, BH, true, true><<<grid(blocks), 32 * warps, 0, stream>>>(a);
+        else evaluate<BW, BH, true><<<blocks, 32 * warps, 0, stream>>>(a);
+    }
     {
         FineTimer t(a.trials ? nullptr : split);
         // thread-per-transform kernels for dense launches (sparse refinement trials keep one warp per transform: few
@@ -1764,24 +1832,24 @@ void launchEvaluation(EvalArgs a, bool splitExternal, cudaStream_t stream,
         const bool s4 = g_split4 && !a.trials, s8 = g_split8 && !a.trials;
         if constexpr (BW == 8 && BH == 8) {
             if (s4) evalSplitT<8, 8, 2><<<(nb * 4 + 127) / 128, 128, 0, stream>>>(a, 0);
-            else evalSplit<BW, BH><<<(nb * 4 + 3) / 4, 128, 0, stream>>>(a, 0);
+            else if (a.trials) evalSplit<BW, BH, true><<<grid((nb * 4 + 3) / 4), 128, 0, stream>>>(a, 0); else evalSplit<BW, BH><<<(nb * 4 + 3) / 4, 128, 0, stream>>>(a, 0);
         } else if constexpr (BW == 16 && BH == 16) {
             if (s8) evalSplitT<16, 16, 3><<<(nb * 4 + t8 - 1) / t8, t8, 0, stream>>>(a, 1);
-            else evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            else if (a.trials) evalSplit<BW, BH, true><<<grid(nb), 128, 0, stream>>>(a, 1); else evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
             if (s4) evalSplitT<16, 16, 2><<<(nb * 16 + 127) / 128, 128, 0, stream>>>(a, 2);
-            else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
+            else if (a.trials) evalSplit<BW, BH, true><<<grid(nb * 4), 128, 0, stream>>>(a, 2); else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
         } else if constexpr (BW == 32 && BH == 32) {
-            evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            if (a.trials) evalSplit<BW, BH, true><<<grid(nb), 128, 0, stream>>>(a, 1); else evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
             if (s8) evalSplitT<32, 32, 3><<<(nb * 16 + t8 - 1) / t8, t8, 0, stream>>>(a, 2);
-            else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
+            else if (a.trials) evalSplit<BW, BH, true><<<grid(nb * 4), 128, 0, stream>>>(a, 2); else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
         } else if constexpr (BW == BH && BW >= 16) {
-            evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
-            evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
+            if (a.trials) evalSplit<BW, BH, true><<<grid(nb), 128, 0, stream>>>(a, 1); else evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            if (a.trials) evalSplit<BW, BH, true><<<grid(nb * 4), 128, 0, stream>>>(a, 2); else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
         } else {
-            evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128, 0, stream>>>(a, 0);
+            if (a.trials) evalSplit<BW, BH, true><<<grid((nb * SplitGeo<BW, BH>::nsub + 3) / 4), 128, 0, stream>>>(a, 0); else evalSplit<BW, BH><<<(nb * SplitGeo<BW, BH>::nsub + 3) / 4, 128, 0, stream>>>(a, 0);
         }
     }
-    { FineTimer t(a.trials ? nullptr : final); evalFinal<BW, BH><<<(nb + 3) / 4, 128, 0, stream>>>(a); }
+    { FineTimer t(a.trials ? nullptr : final); if (a.trials) evalFinal<BW, BH, true><<<grid((nb + 3) / 4), 128, 0, stream>>>(a); else evalFinal<BW, BH><<<(nb + 3) / 4, 128, 0, stream>>>(a); }
 }
 
 // ------------------------------------------------------------------------------------------------
