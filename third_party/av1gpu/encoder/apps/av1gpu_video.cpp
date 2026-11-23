@@ -1294,7 +1294,11 @@ int main(int argc, char **argv) {
             // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
             gopMotion = !prevFrame.empty() ? motionOf(&prevFrame, 0, n - 1) : 0.0;
             static const double movingBoost = getenv("AV1GPU_PF_BOOST_MOVING") ? atof(getenv("AV1GPU_PF_BOOST_MOVING")) : 60.0;
-            const double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, movingBoost) : pfAltrefBoost;
+            double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, movingBoost) : pfAltrefBoost;
+            // short mini-GOPs (shots between cuts) amortize the boosted frames over fewer pictures (AV1GPU_PF_SHORTGOP:
+            // the length below which the boost scales with n / length; 0 off)
+            static const double shortLen = getenv("AV1GPU_PF_SHORTGOP") ? atof(getenv("AV1GPU_PF_SHORTGOP")) : 8.0;
+            if (shortLen > 0 && double(n) < shortLen) gopBoost *= double(n) / shortLen;
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
             auto qAt = [&](int depth) {

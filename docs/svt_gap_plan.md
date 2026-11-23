@@ -499,3 +499,15 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
 - Quantizer rounding rechecked on five clips: 0.40 +11.2%, 0.46 +10.9% (new default), 0.52 +11.0%; dead zone 0.60 / 0.80
   worse than 0.70 on four clips (+0.5 / +2.0 points).
 
+### Quality allocation of short shots
+
+- video_2 against SVT at similar quality: the shots between scene cuts (frames 5-16) cost us 2.2x SVT's bytes for
+  about 0.8 dB more. Each short shot gets a key frame plus a fully boosted ALTREF that serves only 3 or 4 frames.
+  Mini-GOPs shorter than 8 frames now scale the ALTREF boost by n / 8 (`AV1GPU_PF_SHORTGOP`, 0 off; 16 hurts video_3,
+  whose moving parts use 8-frame mini-GOPs: +66.9%).
+- Five clips: video_1 +6.7%, video_2 +28.0% → +25.4%, video_3 +48.0% → +47.8%, video_4 -20.1% → -21.0%,
+  video_5 -7.7% → -9.0%; mean +10.9% → +10.0%.
+- Key-frame offset rechecked: `--pf-qoffset 70` looked better (+8.7%) only because it also moves our points to higher
+  rates; with the queried quantizers shifted so the inter quantizers match (q 40/70/110/150), it is +11.3% against
+  +10.9%. BD-rate depends on where the curves overlap, so allocation changes are compared at matched quantizers.
+
