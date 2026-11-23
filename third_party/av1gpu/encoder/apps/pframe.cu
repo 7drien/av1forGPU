@@ -377,11 +377,13 @@ __global__ void verticalPhases(const int16_t *hp, int w, int h, uint8_t *out) {
 }
 
 // Lanes cooperating on one block: 8 for 8x8 blocks (4 blocks per warp), else the whole warp.
-// Lanes cooperating on one block in motion search: 8 for 8x8, 32 up to 1024 samples, 128 (four warps, one block per
-// CTA, sums through shared memory) for the 2048- and 4096-sample blocks (their SADs are memory-latency bound; 256
-// lanes for 4096 or 64 for 1024 samples measured no better).
+// Lanes cooperating on one block in motion search: about eight four-sample SAD words per lane (8 lanes up to 256
+// samples, 16 for 512, 32 for 1024), 128 (four warps, one block per CTA, sums through shared memory) for the 2048- and
+// 4096-sample blocks (their SADs are memory-latency bound). Four or sixteen words per lane, 32 or 128 lanes for other
+// sizes measured slower.
 template <int BW, int BH> struct Grp {
-    static constexpr int G = BW * BH == 64 ? 8 : BW * BH >= 2048 ? 128 : 32;
+    static constexpr int words = BW * BH / 4;   // four-sample SAD words per block
+    static constexpr int G = BW * BH >= 2048 ? 128 : words / 8 <= 8 ? 8 : words / 8 >= 32 ? 32 : words / 8;
     __device__ static int lane() { return threadIdx.x & (G - 1); }
     __device__ static unsigned mask() {
         return G >= 32 ? 0xffffffffu : ((1u << G) - 1) << ((threadIdx.x & 31) & ~(G - 1));
@@ -475,7 +477,8 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
                                                                         const Cand *parent, int pcols, int parentSize,
                                                                         const BlockInfo *temporal, int tcols, Cand *out,
                                                                         int cols, int rows, float lambda,
-                                                                        bool pruneable = false) {
+                                                                        bool pruneable = false,
+                                                                        int fullPelPasses = kFullPelPasses) {
     using GR = Grp<BW, BH>;
     const int b = blockIdx.x * RefineCfg<BW, BH>::per() + threadIdx.x / GR::G;
     if (b >= cols * rows) return;
@@ -559,7 +562,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
         if (c < bc) { bc = c; bm = m; }
     };
     for (int i = 0; i < n; i++) tryMv(Mv{(int16_t)(cand[i][0] * 8), (int16_t)(cand[i][1] * 8)});
-    for (int pass = 0; pass < kFullPelPasses; pass++) {
+    for (int pass = 0; pass < fullPelPasses; pass++) {
         const Mv c0 = bm;
         for (int k = 0; k < 9; k++)
             if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * 8), (int16_t)(c0.col + (k % 3 - 1) * 8)});
@@ -3496,13 +3499,15 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
                                                                      s->cand[K], s->cols[K], n, st.pruneRect || off,
                                                                      off ? 0.f : getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
         }
+        // full-pel search passes of the rectangles (they start from their square's vector; AV1GPU_PF_RECTPASSES)
+        static const int rectPasses = getenv("AV1GPU_PF_RECTPASSES") ? atoi(getenv("AV1GPU_PF_RECTPASSES")) : kFullPelPasses;
         for (int r = 0; r < refCount; r++) {
         #define PF_RREFINE(RK, K, BW, BH)                                                                               \
             { FineTimer ft_("refine " #BW "x" #BH);                                                                     \
             refine<BW, BH><<<(s->rcols[RK] * s->rrows[RK] + RefineCfg<BW, BH>::per() - 1) / RefineCfg<BW, BH>::per(),   \
                              32 * RefineCfg<BW, BH>::warps, 0, s->shapeStream[4 + (RK)]>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows, \
                                                               s->cand[K], s->cols[K], 8 << K, temporal, s->gcols,            \
-                                                              s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad, true); }
+                                                              s->rcand[RK], s->rcols[RK], s->rrows[RK], lambdaSad, true, rectPasses); }
                 {
                     PF_RREFINE(0, 1, 16, 8) PF_RREFINE(1, 1, 8, 16)
                     PF_RREFINE(2, 2, 32, 16) PF_RREFINE(3, 2, 16, 32)
