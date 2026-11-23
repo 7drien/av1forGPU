@@ -50,6 +50,9 @@ static std::map<std::string, double> g_fineMs;
 static double g_bitStats[4];
 static struct BitReport { ~BitReport() { const double t = g_bitStats[0] + g_bitStats[1] + g_bitStats[2] + g_bitStats[3]; if (t > 0) fprintf(stderr, "inter bits: modes/partition %.1f%%, mv %.1f%%, coefficients %.1f%%, tx types %.1f%%\n", 100 * g_bitStats[0] / t, 100 * g_bitStats[1] / t, 100 * g_bitStats[2] / t, 100 * g_bitStats[3] / t); } } g_bitReport;
 static bool g_fine = getenv("AV1GPU_PF_PROFILE2") != nullptr;
+// thread-per-transform 4x4 split search (AV1GPU_PF_SPLIT4=0: the warp-per-transform kernel)
+static bool g_split4 = !getenv("AV1GPU_PF_SPLIT4") || atoi(getenv("AV1GPU_PF_SPLIT4")) != 0;
+static bool g_split8 = !getenv("AV1GPU_PF_SPLIT8") || atoi(getenv("AV1GPU_PF_SPLIT8")) != 0;
 struct FineTimer {
     const char *name; std::chrono::steady_clock::time_point t;
     explicit FineTimer(const char *n) : name(n) { if (g_fine && name) { cudaDeviceSynchronize(); t = std::chrono::steady_clock::now(); } }
@@ -583,6 +586,14 @@ __device__ __noinline__ void inverseAddAny(int lw, int lh, int16_t *q, int txSz,
     PF_INV(4, 2) PF_INV(2, 4) PF_INV(5, 3) PF_INV(3, 5) PF_INV(6, 4) PF_INV(4, 6)
 #undef PF_INV
 }
+// Compile-time size dispatch of the inverse (no ABI call): out-of-range sizes only occur in dead branches.
+template <int LW, int LH>
+__device__ __forceinline__ void inverseAddCt(int16_t *q, int txSz, int txType, int dcQ, int acQ, int16_t *res,
+                                             const uint8_t *pred, uint8_t *recon) {
+    constexpr int lw = LW < 2 ? 2 : LW > 6 ? 6 : LW, lh = LH < 2 ? 2 : LH > 6 ? 6 : LH;
+    constexpr int dl = lw - lh;
+    if constexpr (dl >= -2 && dl <= 2) warpInverseAdd<lw, lh>(q, txSz, txType, dcQ, acQ, res, pred, recon);
+}
 
 // Greedy RD-optimized quantization (one lane): in reverse scan order, each nonzero level may drop by one or to zero
 // when D + lambda * R improves. Rates use the AV1 coefficient contexts of the levels already decided (later scan
@@ -933,7 +944,11 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     rb += coeff_bits(k, eobF, q, scan, txSz, av1g_tx_class(AV1G_DCT_DCT), p > 0, 0, e.C);
                 o.R = warp_sum(rb);
             }
-            inverseAddAny(tlw, tlh, q, txSz, type, dcQ, acQ, res, pred, rec);
+            {
+                constexpr int L0 = Log2<BW>::v > 6 ? 6 : Log2<BW>::v, H0 = Log2<BH>::v > 6 ? 6 : Log2<BH>::v;
+                if (p == 0) inverseAddCt<L0, H0>(q, txSz, type, dcQ, acQ, res, pred, rec);
+                else inverseAddCt<Log2<BW>::v - 1, Log2<BH>::v - 1>(q, txSz, type, dcQ, acQ, res, pred, rec);
+            }
             return 0.f;
         };
         auto recSse = [&]() {
@@ -1018,7 +1033,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                     if (mode == 0) return fwdScore(tmpS[warp], SW, SH, stx, type);
                     warp_quant_rate_rt<8>(tmpS[warp], q, es, os, SW, SH);
                     if (mode == 1) return 0.f;
-                    inverseAddAny(lsw, lsh, q, stx, type, dcQ, acQ, res, pq, rq);
+                    inverseAddCt<lsw, lsh>(q, stx, type, dcQ, acQ, res, pq, rq);
                     return 0.f;
                 };
                 auto sseFn = [&]() {
@@ -1098,7 +1113,8 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                         if (mode == 0) return fwdScore(tmpS[warp], hn, hn, stx, type);
                         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hn, hn);
                         if (mode == 1) return 0.f;
-                        inverseAddAny(lhn, lhn, q, stx, type, dcQ, acQ, res, pq, rq);
+                        if (d == 1) inverseAddCt<Log2<BW>::v - 1, Log2<BW>::v - 1>(q, stx, type, dcQ, acQ, res, pq, rq);
+                        else inverseAddCt<Log2<BW>::v - 2, Log2<BW>::v - 2>(q, stx, type, dcQ, acQ, res, pq, rq);
                         return 0.f;
                     };
                     auto sseFn = [&]() {
@@ -1259,7 +1275,9 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
         if (mode == 0) return fwdScore(tmpS[warp], hw, hh, stx, type);
         warp_quant_rate_rt<8>(tmpS[warp], q, es, os, hw, hh);
         if (mode == 1) return 0.f;
-        inverseAddAny(lsw, lsh, q, stx, type, dcQ, acQ, res, pq, rq);
+        if (!G::sq) inverseAddCt<Log2<G::sw>::v, Log2<G::sh>::v>(q, stx, type, dcQ, acQ, res, pq, rq);
+        else if (d == 1) inverseAddCt<Log2<BW>::v - 1, Log2<BH>::v - 1>(q, stx, type, dcQ, acQ, res, pq, rq);
+        else inverseAddCt<Log2<BW>::v - 2, Log2<BH>::v - 2>(q, stx, type, dcQ, acQ, res, pq, rq);
         return 0.f;
     };
     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
@@ -1287,6 +1305,263 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
         a.subNz[size_t(b) * NSUB + k] = nzS;
         a.subType[size_t(b) * NSUB + k] = (uint8_t)ty;
     }
+}
+
+// Thread-per-transform split search for 4x4 and 8x8 transforms: they keep at most 4 or 8 lanes of a warp busy in the
+// transform passes, so here one lane runs one transform through the same steps as chooseLumaType (DCT_DCT, the
+// forward-only screen of the other types, quantizer estimates of the best three, reconstruction of the winner), with
+// the same arithmetic. Per-lane residual / backup / levels live in shared memory (odd word stride: conflict-free).
+template <int LN>
+struct TCfg {
+    static constexpr int N = 1 << LN, A = N * N, stride = A + 2, threads = LN == 2 ? 128 : 64;
+    static constexpr int txSz = LN == 2 ? AV1G_TX_4X4 : AV1G_TX_8X8;
+};
+template <int LN>
+__device__ __forceinline__ void fwdT(const int16_t *bk, int type, float (&t)[TCfg<LN>::A]) {
+    constexpr int N = TCfg<LN>::N;
+    const int rk = av1g_row_kind(type), ck = av1g_col_kind(type);
+    const int fud = av1g_flip_ud(type), flr = av1g_flip_lr(type);
+    const float *Fc = g_fwd + g_fwdOff[ck][LN], *FcT = g_fwdT + g_fwdOff[ck][LN];
+    const float *Fr = g_fwd + g_fwdOff[rk][LN], *FrT = g_fwdT + g_fwdOff[rk][LN];
+#pragma unroll
+    for (int j = 0; j < N; j++) {
+        const int jj = flr ? N - 1 - j : j;
+        if (ck == AV1G_K_IDT) {
+#pragma unroll
+            for (int i = 0; i < N; i++) t[i * N + j] = __ldg(&Fc[i * N + i]) * (float)bk[(fud ? N - 1 - i : i) * N + jj];
+        } else {
+            float acc[N];
+#pragma unroll
+            for (int i = 0; i < N; i++) acc[i] = 0.f;
+#pragma unroll
+            for (int k = 0; k < N; k++) {
+                const float x = (float)bk[(fud ? N - 1 - k : k) * N + jj];
+                const float4 *f4 = (const float4 *)(FcT + k * N);
+#pragma unroll
+                for (int i4 = 0; i4 < N / 4; i4++) {
+                    const float4 fv = __ldg(&f4[i4]);
+                    acc[4 * i4 + 0] = fmaf(fv.x, x, acc[4 * i4 + 0]);
+                    acc[4 * i4 + 1] = fmaf(fv.y, x, acc[4 * i4 + 1]);
+                    acc[4 * i4 + 2] = fmaf(fv.z, x, acc[4 * i4 + 2]);
+                    acc[4 * i4 + 3] = fmaf(fv.w, x, acc[4 * i4 + 3]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < N; i++) t[i * N + j] = acc[i];
+        }
+    }
+    const float scale = g_txScale[TCfg<LN>::txSz];
+#pragma unroll
+    for (int i = 0; i < N; i++) {
+        float acc[N];
+#pragma unroll
+        for (int jj = 0; jj < N; jj++) acc[jj] = 0.f;
+        if (rk == AV1G_K_IDT) {
+#pragma unroll
+            for (int jj = 0; jj < N; jj++) acc[jj] = __ldg(&Fr[jj * N + jj]) * t[i * N + jj];
+        } else {
+#pragma unroll
+            for (int k = 0; k < N; k++) {
+                const float x = t[i * N + k];
+                const float4 *f4 = (const float4 *)(FrT + k * N);
+#pragma unroll
+                for (int j4 = 0; j4 < N / 4; j4++) {
+                    const float4 fv = __ldg(&f4[j4]);
+                    acc[4 * j4 + 0] = fmaf(fv.x, x, acc[4 * j4 + 0]);
+                    acc[4 * j4 + 1] = fmaf(fv.y, x, acc[4 * j4 + 1]);
+                    acc[4 * j4 + 2] = fmaf(fv.z, x, acc[4 * j4 + 2]);
+                    acc[4 * j4 + 3] = fmaf(fv.w, x, acc[4 * j4 + 3]);
+                }
+            }
+        }
+#pragma unroll
+        for (int jj = 0; jj < N; jj++) t[i * N + jj] = acc[jj] * scale;
+    }
+}
+// quantize (as warp_quant_rate_rt: no matrices) into q, D and R of the levels
+template <int LN>
+__device__ __forceinline__ void quantT(const float (&t)[TCfg<LN>::A], int16_t *q, const EvalIn &e, float &D, float &R) {
+    constexpr int A = TCfg<LN>::A, txSz = TCfg<LN>::txSz;
+    const int den = av1g_dq_denom(txSz);
+    float dist = 0.f;
+#pragma unroll
+    for (int idx = 0; idx < A; idx++) {
+        const float v = t[idx];
+        const int step = idx == 0 ? e.dcQ : e.acQ;
+        const float a = fabsf(v) * (float)den / (float)step;
+        int l = a < e.zbin ? 0 : (int)(a + e.rnd);
+        l = min(l, 16383);
+        const int qv = v < 0 ? -l : l;
+        q[idx] = (int16_t)qv;
+        const float dq = l ? (float)av1g_dequant_coef<8>(qv, step, den) : 0.f;
+        const float d = v - dq;
+        dist = fmaf(d * d, 1.f, dist);
+    }
+    const uint16_t *scan = av1g_get_scan(txSz, e.txType);
+    int eob = 0;
+    for (int c = A - 1; c >= 0; c--)
+        if (q[scan[c]]) { eob = c + 1; break; }
+    float bits = base_bits(e, eob);
+    const int txClass = av1g_tx_class(e.txType);
+    for (int c = 0; c < eob; c++) bits += coeff_bits(c, eob, q, scan, txSz, txClass, 0, e.dcCtx, e.C);
+    D = g_txg[txSz][e.txType] * dist;
+    R = bits;
+}
+// exact inverse + add (warpInverseAdd<LN, LN> on one lane)
+template <int LN>
+__device__ __forceinline__ void inverseTS(int16_t *q, int type, int dcQ, int acQ, int16_t *res, const uint8_t *pred,
+                                          uint8_t *rec, int ps) {
+    constexpr int N = TCfg<LN>::N, A = TCfg<LN>::A, txSz = TCfg<LN>::txSz;
+    const int den = av1g_dq_denom(txSz);
+    const int rk = av1g_row_kind(type), ck = av1g_col_kind(type);
+    const int rowShift = AV1G_T(Transform_Row_Shift)[txSz];
+    for (;;) {
+        int any = 0;
+#pragma unroll
+        for (int i = 0; i < A; i++) any |= q[i];
+        if (!any) {
+            for (int i = 0; i < A; i++) rec[i * ps] = pred[i * ps];
+            return;
+        }
+        uint32_t err = 0;
+        for (int i = 0; i < N; i++) err |= rci::row<LN, 8>(i, N, N, q, dcQ, acQ, nullptr, den, false, rk, rowShift, res);
+        for (int j = 0; j < N; j++) err |= rci::col<LN>(j, N, ck, res);
+        if (!err) break;
+#pragma unroll
+        for (int i = 0; i < A; i++) q[i] = (int16_t)(q[i] / 2);
+    }
+    const int fud = av1g_flip_ud(type), flr = av1g_flip_lr(type);
+    for (int i = 0; i < A; i++) {
+        const int r = i >> LN, c = i & (N - 1);
+        rec[i * ps] = (uint8_t)min(max((int)pred[i * ps] + res[(fud ? N - 1 - r : r) * N + (flr ? N - 1 - c : c)], 0), 255);
+    }
+}
+// One lane per split transform of size 2^LN (dsel as evalSplit).
+template <int BW, int BH, int LN>
+__global__ void __launch_bounds__(TCfg<LN>::threads) evalSplitT(EvalArgs a, int dsel) {
+    using G = SplitGeo<BW, BH>;
+    using T = TCfg<LN>;
+    constexpr int NSUB = G::nsub, N = T::N, A = T::A, S = T::stride, NT = T::threads;
+    __shared__ int16_t resS[NT * S], bkS[NT * S], qS[NT * S];
+    __shared__ uint8_t pS[NT * A], rS[NT * A];
+    const int per0 = dsel == 1 ? (G::sq ? 4 : 2) : dsel == 2 ? 16 : NSUB, off0 = dsel == 2 ? 4 : 0;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= a.blockCount() * per0) return;
+    const int b = a.blockIndex(idx / per0), k = off0 + idx % per0;
+    const Frame &f = a.f;
+    const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
+    const Cand &c = *a.candidate(b, x0, y0);
+    if (x0 >= f.w || y0 >= f.h || c.pruned) return;
+    const size_t o = size_t(b) * NSUB + k;
+    auto none = [&]() { a.subD[o] = kInf; a.subR[o] = 0.f; a.subNz[o] = 0; a.subType[o] = 0; };
+    if (c.trialDepth != 255 && (c.trialDepth == 0 || (c.trialDepth == 1) != (k < (G::sq ? 4 : 2)))) { none(); return; }
+    if (a.splitPrune && !c.nzWhole) { none(); return; }
+    if (dsel == 2 && c.trialDepth != 2) {
+        float d1 = 0.f, r1 = 0.f;
+        for (int j = 0; j < 4; j++) { d1 += a.subD[size_t(b) * NSUB + j]; r1 += a.subR[size_t(b) * NSUB + j]; }
+        const float j0 = c.lumaD + a.lambda * c.lumaBits, j1 = d1 + a.lambda * (r1 + 1.f);
+        if (!(j1 < a.d2Margin * j0)) { none(); return; }
+    }
+    const int d = k < 4 ? 1 : 2, kk = k < 4 ? k : k - 4, per = 1 << d;
+    const int qx = G::sq ? (kk % per) * N : (BW > BH ? k * N : 0), qy = G::sq ? (kk / per) * N : (BW > BH ? 0 : k * N);
+    const int pw = f.w, ph = f.h, pitch = f.pitch[0];
+    const uint8_t *src = f.src[0], *predF = a.pred;
+    int16_t *res = resS + threadIdx.x * S, *bk = bkS + threadIdx.x * S, *q = qS + threadIdx.x * S;
+    uint8_t *pq = pS + threadIdx.x, *rq = rS + threadIdx.x;   // element i at [i * NT]
+    for (int i = 0; i < A; i++) {
+        const int x = x0 + qx + (i & (N - 1)), y = y0 + qy + (i >> LN);
+        int dd = 0;
+        uint8_t pv = 0;
+        if (x < pw && y < ph) { pv = predF[size_t(y) * pw + x]; dd = (int)src[y * pitch + x] - pv; }
+        pq[i * NT] = pv;
+        bk[i] = (int16_t)dd;
+    }
+    EvalIn e{};
+    e.txSz = T::txSz; e.txType = AV1G_DCT_DCT; e.plane = 0;
+    e.dcQ = av1g_dc_q(a.qindex); e.acQ = av1g_ac_q(a.qindex); e.qm = nullptr;
+    e.rnd = a.rnd; e.zbin = a.zbin;
+    e.skipCtx = 2; e.dcCtx = 0; e.intraDir = -1; e.reduced = 1;
+    e.C = g_cost[a.qctx];
+    e.qmDist = 0; e.qmRnd = 0;
+    uint8_t *tmap = d == 1 ? a.types2 : a.types3;
+    const bool enabled = tmap != nullptr && a.splitTypes < 2, exhaustive = a.txExhaustive != 0 && a.splitTypes == 0;
+    const int set = enabled ? pft2::interTxSet(T::txSz, a.reducedTxSet) : AV1G_TX_SET_DCTONLY;
+    const int sq = AV1G_T(Tx_Size_Sqr)[T::txSz];
+    const int n = pft2::interTxCount(set);
+    float t[A], D, R;
+    auto full = [&](int type) {
+        e.txType = type;
+        fwdT<LN>(bk, type, t);
+        quantT<LN>(t, q, e, D, R);
+        inverseTS<LN>(q, type, e.dcQ, e.acQ, res, pq, rq, NT);
+    };
+    full(AV1G_DCT_DCT);
+    int best = AV1G_DCT_DCT;
+    int any = 0;
+#pragma unroll
+    for (int i = 0; i < A; i++) any |= q[i];
+    if (set != AV1G_TX_SET_DCTONLY && any) {
+        float bestJ = D + a.lambda * (R + interTypeBits(set, sq, pft2::interTxIndex(set, AV1G_DCT_DCT)));
+        constexpr int kTop = 3;
+        const bool screen = n > 4;
+        int top[kTop] = {-1, -1, -1};
+        float topS[kTop] = {3.4e38f, 3.4e38f, 3.4e38f};
+        if (screen)
+            for (int i = 0; i < n; i++) {
+                const int ty = pft2::interTxInv(set, i);
+                if (ty == AV1G_DCT_DCT || (!exhaustive && (av1g_flip_ud(ty) || av1g_flip_lr(ty) || ty >= AV1G_V_ADST))) continue;
+                fwdT<LN>(bk, ty, t);
+                float sc = 0.f;
+#pragma unroll
+                for (int j = 0; j < A; j++) sc += fabsf(t[j]);
+                sc *= sqrtf(g_txg[T::txSz][ty]);
+                int tt = ty;
+#pragma unroll
+                for (int m = 0; m < kTop; m++)
+                    if (sc < topS[m]) { const float fs = topS[m]; const int ft = top[m]; topS[m] = sc; top[m] = tt; sc = fs; tt = ft; }
+            }
+        const int nCand = screen ? kTop : n;
+        for (int ci = 0; ci < nCand; ci++) {
+            const int ty = screen ? top[ci] : pft2::interTxInv(set, ci);
+            if (ty < 0 || ty == AV1G_DCT_DCT || (!screen && !exhaustive && (av1g_flip_ud(ty) || av1g_flip_lr(ty) || ty >= AV1G_V_ADST)))
+                continue;
+            e.txType = ty;
+            fwdT<LN>(bk, ty, t);
+            quantT<LN>(t, q, e, D, R);
+            const float J = D + a.lambda * (R + interTypeBits(set, sq, pft2::interTxIndex(set, ty)));
+            if (J < bestJ) { bestJ = J; best = ty; }
+        }
+        full(best);
+        if (best != AV1G_DCT_DCT) {
+            any = 0;
+#pragma unroll
+            for (int i = 0; i < A; i++) any |= q[i];
+            if (!any) { best = AV1G_DCT_DCT; full(best); }
+        }
+        R += interTypeBits(set, sq, pft2::interTxIndex(set, best));
+    } else if (set != AV1G_TX_SET_DCTONLY) {
+        R += interTypeBits(set, sq, pft2::interTxIndex(set, AV1G_DCT_DCT));
+    }
+    const int tstride = f.aw >> 2;
+    if (tmap)
+        for (int i = 0; i < (N >> 2) * (N >> 2); i++)
+            tmap[size_t(((y0 + qy) >> 2) + i / (N >> 2)) * tstride + ((x0 + qx) >> 2) + i % (N >> 2)] = (uint8_t)best;
+    int16_t *dstLev = d == 1 ? a.levels2 : a.levels3;
+    uint8_t *dstRec = d == 1 ? a.recon2 : a.recon3;
+    int anyS = 0, sse = 0;
+    for (int i = 0; i < A; i++) {
+        anyS |= q[i];
+        const int x = x0 + qx + (i & (N - 1)), y = y0 + qy + (i >> LN);
+        dstLev[size_t(y) * f.aw + x] = q[i];
+        if (x >= pw || y >= ph) continue;
+        const int dd = (int)src[y * pitch + x] - rq[i * NT];
+        sse += dd * dd;
+        dstRec[y * pw + x] = rq[i * NT];
+    }
+    a.subD[o] = (float)sse;
+    a.subR[o] = R;
+    a.subNz[o] = anyS != 0;
+    a.subType[o] = (uint8_t)best;
 }
 
 // Split-external evaluation, last step: luma depth from the evalSplit results, chroma with the type of the top-left
@@ -1359,7 +1634,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
         EvalOut o;
         warp_fwd_rt(res, tmpS[warp], CW, CH, txSz, e.txType);
         warp_quant_rate_rt<8>(tmpS[warp], q, e, o, CW, CH);
-        inverseAddAny(lw, lh, q, txSz, e.txType, dcQ, acQ, res, pred, rec);
+        inverseAddCt<lw, lh>(q, txSz, e.txType, dcQ, acQ, res, pred, rec);
         bC += o.R;
         int any = 0;
         for (int i = lane; i < CW * CH; i += 32) any |= q[i];
@@ -1412,7 +1687,23 @@ void launchEvaluation(EvalArgs a, bool splitExternal, cudaStream_t stream,
     { FineTimer t(a.trials ? nullptr : whole); evaluate<BW, BH, true><<<blocks, 32 * warps, 0, stream>>>(a); }
     {
         FineTimer t(a.trials ? nullptr : split);
-        if constexpr (BW == BH && BW >= 16) {
+        // thread-per-transform kernels for dense launches (sparse refinement trials keep one warp per transform: few
+        // transforms in flight are latency-bound)
+        constexpr int t8 = TCfg<3>::threads;
+        const bool s4 = g_split4 && !a.trials, s8 = g_split8 && !a.trials;
+        if constexpr (BW == 8 && BH == 8) {
+            if (s4) evalSplitT<8, 8, 2><<<(nb * 4 + 127) / 128, 128, 0, stream>>>(a, 0);
+            else evalSplit<BW, BH><<<(nb * 4 + 3) / 4, 128, 0, stream>>>(a, 0);
+        } else if constexpr (BW == 16 && BH == 16) {
+            if (s8) evalSplitT<16, 16, 3><<<(nb * 4 + t8 - 1) / t8, t8, 0, stream>>>(a, 1);
+            else evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            if (s4) evalSplitT<16, 16, 2><<<(nb * 16 + 127) / 128, 128, 0, stream>>>(a, 2);
+            else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
+        } else if constexpr (BW == 32 && BH == 32) {
+            evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
+            if (s8) evalSplitT<32, 32, 3><<<(nb * 16 + t8 - 1) / t8, t8, 0, stream>>>(a, 2);
+            else evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
+        } else if constexpr (BW == BH && BW >= 16) {
             evalSplit<BW, BH><<<nb, 128, 0, stream>>>(a, 1);
             evalSplit<BW, BH><<<nb * 4, 128, 0, stream>>>(a, 2);
         } else {
