@@ -562,12 +562,26 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
         const float c = costOf(m);
         if (c < bc) { bc = c; bm = m; }
     };
-    for (int i = 0; i < n; i++) tryMv(Mv{(int16_t)(cand[i][0] * 8), (int16_t)(cand[i][1] * 8)});
+    // repeated vectors cannot change the choice (ties keep the first): duplicate candidates are skipped, and so are
+    // the neighbours of a new centre that were neighbours of the previous one
+    for (int i = 0; i < n; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) seen |= cand[j][0] == cand[i][0] && cand[j][1] == cand[i][1];
+        if (!seen) tryMv(Mv{(int16_t)(cand[i][0] * 8), (int16_t)(cand[i][1] * 8)});
+    }
+    Mv prev{0, 0};
+    bool havePrev = false;
     for (int pass = 0; pass < fullPelPasses; pass++) {
         const Mv c0 = bm;
-        for (int k = 0; k < 9; k++)
-            if (k != 4) tryMv(Mv{(int16_t)(c0.row + (k / 3 - 1) * 8), (int16_t)(c0.col + (k % 3 - 1) * 8)});
+        for (int k = 0; k < 9; k++) {
+            if (k == 4) continue;
+            const Mv m{(int16_t)(c0.row + (k / 3 - 1) * 8), (int16_t)(c0.col + (k % 3 - 1) * 8)};
+            if (havePrev && abs(m.row - prev.row) <= 8 && abs(m.col - prev.col) <= 8) continue;
+            tryMv(m);
+        }
         if (bm == c0) break;
+        prev = c0;
+        havePrev = true;
     }
     for (int step = 4; step >= 2; step >>= 1) {
         const Mv c0 = bm;
