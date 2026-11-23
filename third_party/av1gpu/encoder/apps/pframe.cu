@@ -117,6 +117,78 @@ __device__ __forceinline__ float mvBits(Mv mv, Mv pred) {
     return 3.0f + mvCompBits(dr) + mvCompBits(dc);
 }
 
+// Four bytes at any address (two aligned loads and a funnel shift; may read up to 3 bytes past a + 3: the phase planes
+// carry 16 bytes of padding).
+__device__ __forceinline__ uint32_t ldu32(const uint8_t *a) {
+    const uintptr_t ad = reinterpret_cast<uintptr_t>(a);
+    const uint32_t *b = reinterpret_cast<const uint32_t *>(ad & ~uintptr_t(3));
+    return __funnelshift_r(__ldg(b), __ldg(b + 1), unsigned(ad & 3) * 8);
+}
+// Horizontal eight-tap pass of an inter prediction (rows iy - 3 .. iy + h + 3, Round2(sum, 3) into tmp, row stride w).
+// Blocks whose taps stay inside the plane (with 12 samples of margin on the right for the word loads) take four outputs
+// per lane step from three word loads; others clamp every tap.
+__device__ __forceinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
+                                        const int16_t *filt, int16_t *tmp) {
+    const int lane = threadIdx.x & 31, ih = h + 7;
+    int f[8];
+#pragma unroll
+    for (int t = 0; t < 8; t++) f[t] = filt[t];
+    if (ix >= 3 && ix + w + 12 <= pw && iy >= 3 && iy + h + 4 <= ph) {
+        const int lq = lw - 2, qw = 1 << lq;
+        for (int u = lane; u < ih << lq; u += 32) {
+            const int r = u >> lq, c = (u & (qw - 1)) << 2;
+            const uint8_t *sp = ref + (iy + r - 3) * pw + ix + c - 3;
+            const uint32_t w0 = ldu32(sp), w1 = ldu32(sp + 4), w2 = ldu32(sp + 8);
+            int b[11];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                b[k] = (w0 >> (8 * k)) & 255;
+                b[4 + k] = (w1 >> (8 * k)) & 255;
+                if (k < 3) b[8 + k] = (w2 >> (8 * k)) & 255;
+            }
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                int sum = 0;
+#pragma unroll
+                for (int t = 0; t < 8; t++) sum += f[t] * b[k + t];
+                tmp[r * w + c + k] = (int16_t)round2(sum, 3);
+            }
+        }
+    } else {
+        const int lastX = pw - 1, lastY = ph - 1;
+        for (int i = lane; i < ih * w; i += 32) {
+            const int r = i >> lw, c = i & (w - 1);
+            const uint8_t *row = ref + min(max(iy + r - 3, 0), lastY) * pw;
+            int sum = 0;
+#pragma unroll
+            for (int t = 0; t < 8; t++) sum += f[t] * row[min(max(ix + c + t - 3, 0), lastX)];
+            tmp[i] = (int16_t)round2(sum, 3);
+        }
+    }
+    __syncwarp();
+}
+// Vertical eight-tap pass: four output rows per lane step from eleven intermediate rows; emit(i, sum) per output.
+template <class Emit>
+__device__ __forceinline__ void interpV(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
+    const int lane = threadIdx.x & 31;
+    int f[8];
+#pragma unroll
+    for (int t = 0; t < 8; t++) f[t] = filt[t];
+    for (int u = lane; u < (w * h) >> 2; u += 32) {
+        const int c = u & (w - 1), r0 = (u >> lw) << 2;
+        int v[11];
+#pragma unroll
+        for (int k = 0; k < 11; k++) v[k] = tmp[(r0 + k) * w + c];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int sum = 0;
+#pragma unroll
+            for (int t = 0; t < 8; t++) sum += f[t] * v[k + t];
+            emit((r0 + k) * w + c, sum);
+        }
+    }
+    __syncwarp();
+}
 // ------------------------------------------------------------------------------------------------
 // Exact AV1 single-reference inter prediction (spec 7.11.3.3 / 7.11.3.4, unscaled reference, regular
 // eight-tap filter; blocks of width or height 4 use the four-tap variant). One warp predicts a w x h block.
@@ -127,6 +199,7 @@ __device__ __forceinline__ int filterRow(int f, int n) { return n <= 4 ? (f == 1
 __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, int w, int h, Mv mv, int sub,
                             int16_t *tmp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
+    const int lw = 31 - __clz(w);   // block widths are powers of two
     const int X = (x0 << 4) + ((2 * mv.col) >> sub);
     const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
     const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
@@ -134,30 +207,14 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
     const int lastX = pw - 1, lastY = ph - 1;
     if (!fx && !fy) {
         for (int i = lane; i < w * h; i += 32) {
-            const int r = i / w, c = i - r * w;
+            const int r = i >> lw, c = i & (w - 1);
             out[i] = ref[min(max(iy + r, 0), lastY) * pw + min(max(ix + c, 0), lastX)];
         }
         __syncwarp();
         return;
     }
-    const int ih = h + 7;
-    for (int i = lane; i < ih * w; i += 32) {
-        const int r = i / w, c = i - r * w;
-        const uint8_t *row = ref + min(max(iy + r - 3, 0), lastY) * pw;
-        int s = 0;
-#pragma unroll
-        for (int t = 0; t < 8; t++) s += c_filter[fh][fx][t] * row[min(max(ix + c + t - 3, 0), lastX)];
-        tmp[i] = (int16_t)round2(s, 3);
-    }
-    __syncwarp();
-    for (int i = lane; i < w * h; i += 32) {
-        const int r = i / w, c = i - r * w;
-        int s = 0;
-#pragma unroll
-        for (int t = 0; t < 8; t++) s += c_filter[fv][fy][t] * tmp[(r + t) * w + c];
-        out[i] = (uint8_t)min(max(round2(s, 11), 0), 255);
-    }
-    __syncwarp();
+    interpH(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
+    interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { out[i] = (uint8_t)min(max(round2(sum, 11), 0), 255); });
 }
 
 // Exact AV1 compound-average prediction (spec 7.11.3.1 with InterRound1 = 7 and InterPostRound = 4):
@@ -165,34 +222,19 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
 __device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, int pw, int ph, int x0, int y0, int w,
                                     int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out, int filt = 0) {
     const int lane = threadIdx.x & 31;
+    const int lw = 31 - __clz(w);   // block widths are powers of two
     const int fh = filterRow(filt, w), fv = filterRow(filt, h);
-    const int lastX = pw - 1, lastY = ph - 1;
-    const int ih = h + 7;
     for (int k = 0; k < 2; k++) {
         const uint8_t *ref = k ? ref1 : ref0;
         const Mv mv = k ? mv1 : mv0;
         const int X = (x0 << 4) + ((2 * mv.col) >> sub);
         const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
         const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
-        for (int i = lane; i < ih * w; i += 32) {
-            const int r = i / w, c = i - r * w;
-            const uint8_t *row = ref + min(max(iy + r - 3, 0), lastY) * pw;
-            int s = 0;
-#pragma unroll
-            for (int t = 0; t < 8; t++) s += c_filter[fh][fx][t] * row[min(max(ix + c + t - 3, 0), lastX)];
-            tmp[i] = (int16_t)round2(s, 3);
-        }
-        __syncwarp();
-        for (int i = lane; i < w * h; i += 32) {
-            const int r = i / w, c = i - r * w;
-            int s = 0;
-#pragma unroll
-            for (int t = 0; t < 8; t++) s += c_filter[fv][fy][t] * tmp[(r + t) * w + c];
-            const int v = round2(s, 7);
-            if (!k) hp[i] = (int16_t)v;
-            else out[i] = (uint8_t)min(max(round2(hp[i] + v, 5), 0), 255);
-        }
-        __syncwarp();
+        interpH(ref, pw, ph, ix, iy, w, lw, h, c_filter[fh][fx], tmp);
+        if (!k) interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) { hp[i] = (int16_t)round2(sum, 7); });
+        else interpV(tmp, w, lw, h, c_filter[fv][fy], [&](int i, int sum) {
+            out[i] = (uint8_t)min(max(round2(hp[i] + round2(sum, 7), 5), 0), 255);
+        });
     }
 }
 
@@ -324,13 +366,6 @@ template <int BW, int BH> struct Grp {
 template <int V> struct Log2 { static constexpr int v = V <= 1 ? 0 : 1 + Log2<V / 2>::v; };
 template <> struct Log2<1> { static constexpr int v = 0; };
 
-// Four bytes at any address (two aligned loads and a funnel shift; may read up to 3 bytes past a + 3: the phase planes
-// carry 16 bytes of padding).
-__device__ __forceinline__ uint32_t ldu32(const uint8_t *a) {
-    const uintptr_t ad = reinterpret_cast<uintptr_t>(a);
-    const uint32_t *b = reinterpret_cast<const uint32_t *>(ad & ~uintptr_t(3));
-    return __funnelshift_r(__ldg(b), __ldg(b + 1), unsigned(ad & 3) * 8);
-}
 template <int BW, int BH>
 __device__ __forceinline__ int groupSadPlane(const uint8_t *src, int pitch, const uint8_t *plane, int w, int h, int x0,
                                              int y0, int dx, int dy) {
@@ -836,8 +871,8 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     constexpr int TS = (BH > 32 ? 32 : BH) * (BW + 1);              // forward transform scratch
     __shared__ int16_t interp[W][(BH + 7) * BW];
     __shared__ int16_t hpS[W][AREA];
-    __shared__ uint8_t predS[W][AREA + AREA / 2];
-    __shared__ uint8_t recS[W][AREA];
+    __shared__ __align__(16) uint8_t predS[W][AREA + AREA / 2];
+    __shared__ __align__(16) uint8_t recS[W][AREA];
     __shared__ int16_t resS[W][AREA];
     __shared__ float tmpS[W][TS];
     __shared__ int16_t qS[W][TQ];
@@ -870,6 +905,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     // interpolation filter (one per block, both references): luma SSE plus approximate interp_filter bits, tried only
     // when a vector is fractional in some plane (1/16 chroma units: luma integer vectors may be chroma half-pel)
     int filt = 0;
+    bool searched = false;   // the luma prediction of the chosen filter is already in predS
     if (a.switchable && !c.skipModeTrial && (((c.mv.row | c.mv.col) & 15) || (c.ref == 2 && ((c.mv2.row | c.mv2.col) & 15)))) {
         const float fbits[3] = {0.21f, 2.9f, 7.6f};   // Default_Interp_Filter_Cdf context 3 (no neighbour information)
         float bestJ = 3.4e38f;
@@ -887,8 +923,22 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
                 v += d * d;
             }
             const float J = (float)warp_sumi(v) + a.lambda * (t ? fbits[t] * a.filterBias : fbits[t]);
-            if (J < bestJ) { bestJ = J; filt = t; }
+            if (J < bestJ) {
+                bestJ = J;
+                filt = t;
+                if (t < 2) {   // keep it (recS is free until the reconstruction)
+                    for (int i = lane; i < AREA / 4; i += 32)
+                        reinterpret_cast<uint32_t *>(recS[warp])[i] = reinterpret_cast<const uint32_t *>(pl)[i];
+                    __syncwarp();
+                }
+            }
         }
+        if (filt != 2) {
+            for (int i = lane; i < AREA / 4; i += 32)
+                reinterpret_cast<uint32_t *>(pl)[i] = reinterpret_cast<const uint32_t *>(recS[warp])[i];
+            __syncwarp();
+        }
+        searched = true;
     }
     if (!lane) c.filter = (uint8_t)filt;
 #pragma unroll
@@ -899,7 +949,8 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         const int px = x0 >> sub, py = y0 >> sub;
         uint8_t *pred = predS[warp] + (p ? AREA + (p - 1) * (AREA / 4) : 0);
         const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
-        if (c.ref == 2)
+        if (p == 0 && searched) {
+        } else if (c.ref == 2)
             warpPredictCompound(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, bw, bh, c.mv, c.mv2, sub,
                                 interp[warp], hpS[warp], pred, filt);
         else
