@@ -324,6 +324,13 @@ template <int BW, int BH> struct Grp {
 template <int V> struct Log2 { static constexpr int v = V <= 1 ? 0 : 1 + Log2<V / 2>::v; };
 template <> struct Log2<1> { static constexpr int v = 0; };
 
+// Four bytes at any address (two aligned loads and a funnel shift; may read up to 3 bytes past a + 3: the phase planes
+// carry 16 bytes of padding).
+__device__ __forceinline__ uint32_t ldu32(const uint8_t *a) {
+    const uintptr_t ad = reinterpret_cast<uintptr_t>(a);
+    const uint32_t *b = reinterpret_cast<const uint32_t *>(ad & ~uintptr_t(3));
+    return __funnelshift_r(__ldg(b), __ldg(b + 1), unsigned(ad & 3) * 8);
+}
 template <int BW, int BH>
 __device__ __forceinline__ int groupSadPlane(const uint8_t *src, int pitch, const uint8_t *plane, int w, int h, int x0,
                                              int y0, int dx, int dy) {
@@ -331,9 +338,16 @@ __device__ __forceinline__ int groupSadPlane(const uint8_t *src, int pitch, cons
     const int lane = Grp<BW, BH>::lane();
     int s = 0;
     const bool inside = x0 + dx >= 0 && y0 + dy >= 0 && x0 + dx + BW <= w && y0 + dy + BH <= h && x0 + BW <= w && y0 + BH <= h;
-    if (inside) {
+    const uint8_t *q = src + size_t(y0) * pitch + x0;
+    if (inside && !((reinterpret_cast<uintptr_t>(q) | unsigned(pitch)) & 3)) {   // four samples per lane step
         const uint8_t *p = plane + size_t(y0 + dy) * w + x0 + dx;
-        const uint8_t *q = src + size_t(y0) * pitch + x0;
+#pragma unroll 4
+        for (int u = lane; u < BW * BH / 4; u += G) {
+            const int i = u * 4, r = i >> L, c = i & (BW - 1);
+            s = __vsadu4(*reinterpret_cast<const uint32_t *>(q + r * pitch + c), ldu32(p + r * w + c)) + s;
+        }
+    } else if (inside) {
+        const uint8_t *p = plane + size_t(y0 + dy) * w + x0 + dx;
 #pragma unroll 4
         for (int i = lane; i < BW * BH; i += G) {
             const int r = i >> L, c = i & (BW - 1);
@@ -351,11 +365,12 @@ __device__ __forceinline__ int groupSadPlane(const uint8_t *src, int pitch, cons
     return Grp<BW, BH>::sum(s);
 }
 
-// SAD against source samples cached in registers (sv[k] = sample lane + k * G of the block, area <= 1024).
+// SAD against source samples cached in registers, four per word (sv[k] = samples 4 * (lane + k * G) .. + 3 of the
+// block, area <= 1024).
 template <int BW, int BH>
-__device__ __forceinline__ int groupSadCached(const uint8_t *sv, const uint8_t *src, int pitch, const uint8_t *plane,
+__device__ __forceinline__ int groupSadCached(const uint32_t *sv, const uint8_t *src, int pitch, const uint8_t *plane,
                                               int w, int h, int x0, int y0, int dx, int dy) {
-    constexpr int L = Log2<BW>::v, G = Grp<BW, BH>::G, PL = BW * BH / G;
+    constexpr int L = Log2<BW>::v, G = Grp<BW, BH>::G, PL = BW * BH / (4 * G);
     const int lane = Grp<BW, BH>::lane();
     const bool inside = x0 + dx >= 0 && y0 + dy >= 0 && x0 + dx + BW <= w && y0 + dy + BH <= h && x0 + BW <= w && y0 + BH <= h;
     if (!inside) return groupSadPlane<BW, BH>(src, pitch, plane, w, h, x0, y0, dx, dy);
@@ -363,8 +378,8 @@ __device__ __forceinline__ int groupSadCached(const uint8_t *sv, const uint8_t *
     int s = 0;
 #pragma unroll
     for (int k = 0; k < PL; k++) {
-        const int i = lane + k * G, r = i >> L, c = i & (BW - 1);
-        s += abs((int)sv[k] - (int)p[r * w + c]);
+        const int i = 4 * (lane + k * G), r = i >> L, c = i & (BW - 1);
+        s = __vsadu4(sv[k], ldu32(p + r * w + c)) + s;
     }
     return Grp<BW, BH>::sum(s);
 }
@@ -434,14 +449,18 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) refine(Frame f,
             add(t);
         }
     }
-    constexpr int CL = BW * BH <= 1024 ? BW * BH / GR::G : 1;   // cached source samples per lane
-    uint8_t sv[CL];
+    constexpr int CL = BW * BH <= 1024 ? BW * BH / (4 * GR::G) : 1;   // cached source words (4 samples) per lane
+    uint32_t sv[CL];
     if constexpr (BW * BH <= 1024) {
         constexpr int L = Log2<BW>::v;
 #pragma unroll
         for (int k = 0; k < CL; k++) {
-            const int i = GR::lane() + k * GR::G, r = i >> L, c = i & (BW - 1);
-            sv[k] = (x0 + c < f.w && y0 + r < f.h) ? src[(y0 + r) * pitch + x0 + c] : 0;
+            const int i = 4 * (GR::lane() + k * GR::G), r = i >> L, c = i & (BW - 1);
+            uint32_t v = 0;
+#pragma unroll
+            for (int t = 0; t < 4; t++)
+                if (x0 + c + t < f.w && y0 + r < f.h) v |= uint32_t(src[(y0 + r) * pitch + x0 + c + t]) << (8 * t);
+            sv[k] = v;
         }
     }
     auto costOf = [&](Mv m) {
@@ -3037,7 +3056,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->cdefCur, sizeof(unsigned long long) * size_t((w + 63) / 64) * ((h + 63) / 64));
         alloc(&s->cdefChoice, sizeof(CdefChoice));
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
-        for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
+        for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h + 16);   // + 16: ldu32 over-read
     }
     {
         const int miCols = 2 * ((w + 7) >> 3), miRows = 2 * ((h + 7) >> 3);
