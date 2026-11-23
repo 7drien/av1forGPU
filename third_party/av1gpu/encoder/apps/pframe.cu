@@ -72,6 +72,7 @@ struct Cand {
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
     uint8_t skipModeTrial;   // mode-refinement trial of skip_mode: EIGHTTAP prediction (no filter search)
+    uint8_t trialDepth;      // mode-refinement trial: luma transform depth to keep (0..2), 255 = search
 };
 
 struct ModeTrial {
@@ -526,6 +527,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) chooseInter(Fra
         c.mv2 = c.mvR[1];
         c.mvBits = bits;
         c.skipModeTrial = 0;
+        c.trialDepth = 255;
     }
 }
 
@@ -653,13 +655,14 @@ __global__ void pruneRect(Cand *rc, int rcols, int rrows, int bw, int bh, const 
 // same rule as pruneRect. A pruned parent prunes its children; a parent crossing the frame edge (which must split)
 // never prunes them.
 __global__ void pruneSquare(Cand *cc, int ccols, int crows, int n, const Cand *parent, int pcols, int w, int h,
-                            float margin) {
+                            float margin, int force = 0) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= ccols * crows) return;
     const int x0 = (b % ccols) * n, y0 = (b / ccols) * n;
     const int px = x0 / (2 * n) * (2 * n), py = y0 / (2 * n) * (2 * n);
     const Cand &p = parent[(py / (2 * n)) * pcols + px / (2 * n)];
     const bool mustSplit = px + n >= w || py + n >= h;
+    if (force) { cc[b].pruned = !mustSplit; return; }   // level disabled: kept only where the parent must split
     cc[b].pruned = margin > 0.f && !mustSplit && (p.pruned || !(p.nz && p.costCoded < p.costSkip * margin));
 }
 template <int BW, int BH>
@@ -1194,12 +1197,17 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     const Cand &c = *a.candidate(b, x0, y0);
     if (x0 >= f.w || y0 >= f.h || c.pruned) return;
+    // a refinement trial keeping its block's transform depth computes only that depth's split transforms
+    if (c.trialDepth != 255 && (c.trialDepth == 0 || (c.trialDepth == 1) != (k < (G::sq ? 4 : 2)))) {
+        if (!lane) { a.subD[size_t(b) * NSUB + k] = kInf; a.subR[size_t(b) * NSUB + k] = 0.f; a.subNz[size_t(b) * NSUB + k] = 0; a.subType[size_t(b) * NSUB + k] = 0; }
+        return;
+    }
     // split pruning (moving content): no split transform when the whole-block transform quantizes to nothing
     if (a.splitPrune && !c.nzWhole) {
         if (!lane) { a.subD[size_t(b) * NSUB + k] = kInf; a.subR[size_t(b) * NSUB + k] = 0.f; a.subNz[size_t(b) * NSUB + k] = 0; a.subType[size_t(b) * NSUB + k] = 0; }
         return;
     }
-    if (dsel == 2) {
+    if (dsel == 2 && c.trialDepth != 2) {
         float d1 = 0.f, r1 = 0.f;
         for (int j = 0; j < 4; j++) { d1 += a.subD[size_t(b) * NSUB + j]; r1 += a.subR[size_t(b) * NSUB + j]; }
         const float j0 = c.lumaD + a.lambda * c.lumaBits, j1 = d1 + a.lambda * (r1 + 1.f);
@@ -1809,6 +1817,7 @@ struct RefinementArgs {
     int *trialIndices[kShapes];
     float lambda, origMvWeight, screenWeight;
     int pass;
+    int keepDepth;   // trials keep the block's transform depth (no split search)
 };
 
 struct MotionOption {
@@ -1978,6 +1987,7 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
         trial.cand.mv2 = option.mv[1];
         trial.cand.ref = option.skipMode ? 2 : bi.ref;
         trial.cand.skipModeTrial = (uint8_t)option.skipMode;
+        trial.cand.trialDepth = a.keepDepth ? (bi.skip ? 0 : bi.txSplit) : 255;
         trial.skipMode = option.skipMode != 0;
         trial.cand.pruned = 0;
         trial.cand.mvBits = 0;
@@ -2914,6 +2924,11 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         for (int r = 0; r < refCount; r++) f.tmv[r] = s->mfDev + size_t(syntax.refName[r]) * cells;
     }
     const BlockInfo *temporal = s->havePrev ? s->prevGrid : nullptr;
+    // without the 8x8 level (Settings::blocks8 false): 8x8 blocks only where their 16x16 node crosses the frame edge
+    // and must split; the others are pruned before motion search
+    if (!st.blocks8)
+        pruneSquare<<<(s->cols[0] * s->rows[0] + 127) / 128, 128, 0, stream>>>(s->cand[0], s->cols[0], s->rows[0], 8,
+                                                                            s->cand[1], s->cols[1], w, h, 0.f, 1);
     for (int r = 0; r < refCount; r++) {
         { FineTimer ft_("phase planes");
         horizontalPhases<<<dim3((w + 31) / 32, (h + 7) / 8, 4), dim3(32, 8), 0, stream>>>(refs[r], w, h, s->hphase);
@@ -2923,7 +2938,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     refine<N, N><<<(s->cols[K] * s->rows[K] + RefineCfg<N, N>::per() - 1) / RefineCfg<N, N>::per(),               \
                    32 * RefineCfg<N, N>::warps, 0, stream>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,             \
                                                   K == 3 ? nullptr : s->cand[K + 1], K == 3 ? 0 : s->cols[K + 1],    \
-                                                  2 * N, temporal, s->gcols, s->cand[K], s->cols[K], s->rows[K], lambdaSad)
+                                                  2 * N, temporal, s->gcols, s->cand[K], s->cols[K], s->rows[K], lambdaSad, \
+                                                  K == 0 && !st.blocks8)
         PF_REFINE(3, 64);
         PF_REFINE(2, 32);
         PF_REFINE(1, 16);
@@ -2955,6 +2971,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.rdoq = st.rdoq;
     ea.d2Margin = getenv("AV1GPU_PF_D2MARGIN") ? (float)atof(getenv("AV1GPU_PF_D2MARGIN")) : 1.0f;
     static const bool splitExternal = !getenv("AV1GPU_PF_INKERNEL") ;
+    bool splitSearch = st.txSplit;   // evaluations search split transforms (the refinement trials may not)
     ea.reducedTxSet = st.txTypes == 1;
     ea.switchable = st.switchableFilter;
     ea.filterBias = getenv("AV1GPU_PF_FBIAS") ? (float)atof(getenv("AV1GPU_PF_FBIAS")) : 16.f;
@@ -2963,7 +2980,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #define PF_EVAL(K, N)                                                                                         \
     ea.cand = s->cand[K]; ea.cols = s->cols[K]; ea.rows = s->rows[K];                                        \
     ea.pred = s->pred[K]; ea.recon = s->recon[K]; ea.levels = s->levels[K];                                   \
-    ea.recon2 = st.txSplit ? s->recon2[K] : nullptr; ea.levels2 = s->levels2[K];                              \
+    ea.recon2 = splitSearch ? s->recon2[K] : nullptr; ea.levels2 = s->levels2[K];                             \
     ea.recon3 = s->recon3[K]; ea.levels3 = s->levels3[K];                                                     \
     ea.types1 = st.txTypes ? s->types1[K] : nullptr; ea.types2 = st.txTypes ? s->types2[K] : nullptr;         \
     ea.types3 = st.txTypes ? s->types3[K] : nullptr;                                                          \
@@ -2974,7 +2991,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
 #define PF_REVAL(RK, BW, BH)                                                                                  \
     ea.cand = s->rcand[RK]; ea.cols = s->rcols[RK]; ea.rows = s->rrows[RK];                                 \
     ea.pred = s->rpred[RK]; ea.recon = s->rrecon[RK]; ea.levels = s->rlevels[RK];                              \
-    ea.recon2 = st.txSplit ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                          \
+    ea.recon2 = splitSearch ? s->rrecon2[RK] : nullptr; ea.levels2 = s->rlevels2[RK];                         \
     ea.types1 = st.txTypes ? s->types1[4 + RK] : nullptr; ea.types2 = st.txTypes ? s->types2[4 + RK] : nullptr; \
     ea.types3 = nullptr;                                                                                     \
     ea.subD = s->rsubD[RK]; ea.subR = s->rsubR[RK]; ea.subNz = s->rsubNz[RK]; ea.subType = s->rsubType[RK];   \
@@ -3007,7 +3024,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         if (K < kSizes - 1) {
             if (sqMargin > 0.f) cudaStreamWaitEvent(ks, s->sqDone[K + 1], 0);
             pruneSquare<<<(s->cols[K] * s->rows[K] + 127) / 128, 128, 0, ks>>>(s->cand[K], s->cols[K], s->rows[K], 8 << K,
-                                                                           s->cand[K + 1], s->cols[K + 1], w, h, sqMargin);
+                                                                           s->cand[K + 1], s->cols[K + 1], w, h, sqMargin,
+                                                                           K == 0 && !st.blocks8);
         }
         if (K == 3) PF_ON(3, PF_EVAL(3, 64));
         if (K == 2) PF_ON(2, PF_EVAL(2, 32));
@@ -3022,7 +3040,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
             cudaStreamWaitEvent(s->shapeStream[4 + k], s->sqDone[K], 0);
             // 4:1 shapes (k >= 6) off: margin 0 prunes every block (their searches return at once)
-            const bool off = k >= 6 && !st.rect4;
+            const bool off = (k >= 6 && !st.rect4) || (k < 2 && !st.blocks8);
             pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128, 0, s->shapeStream[4 + k]>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
                                                                      s->cand[K], s->cols[K], n, st.pruneRect || off,
                                                                      off ? 0.f : getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
@@ -3122,6 +3140,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         j.entryCount = s->modeEntryCount;
         const int nSb = j.sbCols * j.sbRows;
         const float origMvWeight = ea.mvWeight;
+        static const int trialFast = getenv("AV1GPU_PF_TRIALFAST") ? atoi(getenv("AV1GPU_PF_TRIALFAST")) : 0;
         // extra bits credited to a skip_mode option (it also saves the references, skip flag and filter, but 0
         // measured best: 4.5 / 2 / -2 were worse)
         static const float skipModeCredit = getenv("AV1GPU_PF_SMCREDIT") ? (float)atof(getenv("AV1GPU_PF_SMCREDIT")) : 0.f;
@@ -3150,6 +3169,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.origMvWeight = origMvWeight;
             ra.screenWeight = 3.f * lambdaSad;
             ra.pass = pass;
+            ra.keepDepth = (trialFast & 16) != 0;
             priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass, skipModeCredit);
             proposeMotion<<<nSb * 64, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
         }
@@ -3159,10 +3179,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ea.mvWeight = 0.f;
         // experiment (AV1GPU_PF_TRIALFAST bits): 1 DCT-only split transforms, 2 seven-type whole transforms,
         // 4 no interpolation-filter search in the trials
-        static const int trialFast = getenv("AV1GPU_PF_TRIALFAST") ? atoi(getenv("AV1GPU_PF_TRIALFAST")) : 0;
         if (trialFast & 1) ea.splitTypes = 2;
         if (trialFast & 2) ea.txExhaustive = 0;
         if (trialFast & 4) ea.switchable = 0;
+        if (trialFast & 8) splitSearch = false;   // no split-transform search in the trials
         {
             e = cudaEventRecord(s->trialFork, stream);
             const int nTrialShapes = st.rectPartitions ? kShapes : kSizes;

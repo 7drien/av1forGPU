@@ -354,6 +354,8 @@ int main(int argc, char **argv) {
             pfCdefSb = false;
         } else if (!strcmp(argv[i], "--pf-no-skip-mode")) {
             pfSkipMode = false;
+        } else if (!strcmp(argv[i], "--pf-no-8x8")) {
+            pfSettings.blocks8 = false;
         } else if (!strcmp(argv[i], "--pf-no-rect4")) {
             pfSettings.rect4 = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {

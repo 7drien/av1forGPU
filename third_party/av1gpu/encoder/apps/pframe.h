@@ -47,6 +47,7 @@ struct Settings {
     float rnd = 0.46f, zbin = 0.70f;   // quantizer rounding and dead zone (five-clip sweeps)
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
+    bool blocks8 = true;         // 8x8 level and 16x8 / 8x16 blocks (--pf-no-8x8: only where a 16x16 node must split)
     bool rect4 = true;           // 4:1 shapes (HORZ_4 / VERT_4: 32x8 .. 16x64) with rectPartitions (--pf-no-rect4)
     bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
     int txTypes = 3;             // inter transform types: 0 DCT_DCT only, 1 IDTX / DCT_DCT (reduced_tx_set),

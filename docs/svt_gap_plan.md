@@ -583,3 +583,18 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
 - Filter lengths (the analyzer now takes up to 16 neighbours; `--pf-tf-frames` up to 8): ALTREF +-6 frames -0.17% on
   the filtered clips (kept +-4: slower), key frames over 12 frames -0.24% (video_3 -0.73%): now 12.
 
+### Where the time goes (video_2 q50, 52.4 ms per frame) and more trade-offs
+
+- Time saved with each part off: final-partition refinement 13.5 ms (26%), rectangular shapes 11.7 ms (22%), split
+  transforms 8.2 ms (16%), transform-type search 6.5 ms (12%), interpolation-filter search 4.5 ms (9%), in-loop filters
+  4.4 ms (8%); refinement passes 3-6 cost 7 ms.
+- Final partition at q90: 8x8 blocks 0.0% of the area on video_2 and video_3 (0.9% on video_1 at q20), 16x16-level
+  shapes under 1% (7% on video_1 at q20). `--pf-no-8x8` (8x8 / 16x8 / 8x16 only where a 16x16 node crosses the frame
+  edge) is 6 to 11% faster but costs video_1 +8.4% and video_5 +6.1% (mean +3.2%): those few blocks carry the detail.
+- Cheaper refinement trials (`AV1GPU_PF_TRIALFAST`, compared directly): +8 no split search +0.79% (+6% fps); +15 +1.05%
+  (+12%); +16 keep the block's transform depth, +23 (with 7) +0.77% (+9%). All about 0.08 to 0.1 point per 1% speed.
+- Gauss-Seidel refinement (half the blocks per pass, alternating checkerboards): 64x64 parity +5.0%, block parity +3.9%
+  with 6 passes, +4.9% with 4 (video_2 / video_3): the simultaneous (Jacobi) updates let neighbours settle on a shared
+  vector together. Removed.
+- `--pf-rdoq` compared directly: +0.04% (video_2 / video_3).
+
