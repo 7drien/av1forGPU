@@ -44,7 +44,7 @@ struct Settings {
     int qindex = 100;
     float lambdaMul = 0.5f;
     int searchRange = 192;   // full-pel coarse search radius (quarter-resolution search, at most 192)
-    float rnd = 0.40f, zbin = 0.70f;
+    float rnd = 0.46f, zbin = 0.70f;   // quantizer rounding and dead zone (five-clip sweeps)
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
     bool rect4 = true;           // 4:1 shapes (HORZ_4 / VERT_4: 32x8 .. 16x64) with rectPartitions (--pf-no-rect4)

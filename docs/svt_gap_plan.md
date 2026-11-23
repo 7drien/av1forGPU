@@ -494,4 +494,8 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   video_5 -7.3% → -7.7%; mean +12.0% → +11.2%. Same speed. `--pf-no-cdef-sb` restores one strength per frame.
 - Decision constants rechecked (video_1/2/3/5): skip flag 0.3/2.5 or 1/1 bits instead of 0.5/1.5, partition split
   bits x2 or x0.5: all within 0.3 points (left unchanged).
+- The preset choice first ran on one CTA (+0.82 ms per 1080p frame); one CTA per candidate pair per greedy step brings
+  it to +0.24 ms, same presets.
+- Quantizer rounding rechecked on five clips: 0.40 +11.2%, 0.46 +10.9% (new default), 0.52 +11.0%; dead zone 0.60 / 0.80
+  worse than 0.70 on four clips (+0.5 / +2.0 points).
 
