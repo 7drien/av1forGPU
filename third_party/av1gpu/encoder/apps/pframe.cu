@@ -65,12 +65,14 @@ struct Cand {
     uint8_t nzWhole, wholeType;
     float mvBits;         // estimated bits of the chosen vectors
     float costSkip, costCoded;
+    uint8_t skipModeTrial;   // mode-refinement trial of skip_mode: EIGHTTAP prediction (no filter search)
 };
 
 struct ModeTrial {
     Cand cand;
     float oldCost, rateSaving;
     bool active;
+    bool skipMode;   // the trial is skip_mode: accepted only as a skip block, compound, EIGHTTAP
     // State kept across refinement passes: cost (distortion + coefficient rate, no MV rate) of an accepted trial, and
     // the proposals rejected since (not proposed again unless their rate saving grew), so that a later pass tries the
     // next alternative of the block.
@@ -517,6 +519,7 @@ __global__ void __launch_bounds__(32 * RefineCfg<BW, BH>::warps) chooseInter(Fra
         c.mv = choice == 1 ? c.mvR[1] : choice == 3 ? c.mvR[2] : c.mvR[0];
         c.mv2 = c.mvR[1];
         c.mvBits = bits;
+        c.skipModeTrial = 0;
     }
 }
 
@@ -827,7 +830,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     // interpolation filter (one per block, both references): luma SSE plus approximate interp_filter bits, tried only
     // when a vector is fractional in some plane (1/16 chroma units: luma integer vectors may be chroma half-pel)
     int filt = 0;
-    if (a.switchable && (((c.mv.row | c.mv.col) & 15) || (c.ref == 2 && ((c.mv2.row | c.mv2.col) & 15)))) {
+    if (a.switchable && !c.skipModeTrial && (((c.mv.row | c.mv.col) & 15) || (c.ref == 2 && ((c.mv2.row | c.mv2.col) & 15)))) {
         const float fbits[3] = {0.21f, 2.9f, 7.6f};   // Default_Interp_Filter_Cdf context 3 (no neighbour information)
         float bestJ = 3.4e38f;
         uint8_t *pl = predS[warp];
@@ -1804,10 +1807,11 @@ struct RefinementArgs {
 struct MotionOption {
     Mv mv[2];
     float bits;
+    int skipMode;   // skip_mode: compound NEAREST pair of LAST / ALTREF, no residual, EIGHTTAP
 };
 struct MotionOptions {
-    // 13 implied compound pairs including mixed NEW modes, plus the searched vector pair.
-    MotionOption option[14];
+    // 13 implied compound pairs including mixed NEW modes, plus the searched vector pair, plus skip_mode.
+    MotionOption option[15];
     int count;
     int same;   // equal to the menu of the previous pass: the screen and trial would repeat their outcome
 };
@@ -1816,7 +1820,7 @@ struct MotionOptions {
 __device__ int motionOptions(pft2::TileCoder &t, const pft2::TileCoder::RefPair &rp, const pft2::TileCoder::Stack &s,
                              const BlockInfo &bi, MotionOption *out) {
     using namespace pft2;
-    out[0] = {{bi.mv, rp.compound ? bi.mv2 : Mv{0, 0}}, kInf};
+    out[0] = {{bi.mv, rp.compound ? bi.mv2 : Mv{0, 0}}, kInf, 0};
     int n = 1;
     const int first = rp.compound ? NEAREST_NEARESTMV : NEARESTMV, last = rp.compound ? NEW_NEWMV : NEWMV;
     for (int mode = first; mode <= last; ++mode) {
@@ -1830,14 +1834,14 @@ __device__ int motionOptions(pft2::TileCoder &t, const pft2::TileCoder::RefPair 
             const float bits = t.modeCost(s, rp.compound, mode, idx, target, pred);
             int k = 0;
             while (k < n && !(target[0] == out[k].mv[0] && target[1] == out[k].mv[1])) ++k;
-            if (k == n) out[n++] = {{target[0], target[1]}, bits};
+            if (k == n) out[n++] = {{target[0], target[1]}, bits, 0};
             else out[k].bits = fminf(out[k].bits, bits);
         }
     }
     return n;
 }
 
-__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus, int pass) {
+__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus, int pass, float skipModeCredit) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[sb * 64 + k];
@@ -1850,8 +1854,20 @@ __global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions 
     pft2::TileCoder::Stack stack;
     t.findMvStack(stack, b.r, b.c, 1 << (b.lw - 2), 1 << (b.lh - 2), rp);
     t.setParallelMvCtx(stack);
-    MotionOption options[14];
-    const int n = motionOptions(t, rp, stack, bi, options);
+    MotionOption options[15];
+    int n = motionOptions(t, rp, stack, bi, options);
+    if (j.fs.skipMode && b.lw >= 3 && b.lh >= 3) {
+        // skip_mode: the compound stack of LAST / ALTREF, NEAREST pair at index 0. Its rate is the skip_mode symbol
+        // (context 1 of the default CDF) less what the block codes besides its mode and vectors and skip_mode
+        // replaces: references, skip flag and interpolation filter, about 4.5 bits
+        BlockInfo cb = bi;
+        cb.ref = 2;
+        const auto crp = t.blockRefs(cb);
+        pft2::TileCoder::Stack cs;
+        t.findMvStack(cs, b.r, b.c, 1 << (b.lw - 2), 1 << (b.lh - 2), crp);
+        const Mv p0 = t.modePredictor(cs, pft2::NEARESTMV, 0, 0), p1 = t.modePredictor(cs, pft2::NEARESTMV, 0, 1);
+        options[n++] = {{p0, p1}, pft2::symCost(defaults->skipMode[1], 1) - skipModeCredit, 1};
+    }
     int count = 1;
     for (int i = 1; i < n; ++i)
         if (options[i].bits < options[0].bits) options[count++] = options[i];
@@ -1859,7 +1875,7 @@ __global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions 
     bool same = pass > 0 && menu.count == count;
     for (int i = 0; same && i < count; ++i)
         same = menu.option[i].mv[0] == options[i].mv[0] && menu.option[i].mv[1] == options[i].mv[1] &&
-               menu.option[i].bits == options[i].bits;
+               menu.option[i].bits == options[i].bits && menu.option[i].skipMode == options[i].skipMode;
     for (int i = 0; i < count; ++i) menu.option[i] = options[i];
     menu.count = count;
     menu.same = same;
@@ -1937,7 +1953,7 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
             rejected |= option.mv[0] == trial.rejMv[r][0] && option.mv[1] == trial.rejMv[r][1] &&
                         origBits - option.bits <= trial.rejSaving[r];
         if (rejected) continue;
-        const int satd = motionSatd(a, option, bi.ref, gx * 8, gy * 8, b.lw, b.lh);
+        const int satd = motionSatd(a, option, option.skipMode ? 2 : bi.ref, gx * 8, gy * 8, b.lw, b.lh);
         const float score = satd * 0.125f + a.screenWeight * option.bits;
         if (score < bestScore) { bestScore = score; best = i; }
     }
@@ -1953,7 +1969,9 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
         else trial.oldCost = (bi.skip ? old.costSkip : old.costCoded) - a.lambda * old.mvBits * a.origMvWeight;
         trial.cand.mv = option.mv[0];
         trial.cand.mv2 = option.mv[1];
-        trial.cand.ref = bi.ref;
+        trial.cand.ref = option.skipMode ? 2 : bi.ref;
+        trial.cand.skipModeTrial = (uint8_t)option.skipMode;
+        trial.skipMode = option.skipMode != 0;
         trial.cand.pruned = 0;
         trial.cand.mvBits = 0;
         trial.rateSaving = saving;
@@ -1970,7 +1988,8 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
     ModeTrial &trial = trials[gy * cols + gx];
     if (!trial.active) return;
     const Cand &c = trial.cand;
-    const bool skip = !c.nz || c.costSkip <= c.costCoded;
+    // a skip_mode trial is only valid without residual
+    const bool skip = trial.skipMode || !c.nz || c.costSkip <= c.costCoded;
     const float cost = skip ? c.costSkip : c.costCoded;
     if (cost >= trial.oldCost + lambda * trial.rateSaving) {
         const int r = trial.nRej < ModeTrial::kRej ? trial.nRej++ : pass % ModeTrial::kRej;
@@ -1993,6 +2012,7 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
             bi.skip = skip;
             bi.txSplit = skip ? 0 : c.txSplit;
             bi.filter = c.filter;
+            if (trial.skipMode) bi.ref = 2;
             changed[y * cols + x] = 1;
         }
 }
@@ -2776,6 +2796,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
         memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
         memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
+        memcpy(d.skipMode, pft2::kDefaultSkipModeCdf, sizeof d.skipMode);
         if (e == cudaSuccess) e = cudaMemcpy(s->defaultInter, &d, sizeof d, cudaMemcpyHostToDevice);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
@@ -3057,6 +3078,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         std::copy_n(syntax.refName, 3, j.fs.refName);
         std::copy_n(syntax.signBias, 8, j.fs.signBias);
         j.fs.useTmvp = s->useTmvp;
+        j.fs.skipMode = syntax.skipMode;
         j.grid = s->grid;
         j.mf = s->mfDev;
         j.mi = s->modeMi;
@@ -3064,6 +3086,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         j.entryCount = s->modeEntryCount;
         const int nSb = j.sbCols * j.sbRows;
         const float origMvWeight = ea.mvWeight;
+        // extra bits credited to a skip_mode option (it also saves the references, skip flag and filter, but 0
+        // measured best: 4.5 / 2 / -2 were worse)
+        static const float skipModeCredit = getenv("AV1GPU_PF_SMCREDIT") ? (float)atof(getenv("AV1GPU_PF_SMCREDIT")) : 0.f;
         for (int pass = 0; pass < st.modeRefinePasses; ++pass) {
         cudaError_t e = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes, stream);
         if (e == cudaSuccess) e = cudaMemsetAsync(s->modeChanged, 0, nSb * 64, stream);
@@ -3089,7 +3114,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.origMvWeight = origMvWeight;
             ra.screenWeight = 3.f * lambdaSad;
             ra.pass = pass;
-            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass);
+            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass, skipModeCredit);
             proposeMotion<<<nSb * 64, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
@@ -3196,6 +3221,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.txModeSelect = in.txModeSelect;
     j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.switchable = in.switchableFilter;
+    j.fs.skipMode = in.skipMode;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
     for (int k = 0; k < 8; k++) j.fs.signBias[k] = in.signBias[k];
     j.fs.useTmvp = in.useTmvp && s->useTmvp;
@@ -3436,6 +3462,7 @@ int HostEntropy::init(int width, int height, char *, int) {
     memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
     memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
         memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
+    memcpy(d.skipMode, pft2::kDefaultSkipModeCdf, sizeof d.skipMode);
     return 0;
 }
 
@@ -3455,6 +3482,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.txModeSelect = in.txModeSelect;
     fs.reducedTxSet = in.reducedTxSet;
     fs.switchable = in.switchableFilter;
+    fs.skipMode = in.skipMode;
     fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
     for (int k = 0; k < 8; k++) fs.signBias[k] = in.signBias[k];
     fs.useTmvp = in.useTmvp && in.motionField;

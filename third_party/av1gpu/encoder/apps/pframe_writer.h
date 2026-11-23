@@ -21,6 +21,7 @@ struct FrameParams {
     bool txModeSelect = false;      // TX_MODE_SELECT (coded blocks may split their luma transform)
     bool reducedTxSet = true;
     bool switchable = false;        // is_filter_switchable (else EIGHTTAP)
+    bool skipModePresent = false;   // skip_mode_present (when skip_mode_params allows it)
     int lrType[3] = {0, 0, 0};
     // order hints (enable_order_hint = 1 when orderHintBits > 0)
     int orderHintBits = 0;
@@ -73,7 +74,30 @@ inline int relDist(int a, int b, int bits) {   // get_relative_dist
     const int m = 1 << (bits - 1);
     return (diff & (m - 1)) - (diff & m);
 }
-// skip_mode_params(): whether skip_mode_present is coded
+// skip_mode_params(): whether skip_mode_present is coded, and SkipModeFrame[0..1] (AV1 reference names)
+inline bool skipModeFrames(const FrameParams &fp, int &f0, int &f1) {
+    if (!fp.referenceSelect || !fp.orderHintBits) return false;
+    const int bits = fp.orderHintBits;
+    int fwd = -1, bwd = -1, fwdHint = 0, bwdHint = 0;
+    for (int i = 0; i < 7; i++) {
+        const int h = fp.slotHint[fp.refSlot[i]];
+        if (relDist(h, fp.orderHint, bits) < 0) {
+            if (fwd < 0 || relDist(h, fwdHint, bits) > 0) { fwd = i; fwdHint = h; }
+        } else if (relDist(h, fp.orderHint, bits) > 0) {
+            if (bwd < 0 || relDist(h, bwdHint, bits) < 0) { bwd = i; bwdHint = h; }
+        }
+    }
+    if (fwd < 0) return false;
+    if (bwd >= 0) { f0 = 1 + std::min(fwd, bwd); f1 = 1 + std::max(fwd, bwd); return true; }
+    int fwd2 = -1, fwd2Hint = 0;
+    for (int i = 0; i < 7; i++) {
+        const int h = fp.slotHint[fp.refSlot[i]];
+        if (relDist(h, fwdHint, bits) < 0 && (fwd2 < 0 || relDist(h, fwd2Hint, bits) > 0)) { fwd2 = i; fwd2Hint = h; }
+    }
+    if (fwd2 < 0) return false;
+    f0 = 1 + std::min(fwd, fwd2); f1 = 1 + std::max(fwd, fwd2);
+    return true;
+}
 inline bool skipModeAllowed(const FrameParams &fp) {
     if (!fp.referenceSelect || !fp.orderHintBits) return false;
     const int bits = fp.orderHintBits;
@@ -159,7 +183,7 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     }
     b.bit(fp.txModeSelect);      // tx_mode_select (else TX_MODE_LARGEST)
     b.bit(fp.referenceSelect);   // reference_select
-    if (skipModeAllowed(fp)) b.bit(0);   // skip_mode_present
+    if (skipModeAllowed(fp)) b.bit(fp.skipModePresent);   // skip_mode_present
     b.bit(fp.reducedTxSet);      // reduced_tx_set
     for (int r = 0; r < 7; ++r) b.bit(0);   // is_global
     av1g::write_video_grain(b, fp.grain, fp.grainSeed, true);

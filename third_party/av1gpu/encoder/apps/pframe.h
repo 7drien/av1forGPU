@@ -86,6 +86,7 @@ struct EntropyIn {
     bool useTmvp = false;                // use_ref_frame_mvs
     const Mv *motionField = nullptr;     // HostEntropy's copy of MotionFieldMvs[8][MiRows / 2][MiCols / 2]
     bool switchableFilter = false;
+    bool skipMode = false;      // skip_mode_present (the app sets it only when SkipModeFrame = LAST, ALTREF)
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1

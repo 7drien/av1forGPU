@@ -35,7 +35,10 @@ struct InterCdfs {
     uint16_t useWiener[3];
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
+    uint16_t skipMode[3][3];
 };
+// Default_Skip_Mode_Cdf (spec): skip_mode, context = above skip_mode + left skip_mode
+inline constexpr uint16_t kDefaultSkipModeCdf[3][3] = {{32621, 32768, 0}, {20708, 32768, 0}, {8127, 32768, 0}};
 // All CDFs of a frame: what a reference slot saves at the end of a frame.
 struct EntropyState {
     av1g_cdfs cdf;
@@ -82,6 +85,7 @@ struct MiInfo {
     uint8_t refIdx;    // RefMvIdx of the chosen mode
     uint8_t txW, txH;  // log2 of the luma transform width and height (InterTxSizes)
     uint8_t filter;    // InterpFilters[][0] (EIGHTTAP for GLOBALMV blocks, which code none)
+    uint8_t skipMode;  // skip_mode (skip, compound NEAREST_NEARESTMV of SkipModeFrame[0..1], EIGHTTAP)
     uint32_t order;    // decode order: superblock index << 8 | block index in the superblock
 };
 
@@ -131,6 +135,7 @@ struct FrameSyntax {
     int lrLuma;           // FrameRestorationType[0] = RESTORE_WIENER (64-sample units)
     int signBias[8];      // RefFrameSignBias by reference frame (order hints)
     int useTmvp;          // use_ref_frame_mvs: temporal candidates from the projected motion field
+    int skipMode;         // skip_mode_present (SkipModeFrame[0..1] = LAST_FRAME, ALTREF_FRAME)
     int width, height;    // FrameWidth, FrameHeight
     int miRows, miCols, aw, ah, gcols;
 };
@@ -940,10 +945,18 @@ struct TileCoder {
                 }
             }
             if (bestMode < 0) { st.error = 2; return; }
+            // skip_mode: the block is already coded exactly as skip_mode decodes it (no residual, the compound
+            // pair LAST / ALTREF = SkipModeFrame, the stack's NEAREST pair at index 0, EIGHTTAP): one symbol instead
+            // of the skip flag, references, mode and filter
+            const bool skipMode = fs->skipMode && skip && compound && bi.filter == 0 && lw >= 3 && lh >= 3 &&
+                                  mvEq(target[0], modePredictor(s, NEARESTMV, 0, 0)) &&
+                                  mvEq(target[1], modePredictor(s, NEARESTMV, 0, 1));
+            if (skipMode) { bestMode = NEAREST_NEARESTMV; bestIdx = 0; }
             for (int r = miRow; r < imin(miRow + bh4, fs->miRows); ++r)
                 for (int c = miCol; c < imin(miCol + bw4, fs->miCols); ++c) {
                     at(r, c).mode = (uint8_t)bestMode;
                     at(r, c).refIdx = (uint8_t)bestIdx;
+                    at(r, c).skipMode = (uint8_t)skipMode;
                     // needs_interp_filter() is 0 for GLOBALMV / GLOBAL_GLOBALMV (GmType IDENTITY): EIGHTTAP. Their
                     // vectors are zero, so the prediction does not depend on the filter.
                     if (bestMode == GLOBALMV || bestMode == GLOBAL_GLOBALMV) at(r, c).filter = 0;
@@ -957,6 +970,12 @@ struct TileCoder {
         const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
         const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
         const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
+        if (fs->skipMode && lw >= 3 && lh >= 3) {
+            const int smCtx = (availU ? above->skipMode : 0) + (availL ? left->skipMode : 0);
+            const int sm = at(miRow, miCol).skipMode;
+            sym(ic->skipMode[smCtx], sm, 2);
+            if (sm) return;   // skip = 1, is_inter = 1, references, mode and filter implied
+        }
         const int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
         sym(cdf->skip[skipCtx], skip, 2);
         const bool aboveIntra = availU && !above->isInter, leftIntra = availL && !left->isInter;

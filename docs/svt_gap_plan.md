@@ -467,3 +467,18 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   SMs' registers and shared memory are already taken, so another frame's kernels cannot become resident: the GPU is
   resource-saturated, and only less work or kernels that need fewer resources per unit of work can make it faster.
 
+### skip_mode (T4 item)
+
+- Frames between a past and a future reference whose `skip_mode_params()` pair is our compound pair (LAST, ALTREF) now
+  code `skip_mode_present = 1` (`--pf-no-skip-mode` turns it off). The tile coder codes `skip_mode` (spec CDF, context
+  above + left) for every block of at least 8x8 and nothing else for a skip_mode block; a block uses it when it already
+  decodes identically: skip, compound LAST / ALTREF, EIGHTTAP and the vectors of the stack's NEAREST pair at index 0
+  (decided in the parallel mode choice, phase 2, where the stack depends only on the final grid).
+- Alone this saves nothing (video_2 q50 +0.05%: few blocks match exactly). The final-partition refinement now also
+  proposes skip_mode for every block (compound NEAREST pair of the LAST / ALTREF stack, rate = the skip_mode symbol,
+  EIGHTTAP forced, accepted only without residual). Extra credit for the references / skip flag / filter it saves:
+  4.5 bits video_2 +2.3, video_3 -0.8, video_5 -1.3 points; 0 bits video_2 -1.0, video_3 -2.9, video_5 -0.8; -2 bits
+  slightly worse than 0 (kept 0).
+- Five clips: video_1 +8.4%, video_2 +28.4%, video_3 +50.1%, video_4 -19.8%, video_5 -7.3%; mean +13.1% → +12.0%
+  (libaom: +51.4%). Same speed.
+

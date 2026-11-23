@@ -89,6 +89,8 @@ if __name__ == "__main__":
         run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--kf-tiles", "0.01,1,1"])
         run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-square-prune", "1"])
         run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-no-rect4"])
+        run(b, 448, 184, 12, ["--persistent-cdf", "--qindex", "50", "--pf-no-skip-mode"])
+        run(b, 448, 256, 12, ["--persistent-cdf", "--qindex", "120", "--pf-cpu-entropy"])
         run(b, 712, 392, 18, ["--persistent-cdf", "--qindex", "90", "--pf-square-prune", "2", "--pf-gpu-entropy"])
         run(b, 448, 256, 20, ["--persistent-cdf", "--pf-refs", "3", "--pf-gop", "16"])
         # Temporal filtering consumes both sides of the ALTREF before its original is reused for the overlay.

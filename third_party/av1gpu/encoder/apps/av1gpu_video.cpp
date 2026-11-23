@@ -194,6 +194,7 @@ int main(int argc, char **argv) {
     constexpr int kOrderHintBits = 7;   // --pframes streams: enable_order_hint with 7-bit hints
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    bool pfSkipMode = true;       // --pf-no-skip-mode
     float pfSquarePrune = -1.f;  // --pf-square-prune M: fixed square-children pruning margin (default: motion-adaptive)
     bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
     // --pf-adaptive: mini-GOP length 16 / 8 from this block-mean motion of the next eight frames
@@ -348,6 +349,8 @@ int main(int argc, char **argv) {
             pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
             pfTmvp = false;
+        } else if (!strcmp(argv[i], "--pf-no-skip-mode")) {
+            pfSkipMode = false;
         } else if (!strcmp(argv[i], "--pf-no-rect4")) {
             pfSettings.rect4 = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
@@ -917,6 +920,13 @@ int main(int argc, char **argv) {
                 ein.signBias[r] = pfw::relDist(refHints[r], orderHint, kOrderHintBits) > 0;
             // use_ref_frame_mvs needs error_resilient_mode = 0.
             ein.useTmvp = fp.useRefFrameMvs = tmvp;
+            // skip_mode: frames between a past and a future reference whose SkipModeFrame pair is our compound pair
+            {
+                int f0 = 0, f1 = 0;
+                fp.skipModePresent = pfSkipMode && pfw::skipModeFrames(fp, f0, f1) && f0 == pfw::LAST_FRAME &&
+                                     f1 == pfw::ALTREF_FRAME;
+                ein.skipMode = fp.skipModePresent;
+            }
             if (pfAnalyzer.analyze(src, pitches, refs, refCount, st, ein, spare, projectMotion, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
