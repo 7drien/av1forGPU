@@ -2965,9 +2965,11 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             const int n = 8 << K, div = k < 6 ? 2 : 4;
             const int bw = k & 1 ? n / div : n, bh = k & 1 ? n : n / div;
             cudaStreamWaitEvent(s->shapeStream[4 + k], s->sqDone[K], 0);
+            // 4:1 shapes (k >= 6) off: margin 0 prunes every block (their searches return at once)
+            const bool off = k >= 6 && !st.rect4;
             pruneRect<<<(s->rcols[k] * s->rrows[k] + 127) / 128, 128, 0, s->shapeStream[4 + k]>>>(s->rcand[k], s->rcols[k], s->rrows[k], bw, bh,
-                                                                     s->cand[K], s->cols[K], n, st.pruneRect,
-                                                                     getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
+                                                                     s->cand[K], s->cols[K], n, st.pruneRect || off,
+                                                                     off ? 0.f : getenv("AV1GPU_PF_PRUNE") ? (float)atof(getenv("AV1GPU_PF_PRUNE")) : st.pruneMargin);
         }
         for (int r = 0; r < refCount; r++) {
         #define PF_RREFINE(RK, K, BW, BH)                                                                               \

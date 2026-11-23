@@ -348,6 +348,8 @@ int main(int argc, char **argv) {
             pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
             pfTmvp = false;
+        } else if (!strcmp(argv[i], "--pf-no-rect4")) {
+            pfSettings.rect4 = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
             pfSettings.modeRefine = false;
         } else if (!strcmp(argv[i], "--pf-square-prune") && i + 1 < argc) {

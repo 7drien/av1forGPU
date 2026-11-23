@@ -448,3 +448,16 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   Process start plus CUDA context cost about 0.35 s (lazy module loading is already the default).
 - Without performance counters (admin only on this machine) the kernels' limiters are guessed from such experiments.
 
+### Value of the rectangular shapes (five clips, defaults otherwise)
+
+| Change | mean vs SVT | video_1 | video_2 | video_3 | video_4 | video_5 | speed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| none | +13.1% | +8.3% | +29.4% | +53.0% | -18.9% | -6.5% | |
+| `--pf-no-rect4` (no 32x8 .. 16x64) | +14.0% | +10.0% | +30.8% | +53.6% | (see log) | -6.3% | +6 to 9% |
+| `--pf-no-rect` | +17.5% | +12.7% | +35.1% | +57.5% | -14.7% | -3.3% | +15 to 24% |
+
+- Every pruning measured so far trades about 0.2 to 0.3 BD-rate points per 1% of speed (refinement passes, transform
+  types, square / split pruning, rectangles), so pruning alone cannot double the speed; the kernels' efficiency must.
+- Peak GPU memory: 2.1 GB at 1080p, 6.6 GB at 4K (of 8 GB): a second analyzer for frame-level parallelism (independent
+  leaf frames of the pyramid) fits at 1080p only.
+
