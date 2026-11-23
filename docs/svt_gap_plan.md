@@ -568,4 +568,12 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   it: -0.39 / 0 / -3.67 / 0 / -0.14%, mean -0.84%. Against SVT: +7.8%.
 - Displaying the filtered ALTREF instead of an overlay (`AV1GPU_PF_TF_NOOVERLAY`, as SVT) was worse on video_3 (+5.3% /
   +9.9% for 2 / 3 frames, before the chroma fix).
+- ALTREF filtering, retested after the chroma fix with its own strength (`AV1GPU_PF_TF_ARF_STRENGTH`; the key-frame
+  filter keeps `--pf-tf-strength` 1): the ALTREF is coded at high quality and referenced by its whole mini-GOP, so it
+  wants a much weaker filter. +-4 frames on video_3 / video_5 against the previous configuration: strength 1 +7.1 /
+  -0.8%, 0.2 -3.8 / -1.8%, 0.1 -6.0 / -1.6%, 0.05 -5.5 / -1.1%. Now on by default (4 frames, strength 0.1, the same
+  noise gate; overlay frames as before): video_1 -0.19%, video_2 0, video_3 -5.99%, video_4 0, video_5 -1.63%,
+  mean -1.56%.
+- Five clips against SVT-AV1 preset 8: video_1 +4.9%, video_2 +22.8%, video_3 +30.4%, video_4 -21.3%, video_5 -9.8%;
+  mean +5.4% (libaom: +42.7%). The filtered clips run 4 to 10% slower (filter and overlay frames): video_3 6.9 → 6.2 fps.
 

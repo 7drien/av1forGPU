@@ -88,7 +88,7 @@ Options:
 - `--qindex N` sets the keyframe quantizer. P frames use N + 60 (`--pf-qoffset`), lowered by up to `--pf-altref-boost` (default 100) toward the base of the pyramid.
 - `--bitrate KBPS` enables rate control: one base quantizer per keyframe or mini-GOP period, with a buffer of `--rc-buffer` seconds (default 2).
 - `--persistent-cdf` carries adapted probabilities between frames through each reference slot.
-- `--pf-tf-frames K` enables a GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display. Off by default: no gain on the sample clip.
+- `--pf-tf-frames K` (default 4, 0 off): GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display; key frames are filtered over the next 8 frames. Both only on noisy content (estimated luma noise ≥ 0.25).
 - Switchable interpolation filters are on by default (`--pf-no-switchable`); the lambda multiplier defaults to 0.5.
 - `--pf-rdoq` enables greedy rate-distortion optimized quantization. Off by default: no gain on the sample clip.
 - `--pf-no-mode-refine` disables the final-partition motion refinement that tests the decoder's spatial and temporal vectors.

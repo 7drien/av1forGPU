@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
     int pfCutQoffset = 30;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
     int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
-    int pfTfFrames = 0;
+    int pfTfFrames = 4;   // ALTREF temporal filter over +-4 frames (noisy content only; --pf-tf-frames 0 off)
     float pfTfStrength = 1.0f;
     bool pfFilters = true, pfCdef = false;
     int residualThreshold = 0, interQindex = 0;
@@ -1339,7 +1339,16 @@ int main(int argc, char **argv) {
             // AV1GPU_PF_TF_NOOVERLAY: display the filtered ALTREF itself (show_existing_frame, as SVT-AV1 does by
             // default) instead of coding an overlay frame that restores the original picture
             static const bool tfNoOverlay = getenv("AV1GPU_PF_TF_NOOVERLAY") != nullptr;
+            // noisy content only (as the key-frame filter): estimated luma noise of the ALTREF source
+            bool tfNoisy = false;
             if (pfTfFrames > 0) {
+                if (!inBuf.wait(n - 1, compute)) return 1;
+                static const double tfNoise = getenv("AV1GPU_PF_TF_KEY_NOISE") ? atof(getenv("AV1GPU_PF_TF_KEY_NOISE")) : 0.25;
+                const double sigma = pfAnalyzer.noiseSigma(inBuf[n - 1][0], pitches[0], perr, sizeof perr);
+                if (sigma < -1.5) { fprintf(stderr, "%s\n", perr); return 1; }
+                tfNoisy = sigma >= tfNoise;
+            }
+            if (pfTfFrames > 0 && tfNoisy) {
                 std::vector<const uint8_t *> nbs[3];
                 for (size_t i = firstReady; i < avail; ++i) {
                     if (!inBuf.wait(i, compute)) return 1;
@@ -1350,8 +1359,11 @@ int main(int argc, char **argv) {
                     const uint8_t *const center[3] = {inBuf[n - 1][0], inBuf[n - 1][1], inBuf[n - 1][2]};
                     const uint8_t *const *nbp[3] = {nbs[0].data(), nbs[1].data(), nbs[2].data()};
                     uint8_t *const outp[3] = {tfBuf[0], tfBuf[1], tfBuf[2]};
+                    // ALTREF strength (AV1GPU_PF_TF_ARF_STRENGTH, else --pf-tf-strength): a filtered ALTREF is coded
+                    // at high quality and referenced by the whole mini-GOP, so it wants a much weaker filter
+                    static const float arfStrength = getenv("AV1GPU_PF_TF_ARF_STRENGTH") ? (float)atof(getenv("AV1GPU_PF_TF_ARF_STRENGTH")) : 0.1f;
                     if (pfAnalyzer.temporalFilter(center, nbp, int(nbs[0].size()), pfSettings.qindex,
-                                                  pfTfStrength, outp, perr, sizeof perr)) {
+                                                  arfStrength > 0.f ? arfStrength : pfTfStrength, outp, perr, sizeof perr)) {
                         fprintf(stderr, "%s\n", perr);
                         return 1;
                     }
