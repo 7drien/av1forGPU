@@ -95,7 +95,10 @@ message(STATUS "CUDA ${CUDAToolkit_VERSION} (${CMAKE_CUDA_COMPILER_ID} ${CMAKE_C
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
-if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+# Source line tables for profilers (Nsight Compute source view). Off by default: they made up 55 of the 77 MB of the
+# P-frame module, and the larger fat binary costs about 0.2 s of CUDA context creation and module loading per run.
+option(AV1GPU_LINEINFO "Embed CUDA source line information (-lineinfo)" OFF)
+if(AV1GPU_LINEINFO AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
   string(APPEND CMAKE_CUDA_FLAGS_RELEASE " -lineinfo")
 endif()
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
