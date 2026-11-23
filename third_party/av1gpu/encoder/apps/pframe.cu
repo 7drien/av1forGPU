@@ -127,7 +127,7 @@ __device__ __forceinline__ uint32_t ldu32(const uint8_t *a) {
 // Horizontal eight-tap pass of an inter prediction (rows iy - 3 .. iy + h + 3, Round2(sum, 3) into tmp, row stride w).
 // Blocks whose taps stay inside the plane (with 12 samples of margin on the right for the word loads) take four outputs
 // per lane step from three word loads; others clamp every tap.
-__device__ __forceinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
+__device__ __noinline__ void interpH(const uint8_t *ref, int pw, int ph, int ix, int iy, int w, int lw, int h,
                                         const int16_t *filt, int16_t *tmp) {
     const int lane = threadIdx.x & 31, ih = h + 7;
     int f[8];
@@ -169,7 +169,7 @@ __device__ __forceinline__ void interpH(const uint8_t *ref, int pw, int ph, int 
 }
 // Vertical eight-tap pass: four output rows per lane step from eleven intermediate rows; emit(i, sum) per output.
 template <class Emit>
-__device__ __forceinline__ void interpV(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
+__device__ __noinline__ void interpV(const int16_t *tmp, int w, int lw, int h, const int16_t *filt, Emit emit) {
     const int lane = threadIdx.x & 31;
     int f[8];
 #pragma unroll
@@ -910,6 +910,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
         const float fbits[3] = {0.21f, 2.9f, 7.6f};   // Default_Interp_Filter_Cdf context 3 (no neighbour information)
         float bestJ = 3.4e38f;
         uint8_t *pl = predS[warp];
+#pragma unroll 1
         for (int t = 0; t < 3; t++) {
             if (c.ref == 2)
                 warpPredictCompound(f.ref[0], ref2, f.w, f.h, x0, y0, BW, BH, c.mv, c.mv2, 0, interp[warp], hpS[warp], pl, t);
