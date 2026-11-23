@@ -598,3 +598,35 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   vector together. Removed.
 - `--pf-rdoq` compared directly: +0.04% (video_2 / video_3).
 
+
+### Kernel efficiency without profiler counters (identical streams)
+
+Every change below produces bit-identical streams; video_2 q50 (120 frames) went 13.4 → 16.3 fps. Tools: `nsys`
+timelines (kernel, API and queue times), `ptxas -v` register / spill counts, and `clock64()` phase counters inside a
+kernel (temporary).
+
+- Split transforms: a 4x4 or 8x8 transform kept 4 or 8 lanes of its warp busy in the transform passes. Dense launches
+  now run one lane per transform (`evalSplitT`: same arithmetic, per-lane buffers in shared memory with an odd word
+  stride); the 4x4 split search of 8x8 blocks went 83.8 → 10.6 ms per 24 frames. Sparse refinement trials keep the warp
+  kernels (few transforms in flight are latency-bound: the lane kernels were 2-3x slower there), and so do the 8x8
+  halves of 16x8 / 8x16 blocks (many pruned blocks leave lanes idle). `AV1GPU_PF_SPLIT4` / `AV1GPU_PF_SPLIT8` = 0 select
+  the warp kernels.
+- The inverse transform went through a `__noinline__` size dispatch: the ABI call capped the callers at 168 registers
+  with up to 1.9 KB of spills. Compile-time sizes removed most of them (+6% with the lane kernels).
+- Motion search SADs take four samples per lane step (`__vsadu4` on an aligned source word and a funnel-shifted
+  reference word; the phase planes carry 16 bytes of padding). Batching the eight neighbours' SADs into one pass was
+  slower (register pressure); 32 or 128 lanes for other block sizes were slower.
+- `CUDA_DEVICE_MAX_CONNECTIONS` = 32 (set by the app): the 15 analysis streams no longer share 8 hardware queues (+1%).
+- Inter prediction (37% of a 64x64 evaluation with the filter search, `clock64()`): four horizontal outputs per lane
+  step from three word loads, four vertical outputs from eleven intermediate rows, and the filter search's luma
+  prediction of the chosen filter is kept instead of predicted again. Inlined into the 64-wide evaluations the passes
+  pushed them to 255 registers with 500 bytes of spills; there they are out-of-line calls.
+- Refinement trials were launched over every block of the frame (up to 32640 CTAs for a few hundred trials); while such
+  a grid drained the other shapes' streams waited about 200 us per pass. Trials now launch grid-stride variants on 4
+  CTAs per SM (`AV1GPU_PF_TRIALGRID`). A grid-stride body called through a `const EvalArgs &` was 4% slower in the dense
+  launches (a reference to a kernel parameter makes a local copy): the bodies take `EvalArgs` by value, and dense
+  launches keep one-pass kernels. A pass is now about 1.8 ms; its critical path is the 64x64 chain (evaluation
+  540-670 us for a few dozen blocks, then the split depths and chroma).
+- Phase planes: one tap window per thread for all four horizontal phases, and a 15-row window per thread for eight rows
+  of the four vertical phases (+1.7%).
+- Tried and dropped: both split depths of 64x64 trials in one launch (no gain), grid-stride dense kernels.
