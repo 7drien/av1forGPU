@@ -2228,15 +2228,30 @@ __global__ void buildCdefIdx(const BlockInfo *grid, int gcols, int grows, av1g_p
         }
     f.cdefIdx[i] = coded ? 0 : -1;
 }
-__global__ void planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int w, int h, unsigned long long *out) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+// Sum of squared differences of a plane: four samples per thread (32 x 8 threads cover 128 x 8 samples), one atomic
+// per CTA.
+__global__ void __launch_bounds__(256) planeSse(const uint8_t *src, int pitch, const uint8_t *buf, int w, int h,
+                                                unsigned long long *out) {
+    __shared__ int red[8];
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * 4, y = blockIdx.y * blockDim.y + threadIdx.y;
     int d = 0;
-    if (x < w && y < h) {
-        d = (int)src[y * pitch + x] - (int)buf[y * w + x];
-        d *= d;
+    if (y < h) {
+#pragma unroll
+        for (int k = 0; k < 4; k++)
+            if (x + k < w) {
+                const int e = (int)src[y * pitch + x + k] - (int)buf[y * w + x + k];
+                d += e * e;
+            }
     }
     for (int o = 16; o; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
-    if ((threadIdx.x & 31) == 0 && d) atomicAdd(out, (unsigned long long)d);
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if ((tid & 31) == 0) red[tid >> 5] = d;
+    __syncthreads();
+    if (!tid) {
+        unsigned long long t = 0;
+        for (int k = 0; k < 8; k++) t += (unsigned)red[k];
+        if (t) atomicAdd(out, t);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4342,15 +4357,36 @@ __global__ void __launch_bounds__(256) lrSolve(LrArgs a, int dir) {
     }
     float m[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, v[3] = {0, 0, 0};
     const int W = x1 - x0, n = W * (y1 - y0);
+    // a unit lies in one 64-row stripe: its samples (3 of margin) once in shared memory
+    constexpr int kTw = 96 + 6, kTh = 104 + 6;   // largest unit: 95 x 103
+    __shared__ uint8_t tile[kTh * kTw];
+    const int ss0 = -8 + ((y0 + 8) / 64) * 64, se0 = ss0 + 63;
+    const bool tiled = y1 - 1 <= se0;   // the bottom unit row may reach into the next stripe: per-sample stripes then
+    if (tiled) {
+        const int tw = W + 6, th = y1 - y0 + 6;
+        for (int i = threadIdx.x; i < tw * th; i += blockDim.x)
+            tile[(i / tw) * kTw + i % tw] = (uint8_t)lrSample(a, x0 + i % tw - 3, y0 + i / tw - 3, ss0, se0);
+        __syncthreads();
+    }
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int x = x0 + i % W, y = y0 + i / W;
-        const int sn = (y + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
+        const int xi = i % W, yi = i / W, x = x0 + xi, y = y0 + yi;
         float t[7];
-        for (int k = 0; k < 7; k++) {   // filtered along the fixed direction, at offset k - 3 along the solved one
-            float s = 0.f;
-            for (int j = 0; j < 7; j++)
-                s += fixed[j] * (float)(dir ? lrSample(a, x + k - 3, y + j - 3, ss, se) : lrSample(a, x + j - 3, y + k - 3, ss, se));
-            t[k] = s;
+        if (tiled) {
+            const uint8_t *c0 = tile + (yi + 3) * kTw + xi + 3;
+            for (int k = 0; k < 7; k++) {   // filtered along the fixed direction, at offset k - 3 along the solved one
+                float s = 0.f;
+                for (int j = 0; j < 7; j++)
+                    s += fixed[j] * (float)(dir ? c0[(j - 3) * kTw + k - 3] : c0[(k - 3) * kTw + j - 3]);
+                t[k] = s;
+            }
+        } else {
+            const int sn = (y + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
+            for (int k = 0; k < 7; k++) {
+                float s = 0.f;
+                for (int j = 0; j < 7; j++)
+                    s += fixed[j] * (float)(dir ? lrSample(a, x + k - 3, y + j - 3, ss, se) : lrSample(a, x + j - 3, y + k - 3, ss, se));
+                t[k] = s;
+            }
         }
         const float f[3] = {t[0] + t[6] - 2.f * t[3], t[1] + t[5] - 2.f * t[3], t[2] + t[4] - 2.f * t[3]};
         const float r = (float)a.src[y * a.srcPitch + x] - t[3];
@@ -4398,31 +4434,56 @@ __global__ void lrQuantize(LrArgs a) {
     a.sse[2 * u] = a.sse[2 * u + 1] = 0;
 }
 // Exact Wiener filter (spec 7.17.4, 8-bit: InterRound0 3, InterRound1 11) of every luma sample with its unit's
-// quantized taps, and the per-unit SSE with and without it.
-__global__ void lrApply(LrArgs a) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    int e0 = 0, e1 = 0, u = -1;
-    if (x < a.w && y < a.h) {
-        int ur, uc;
-        u = lrUnitOf(a, x, y, &ur, &uc);
-        const int8_t *q = a.q + u * 6;
-        const int vf[7] = {q[0], q[1], q[2], 128 - 2 * (q[0] + q[1] + q[2]), q[2], q[1], q[0]};
-        const int hf[7] = {q[3], q[4], q[5], 128 - 2 * (q[3] + q[4] + q[5]), q[5], q[4], q[3]};
-        const int sn = (y + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
-        int s = 0;
-        for (int r = 0; r < 7; r++) {
-            int hs = 0;
-            for (int t = 0; t < 7; t++) hs += hf[t] * lrSample(a, x + t - 3, y + r - 3, ss, se);
-            const int iv = min(max((hs + 4) >> 3, -2048), 6143);   // Round2(s, 3), Clip3(-offset, limit - offset)
-            s += vf[r] * iv;
-        }
-        const int v = min(max((s + 1024) >> 11, 0), 255);
-        a.out[y * a.w + x] = (uint8_t)v;
-        const int src = a.src[y * a.srcPitch + x];
-        e0 = (src - a.cdef[y * a.w + x]) * (src - a.cdef[y * a.w + x]);
-        e1 = (src - v) * (src - v);
+// quantized taps, and the per-unit SSE with and without it. One CTA per 32 x 8 tile: tiles never straddle a 64-row
+// stripe (stripes start at -8 + 64 n) or a unit, so the tile shares one set of taps and one stripe; the samples go to
+// shared memory once, then a horizontal and a vertical pass, and one SSE atomic per CTA.
+constexpr int kLrTw = 32, kLrTh = 8;
+__global__ void __launch_bounds__(kLrTw * kLrTh) lrApply(LrArgs a) {
+    __shared__ uint8_t smp[kLrTh + 6][kLrTw + 6];
+    __shared__ int iv[kLrTh + 6][kLrTw];
+    __shared__ unsigned long long red[2][kLrTw * kLrTh / 32];
+    const int x0 = blockIdx.x * kLrTw, y0 = blockIdx.y * kLrTh, tid = threadIdx.y * kLrTw + threadIdx.x;
+    int ur, uc;
+    const int u = lrUnitOf(a, x0, y0, &ur, &uc);
+    const int sn = (y0 + 8) / 64, ss = -8 + sn * 64, se = ss + 63;
+    for (int i = tid; i < (kLrTh + 6) * (kLrTw + 6); i += kLrTw * kLrTh) {
+        const int r = i / (kLrTw + 6), c = i % (kLrTw + 6);
+        smp[r][c] = (uint8_t)lrSample(a, x0 + c - 3, y0 + r - 3, ss, se);
     }
-    if (u >= 0) { atomicAdd(&a.sse[2 * u], (unsigned long long)e0); atomicAdd(&a.sse[2 * u + 1], (unsigned long long)e1); }
+    const int8_t *q = a.q + u * 6;
+    const int vf[7] = {q[0], q[1], q[2], 128 - 2 * (q[0] + q[1] + q[2]), q[2], q[1], q[0]};
+    const int hf[7] = {q[3], q[4], q[5], 128 - 2 * (q[3] + q[4] + q[5]), q[5], q[4], q[3]};
+    __syncthreads();
+    for (int i = tid; i < (kLrTh + 6) * kLrTw; i += kLrTw * kLrTh) {
+        const int r = i / kLrTw, c = i % kLrTw;
+        int hs = 0;
+#pragma unroll
+        for (int t = 0; t < 7; t++) hs += hf[t] * smp[r][c + t];
+        iv[r][c] = min(max((hs + 4) >> 3, -2048), 6143);   // Round2(s, 3), Clip3(-offset, limit - offset)
+    }
+    __syncthreads();
+    const int x = x0 + threadIdx.x, y = y0 + threadIdx.y;
+    unsigned long long e0 = 0, e1 = 0;
+    if (x < a.w && y < a.h) {
+        int sum = 0;
+#pragma unroll
+        for (int r = 0; r < 7; r++) sum += vf[r] * iv[threadIdx.y + r][threadIdx.x];
+        const int v = min(max((sum + 1024) >> 11, 0), 255);
+        a.out[y * a.w + x] = (uint8_t)v;
+        const int src = a.src[y * a.srcPitch + x], cd = a.cdef[y * a.w + x];
+        e0 = (unsigned long long)((src - cd) * (src - cd));
+        e1 = (unsigned long long)((src - v) * (src - v));
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) { e0 += __shfl_xor_sync(0xffffffffu, e0, o); e1 += __shfl_xor_sync(0xffffffffu, e1, o); }
+    if ((tid & 31) == 0) { red[0][tid >> 5] = e0; red[1][tid >> 5] = e1; }
+    __syncthreads();
+    if (!tid) {
+        unsigned long long s0 = 0, s1 = 0;
+        for (int k = 0; k < kLrTw * kLrTh / 32; k++) { s0 += red[0][k]; s1 += red[1][k]; }
+        atomicAdd(&a.sse[2 * u], s0);
+        atomicAdd(&a.sse[2 * u + 1], s1);
+    }
 }
 // Per unit: keep the filter when its SSE saving pays for its bits; write the decision into the grid (the unit's
 // top-left 8x8 entry) and the chosen samples into dst.
@@ -4607,7 +4668,7 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
     const int pw[3] = {w, cw, cw}, ph[3] = {h, ch, ch};
     auto sseOf = [&](uint8_t *const planes[3], int slot) {
         for (int p = 0; p < 3; p++)
-            planeSse<<<dim3((pw[p] + 31) / 32, (ph[p] + 7) / 8), dim3(32, 8), 0, stream>>>(
+            planeSse<<<dim3((pw[p] + 127) / 128, (ph[p] + 7) / 8), dim3(32, 8), 0, stream>>>(
                 src[p], pitch[p], planes[p], pw[p], ph[p], s->sse + 3 * slot + p);
         return cudaGetLastError();
     };
@@ -4698,7 +4759,7 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
             lrSolve<<<nu, 256, 0, stream>>>(la, 1);
             lrQuantize<<<(nu + 127) / 128, 128, 0, stream>>>(la);
             const dim3 g16((w + 15) / 16, (h + 15) / 16);
-            lrApply<<<g16, t16, 0, stream>>>(la);
+            lrApply<<<dim3((w + kLrTw - 1) / kLrTw, (h + kLrTh - 1) / kLrTh), dim3(kLrTw, kLrTh), 0, stream>>>(la);
             lrDecide<<<g16, t16, 0, stream>>>(la, gp_lambda<8>(qindex, 0.7f) * lrBits, s->grid, s->gcols, recon,
                                              s->filterDev);
             e = cudaGetLastError();
