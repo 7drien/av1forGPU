@@ -38,6 +38,11 @@ struct FilterSelection {
     int lf[3], cdef[3], lrLuma;
     int cdefBits, cdefPreset[8][2];   // per-superblock CDEF: presets as (luma, chroma) candidate indices
 };
+// Per-superblock CDEF preset choice state (device): totals of the 9 x 9 candidate pairs, chosen pairs, sums after each.
+struct CdefChoice {
+    unsigned long long totals[81], totalAfter[9];
+    int chosen[8], nCoded;
+};
 
 __constant__ int16_t c_filter[6][16][8];
 // AV1GPU_PF_PROFILE2: per-launch GPU time by name (synchronizes after every timed launch)
@@ -2475,6 +2480,7 @@ struct State {
     int8_t *cdefIdxDev = nullptr;               // per-superblock CDEF presets of the last filtered frame
     unsigned long long *cdefSbErr = nullptr;    // [candidate][superblock][luma, chroma] SSE
     unsigned long long *cdefCur = nullptr;      // preset choice scratch, one per superblock
+    CdefChoice *cdefChoice = nullptr;
     bool useTmvp = false;
     BlockInfo *motionGridHost = nullptr;
     cudaStream_t compute = nullptr;
@@ -2597,7 +2603,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
     cudaFree(s->sse);
-    cudaFree(s->cdefSbErr); cudaFree(s->cdefCur);
+    cudaFree(s->cdefSbErr); cudaFree(s->cdefCur); cudaFree(s->cdefChoice);
     cudaFree(s->hphase);
     for (void *p : {(void *)s->slots, (void *)s->tileWork, (void *)s->staging, (void *)s->defaultInter, (void *)s->mi,
                     (void *)s->tileStats, (void *)s->ecBuf})
@@ -2713,6 +2719,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->sse, sizeof(unsigned long long) * 3 * kCdefCount);
         alloc(&s->cdefSbErr, sizeof(unsigned long long) * 2 * kCdefCount * size_t((w + 63) / 64) * ((h + 63) / 64));
         alloc(&s->cdefCur, sizeof(unsigned long long) * size_t((w + 63) / 64) * ((h + 63) / 64));
+        alloc(&s->cdefChoice, sizeof(CdefChoice));
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
         for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
     }
@@ -3888,65 +3895,68 @@ __global__ void cdefSbSse(const uint8_t *s0, const uint8_t *s1, const uint8_t *s
 }
 // Greedy choice of up to 8 presets (luma candidate, chroma candidate) over the coded superblocks: each step adds the
 // pair that lowers the summed best-preset SSE most; 1, 2, 4 or 8 presets are kept by SSE + lambda * index bits; then
-// each coded superblock takes its best preset. One CTA; exact integer sums (deterministic).
-__global__ void __launch_bounds__(256) cdefChoose(const unsigned long long *err, int nSb, int K, int8_t *cdefIdx,
-                                                 float lambda, unsigned long long *cur, FilterSelection *sel) {
-    __shared__ unsigned long long bestTot[256];
-    __shared__ int bestPair[256];
-    __shared__ int chosen[8];
-    __shared__ unsigned long long totalAfter[9];
-    __shared__ int nCoded;
-    const int t = threadIdx.x, P = K * K;
-    auto e = [&](int pair, int sb) { return err[(size_t(pair / K) * nSb + sb) * 2] + err[(size_t(pair % K) * nSb + sb) * 2 + 1]; };
-    if (!t) nCoded = 0;
+// each coded superblock takes its best preset. Exact integer sums (deterministic). Per step: one CTA per pair sums its
+// SSE over the superblocks (cdefPairTotals), then one CTA picks the pair and updates the per-superblock minima.
+__device__ __forceinline__ unsigned long long cdefPairErr(const unsigned long long *err, int nSb, int K, int pair, int sb) {
+    return err[(size_t(pair / K) * nSb + sb) * 2] + err[(size_t(pair % K) * nSb + sb) * 2 + 1];
+}
+__global__ void cdefChooseInit(int nSb, const int8_t *cdefIdx, unsigned long long *cur, CdefChoice *ch) {
+    __shared__ int coded;
+    if (!threadIdx.x) coded = 0;
     __syncthreads();
-    int myCoded = 0;
-    for (int sb = t; sb < nSb; sb += 256) { cur[sb] = ~0ull; myCoded += cdefIdx[sb] >= 0; }
-    atomicAdd(&nCoded, myCoded);
+    int my = 0;
+    for (int sb = threadIdx.x; sb < nSb; sb += blockDim.x) { cur[sb] = ~0ull; my += cdefIdx[sb] >= 0; }
+    atomicAdd(&coded, my);
     __syncthreads();
-    for (int step = 0; step < 8; step++) {
-        unsigned long long tot = ~0ull;
-        int pair = 0x7fffffff;
-        for (int p = t; p < P; p += 256) {
-            unsigned long long s = 0;
-            for (int sb = 0; sb < nSb; sb++)
-                if (cdefIdx[sb] >= 0) { const unsigned long long v = e(p, sb); s += v < cur[sb] ? v : cur[sb]; }
-            if (s < tot || (s == tot && p < pair)) { tot = s; pair = p; }
-        }
-        bestTot[t] = tot; bestPair[t] = pair;
-        __syncthreads();
-        if (!t) {
-            for (int i = 1; i < 256; i++)
-                if (bestTot[i] < bestTot[0] || (bestTot[i] == bestTot[0] && bestPair[i] < bestPair[0])) {
-                    bestTot[0] = bestTot[i]; bestPair[0] = bestPair[i];
-                }
-            chosen[step] = bestPair[0];
-            totalAfter[step + 1] = bestTot[0];
-        }
-        __syncthreads();
-        for (int sb = t; sb < nSb; sb += 256)
-            if (cdefIdx[sb] >= 0) { const unsigned long long v = e(chosen[step], sb); if (v < cur[sb]) cur[sb] = v; }
-        __syncthreads();
+    if (!threadIdx.x) ch->nCoded = coded;
+}
+__global__ void cdefPairTotals(const unsigned long long *err, int nSb, int K, const int8_t *cdefIdx,
+                               const unsigned long long *cur, CdefChoice *ch) {
+    __shared__ unsigned long long red[8];
+    const int p = blockIdx.x, t = threadIdx.x;
+    unsigned long long sum = 0;
+    for (int sb = t; sb < nSb; sb += 256)
+        if (cdefIdx[sb] >= 0) { const unsigned long long v = cdefPairErr(err, nSb, K, p, sb); sum += v < cur[sb] ? v : cur[sb]; }
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if ((t & 31) == 0) red[t >> 5] = sum;
+    __syncthreads();
+    if (!t) { unsigned long long a = 0; for (int i = 0; i < 8; i++) a += red[i]; ch->totals[p] = a; }
+}
+__global__ void cdefPick(const unsigned long long *err, int nSb, int K, const int8_t *cdefIdx, unsigned long long *cur,
+                         CdefChoice *ch, int step) {
+    __shared__ int pick;
+    if (!threadIdx.x) {
+        int best = 0;
+        for (int p = 1; p < K * K; p++) if (ch->totals[p] < ch->totals[best]) best = p;
+        pick = best;
+        ch->chosen[step] = best;
+        ch->totalAfter[step + 1] = ch->totals[best];
     }
+    __syncthreads();
+    for (int sb = threadIdx.x; sb < nSb; sb += blockDim.x)
+        if (cdefIdx[sb] >= 0) { const unsigned long long v = cdefPairErr(err, nSb, K, pick, sb); if (v < cur[sb]) cur[sb] = v; }
+}
+__global__ void cdefFinish(const unsigned long long *err, int nSb, int K, int8_t *cdefIdx, float lambda,
+                           const CdefChoice *ch, FilterSelection *sel) {
     __shared__ int nKeep;
-    if (!t) {
+    if (!threadIdx.x) {
         int best = 1;
         double bestCost = 1e300;
         for (int b = 0; b <= 3; b++) {
             const int n = 1 << b;
-            const double c = (double)totalAfter[n] + (double)lambda * b * nCoded;
+            const double c = (double)ch->totalAfter[n] + (double)lambda * b * ch->nCoded;
             if (c < bestCost) { bestCost = c; best = n; }
         }
         nKeep = best;
         sel->cdefBits = best == 1 ? 0 : best == 2 ? 1 : best == 4 ? 2 : 3;
-        for (int i = 0; i < 8; i++) { sel->cdefPreset[i][0] = chosen[i] / K; sel->cdefPreset[i][1] = chosen[i] % K; }
+        for (int i = 0; i < 8; i++) { sel->cdefPreset[i][0] = ch->chosen[i] / K; sel->cdefPreset[i][1] = ch->chosen[i] % K; }
     }
     __syncthreads();
-    for (int sb = t; sb < nSb; sb += 256) {
+    for (int sb = threadIdx.x; sb < nSb; sb += blockDim.x) {
         if (cdefIdx[sb] < 0) continue;
         int bi = 0;
-        unsigned long long bv = e(chosen[0], sb);
-        for (int i = 1; i < nKeep; i++) { const unsigned long long v = e(chosen[i], sb); if (v < bv) { bv = v; bi = i; } }
+        unsigned long long bv = cdefPairErr(err, nSb, K, ch->chosen[0], sb);
+        for (int i = 1; i < nKeep; i++) { const unsigned long long v = cdefPairErr(err, nSb, K, ch->chosen[i], sb); if (v < bv) { bv = v; bi = i; } }
         cdefIdx[sb] = (int8_t)bi;
     }
 }
@@ -4050,8 +4060,14 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
             cdefSbSse<<<dim3(nSb, kCdefCount), 256, 0, stream>>>(src[0], src[1], src[2], pitch[0], pitch[1], pitch[2],
                                                                s->filterCandidates, frame, w, h, f.sbCols, nSb, f.cdefIdx,
                                                                s->cdefSbErr);
-            cdefChoose<<<1, 256, 0, stream>>>(s->cdefSbErr, nSb, kCdefCount, f.cdefIdx,
-                                             gp_lambda<8>(qindex, 0.7f), s->cdefCur, s->filterDev);
+            cdefChooseInit<<<1, 256, 0, stream>>>(nSb, f.cdefIdx, s->cdefCur, s->cdefChoice);
+            for (int step = 0; step < 8; step++) {
+                cdefPairTotals<<<kCdefCount * kCdefCount, 256, 0, stream>>>(s->cdefSbErr, nSb, kCdefCount, f.cdefIdx,
+                                                                            s->cdefCur, s->cdefChoice);
+                cdefPick<<<1, 256, 0, stream>>>(s->cdefSbErr, nSb, kCdefCount, f.cdefIdx, s->cdefCur, s->cdefChoice, step);
+            }
+            cdefFinish<<<1, 256, 0, stream>>>(s->cdefSbErr, nSb, kCdefCount, f.cdefIdx, gp_lambda<8>(qindex, 0.7f),
+                                             s->cdefChoice, s->filterDev);
             uint8_t *lumaOut = out.lrAllowed ? s->cdefOut : recon;
             gatherCdef<<<unsigned((frame + 255) / 256), 256, 0, stream>>>(s->filterCandidates, frame, w, h, f.sbCols,
                                                                           f.cdefIdx, s->filterDev, recon, lumaOut);
