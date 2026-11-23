@@ -153,6 +153,8 @@ public:
     // neighbouring padded frames; out receives the filtered padded planes. strength scales the blending weights.
     int temporalFilter(const uint8_t *const center[3], const uint8_t *const *const neighbors[3], int count, int qindex,
                        float strength, uint8_t *const out[3], char *err, int errLen);
+    // Estimated noise standard deviation of a luma plane (libaom estimator; blocking), -1 if undetermined.
+    double noiseSigma(const uint8_t *luma, int pitch, char *err, int errLen);
     // Code the tiles of the last analyzed frame on the GPU (blocking).
     int entropy(const EntropyIn &in, EntropyOut &out, char *err, int errLen);
     // Asynchronous form: launch into entropy slot k (0 .. kEntropySlots-1) on the entropy stream, fetch later (any

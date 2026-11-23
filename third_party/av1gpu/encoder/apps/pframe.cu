@@ -2269,6 +2269,7 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
     __shared__ float wsum[256], acc[256], wl[256];
     __shared__ int d2[256];
     __shared__ float cw[2][64], cacc[2][64];
+    __shared__ int ccen[2][64], cpred[2][64], cd2[2][64];
     __shared__ int bestOff, bestSub;
     __shared__ float blockMse;
     __shared__ int subSad[8];
@@ -2285,7 +2286,8 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
         const int ux = min(bx / 2 + (t & 7), cw2 - 1), uy = min(by / 2 + (t >> 3), ch2 - 1);
         for (int p = 0; p < 2; p++) {
             cw[p][t] = 1.f;
-            cacc[p][t] = a.center[1 + p][uy * caw + ux];
+            ccen[p][t] = a.center[1 + p][uy * caw + ux];
+            cacc[p][t] = (float)ccen[p][t];
         }
     }
     float decay;
@@ -2386,8 +2388,6 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
             const int cy16 = dy16 >> 1, cx16 = dx16 >> 1;
             const int ux = bx / 2 + (t & 7), uy = by / 2 + (t >> 3);
             const int iy = uy + (cy16 >> 4), ix = ux + (cx16 >> 4), fy = cy16 & 15, fx = cx16 & 15;
-            const int l = (t >> 3) * 32 + (t & 7) * 2;   // top-left of the colocated 2x2 luma samples
-            const float wc = 0.25f * (wl[l] + wl[l + 1] + wl[l + 16] + wl[l + 17]);
             for (int p = 0; p < 2; p++) {
                 const uint8_t *pl = a.nb[j][1 + p];
                 int v = 0;
@@ -2398,7 +2398,22 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
                     v += c_filter[0][fy][r] * hsum;
                 }
                 v = min(max((v + 8192) >> 14, 0), 255);
-                cacc[p][t] += wc * v;
+                cpred[p][t] = v;
+                cd2[p][t] = (ccen[p][t] - v) * (ccen[p][t] - v);
+            }
+        }
+        __syncthreads();
+        if (t < 64) {
+            // chroma weights from the plane's own 3x3 window error plus the colocated 2x2 luma errors (as libaom
+            // adds luma to the chroma window): a colour change over unchanged luma must not be averaged
+            const int cr = t >> 3, cc = t & 7, l = cr * 32 + cc * 2;
+            const int lumaSse = d2[l] + d2[l + 1] + d2[l + 16] + d2[l + 17];
+            for (int p = 0; p < 2; p++) {
+                int sse = lumaSse, n = 4;
+                for (int r = max(cr - 1, 0); r <= min(cr + 1, 7); r++)
+                    for (int c = max(cc - 1, 0); c <= min(cc + 1, 7); c++) { sse += cd2[p][r * 8 + c]; n++; }
+                const float wc = __expf(-fminf(7.f, (5.f * (float)sse / (float)n + blockMse) * inv));
+                cacc[p][t] += wc * (float)cpred[p][t];
                 cw[p][t] += wc;
             }
         }
@@ -3700,6 +3715,21 @@ int Analyzer::temporalFilter(const uint8_t *const center[3], const uint8_t *cons
         return -1;
     }
     return 0;
+}
+
+double Analyzer::noiseSigma(const uint8_t *luma, int pitch, char *err, int errLen) {
+    auto *s = static_cast<State *>(state);
+    unsigned long long host[2] = {0, 0};
+    cudaError_t e = cudaMemsetAsync(s->tfNoise, 0, 2 * sizeof(unsigned long long), s->compute);
+    estimateNoise<<<dim3((w + 29) / 32, (h + 5) / 8), dim3(32, 8), 0, s->compute>>>(luma, pitch, w, h, s->tfNoise);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaMemcpyAsync(host, s->tfNoise, sizeof host, cudaMemcpyDeviceToHost, s->compute);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s->compute);
+    if (e != cudaSuccess) {
+        snprintf(err, errLen, "noise estimate: %s", cudaGetErrorString(e));
+        return -2.0;
+    }
+    return host[1] >= 16 ? double(host[0]) / (6.0 * double(host[1])) * 1.25331413731550025 : -1.0;
 }
 
 void Analyzer::resetTemporal() {

@@ -629,6 +629,7 @@ int main(int argc, char **argv) {
     const auto wallStart = std::chrono::steady_clock::now();
     GpEntScratch scratch;
     // ---- CUDA P/ALTREF frame path ----
+    constexpr int kTfKeyMax = 8;
     auto runPframes = [&]() -> int {
         const int G = std::max(1, pfGop);
         const size_t frameBytes = ySize * 3 / 2;
@@ -637,7 +638,8 @@ int main(int argc, char **argv) {
             if (cudaMalloc(&slotBuf[k], frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
         if (cudaMalloc(&spare, frameBytes) != cudaSuccess) { fprintf(stderr, "slot allocation failed\n"); return 1; }
         const cudaStream_t compute = pfAnalyzer.stream();
-        FrameUploads inBuf(w, h, aw, ah, G + pfTfFrames + 1);
+        // slots: a mini-GOP plus temporal-filter neighbours, or a key frame and its filter neighbours
+        FrameUploads inBuf(w, h, aw, ah, std::max<size_t>(size_t(G + pfTfFrames + 1), size_t(kTfKeyMax + 1)));
         if (!inBuf.init()) return 1;
         bool slotValid[8] = {};
         std::array<uint8_t *, 3> tfBuf{};
@@ -1189,16 +1191,59 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 // keyframe
+                // AV1GPU_PF_TF_KEY=k: temporal filter of the key frame over the next k frames (as SVT-AV1 does); the key frame
+                // codes the filtered picture
+                static const int tfKey = getenv("AV1GPU_PF_TF_KEY") ? std::min(kTfKeyMax, atoi(getenv("AV1GPU_PF_TF_KEY"))) : 8;
+                static const double tfKeyNoise = getenv("AV1GPU_PF_TF_KEY_NOISE") ? atof(getenv("AV1GPU_PF_TF_KEY_NOISE")) : 0.25;
+                bool keyFiltered = false;
+                if (tfKey > 0) {
+                    readMore(size_t(tfKey) + 1);
+                    const int nb = std::min<int>(tfKey, int(pending.size()) - 1);
+                    if (nb > 0) {
+                        for (int j = 0; j <= nb; ++j)
+                            if (!inBuf.upload(j, pending[j]) || !inBuf.wait(j, compute)) return 1;
+                    }
+                    // only noisy content: the filter also averages real changes, which costs clean content more than
+                    // it gains (video_4 / video_2, noise 0.05-0.18: +0.8% / 0; video_1 / 3 / 5, 0.37-1.4: -0.4 to -3.7%)
+                    const double sigma = nb > 0 ? pfAnalyzer.noiseSigma(inBuf[0][0], pitches[0], perr, sizeof perr) : 0.0;
+                    if (sigma < -1.5) { fprintf(stderr, "%s\n", perr); return 1; }
+                    if (nb > 0 && sigma >= tfKeyNoise) {
+                        std::vector<const uint8_t *> nbs[3];
+                        for (int j = 1; j <= nb; ++j)
+                            for (int p = 0; p < 3; ++p) nbs[p].push_back(inBuf[j][p]);
+                        const uint8_t *const center[3] = {inBuf[0][0], inBuf[0][1], inBuf[0][2]};
+                        const uint8_t *const *nbp[3] = {nbs[0].data(), nbs[1].data(), nbs[2].data()};
+                        uint8_t *const outp[3] = {tfBuf[0], tfBuf[1], tfBuf[2]};
+                        // strength from the key frame's own quantizer (as libaom: a near-lossless key frame is barely
+                        // filtered; with the inter quantizer video_4's 60 dB logo frame lost 2.8 dB)
+                        const int kfQ = std::max(1, std::min(255, pfSettings.qindex - keyOffset));
+                        if (pfAnalyzer.temporalFilter(center, nbp, nb, kfQ, pfTfStrength, outp, perr, sizeof perr)) {
+                            fprintf(stderr, "%s\n", perr);
+                            return 1;
+                        }
+                        if (cudaStreamSynchronize(compute) != cudaSuccess) return 1;
+                        keyFiltered = true;
+                        if (getenv("AV1GPU_PF_TF_DUMP")) {   // debug: the filtered key-frame source (padded planes)
+                            static FILE *tfd = fopen(getenv("AV1GPU_PF_TF_DUMP"), "wb");
+                            std::vector<uint8_t> hb(sizes[0]);
+                            for (int p = 0; p < 3; ++p) {
+                                hb.resize(sizes[p]);
+                                cudaMemcpy(hb.data(), tfBuf[p], sizes[p], cudaMemcpyDeviceToHost);
+                                if (tfd) fwrite(hb.data(), 1, sizes[p], tfd);
+                            }
+                        }
+                    }
+                }
                 std::vector<uint8_t> raw = std::move(pending.front());
                 pending.erase(pending.begin());
-                if (!inBuf.upload(0, raw) || !inBuf.wait(0, nullptr)) return 1;
+                if (!keyFiltered && (!inBuf.upload(0, raw) || !inBuf.wait(0, nullptr))) return 1;
                 prevFrame = std::move(raw);
                 diffCache.clear();   // freed buffers may be reused at the same addresses
                 GpFrameIn in;
                 in.deviceRecon = reference;
                 in.W = w; in.H = h; in.aw = aw; in.ah = ah;
                 in.colorMatrix = 1;
-                for (int p = 0; p < 3; ++p) { in.dsrc[p] = inBuf[0][p]; in.spitch[p] = pitches[p]; }
+                for (int p = 0; p < 3; ++p) { in.dsrc[p] = keyFiltered ? tfBuf[p] : inBuf[0][p]; in.spitch[p] = pitches[p]; }
                 std::vector<GpFrameIn> inputs{in};
                 std::vector<GpFrameOut> frames;
                 GpTimes times;
@@ -1291,6 +1336,9 @@ int main(int argc, char **argv) {
             order(order, 0, n);
 
             bool filtered = false;
+            // AV1GPU_PF_TF_NOOVERLAY: display the filtered ALTREF itself (show_existing_frame, as SVT-AV1 does by
+            // default) instead of coding an overlay frame that restores the original picture
+            static const bool tfNoOverlay = getenv("AV1GPU_PF_TF_NOOVERLAY") != nullptr;
             if (pfTfFrames > 0) {
                 std::vector<const uint8_t *> nbs[3];
                 for (size_t i = firstReady; i < avail; ++i) {
@@ -1344,7 +1392,7 @@ int main(int argc, char **argv) {
             // hi2Slot: the next anchor after hi (still held, displayed later), the third reference of the interval
             std::function<int(uint64_t, uint64_t, int, int, int, int)> rec = [&](uint64_t lo, uint64_t hi, int loSlot,
                                                                                  int hiSlotL, int depth, int hi2Slot) -> int {
-                if (hi == lo + 1 && filtered && hi == base + n) {
+                if (hi == lo + 1 && filtered && hi == base + n && !tfNoOverlay) {
                     // overlay: display the original picture coded from the filtered ALTREF (refreshes no slot)
                     frameOrder = base + n;
                     if (interFrame(n - 1, loSlot, hiSlotL, 8, std::min(255, pfSettings.qindex + pfLeafOffset),
@@ -1370,7 +1418,7 @@ int main(int argc, char **argv) {
                 const uint64_t mid = (lo + hi) / 2;
                 if (mid == lo + 1) {
                     // the frame shown before an overlay is the overlay's LAST reference
-                    const bool referenced = hi - mid > 1 || (filtered && hi == base + n);
+                    const bool referenced = hi - mid > 1 || (filtered && hi == base + n && !tfNoOverlay);
                     const int midSlot = referenced ? allocSlot() : -1;
                     // an unreferenced shown frame refreshes no slot; its reconstruction lands in the spare buffer
                     frameOrder = mid;

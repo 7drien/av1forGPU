@@ -549,3 +549,23 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   -0.65%, rounding 0.46 -0.17%, short-GOP boost -0.86%, cut detection + cut offset 30 -0.33%. Allocation changes are
   now validated this way.
 
+### Temporal filter: chroma bug fixed, key frames filtered on noisy content
+
+- SVT-AV1 without its temporal filter (`enable-tf=0`) loses 14.7% on video_3 (video_2: -1.8%). With it, SVT filters
+  key frames too: its first frame is 1.3 dB further from the source, its first ALTREF group costs 159 KB instead of
+  247 KB, and the frames between are about 0.6 dB better (they predict from denoised references).
+- Our rewritten filter weighted chroma by the colocated luma weights only, so a colour change over unchanged luma
+  (stage lights) was averaged: at near-lossless settings the filtered key frame of video_2 had chroma MSE 1.45 (max
+  difference 13 / 22 levels). Chroma weights now use the plane's own 3x3 window error plus the colocated luma errors
+  (as libaom): chroma MSE 0.055. This also affected the ALTREF results above.
+- Key frames are now filtered over the next 8 frames (`AV1GPU_PF_TF_KEY`, 0 off) with the strength of the key frame's
+  own quantizer, when the estimated luma noise is at least 0.25 (`AV1GPU_PF_TF_KEY_NOISE`): the filter also averages
+  real changes (video_2's filtered key frame differs from its source by MSE 0.43 at noise 0.12), which costs clean
+  content more than it gains. Noise estimates: video_1 0.37-0.45, video_2 0.10-0.15, video_3 0.46-0.60, video_4
+  0.05-0.18, video_5 1.2-1.4 (texture read as noise).
+- Compared directly with the previous configuration: 2 / 4 / 6 / 8 frames on video_3 -0.68 / -1.81 / -2.63 / -3.51%;
+  without the noise gate (8 frames): video_1 -0.39, video_2 -0.09, video_3 -3.67, video_4 +0.79, video_5 -0.14%; with
+  it: -0.39 / 0 / -3.67 / 0 / -0.14%, mean -0.84%. Against SVT: +7.8%.
+- Displaying the filtered ALTREF instead of an overlay (`AV1GPU_PF_TF_NOOVERLAY`, as SVT) was worse on video_3 (+5.3% /
+  +9.9% for 2 / 3 frames, before the chroma fix).
+
