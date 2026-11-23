@@ -219,13 +219,13 @@ __device__ __forceinline__ void interpVSel(const int16_t *tmp, int w, int lw, in
 __device__ __forceinline__ int filterRow(int f, int n) { return n <= 4 ? (f == 1 ? 5 : 4) : f; }
 template <bool OUT = false>
 __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, int w, int h, Mv mv, int sub,
-                            int16_t *tmp, uint8_t *out, int filt = 0) {
+                            int16_t *tmp, uint8_t *out, int filt = 0, int hf = -1) {
     const int lane = threadIdx.x & 31;
     const int lw = 31 - __clz(w);   // block widths are powers of two
     const int X = (x0 << 4) + ((2 * mv.col) >> sub);
     const int Y = (y0 << 4) + ((2 * mv.row) >> sub);
     const int ix = X >> 4, fx = X & 15, iy = Y >> 4, fy = Y & 15;
-    const int fh = filterRow(filt, w), fv = filterRow(filt, h);
+    const int fh = filterRow(filt, w), fv = filterRow(filt, hf < 0 ? h : hf);   // hf: height of the whole block (stripes)
     const int lastX = pw - 1, lastY = ph - 1;
     if (!fx && !fy) {
         for (int i = lane; i < w * h; i += 32) {
@@ -243,10 +243,11 @@ __device__ void warpPredict(const uint8_t *ref, int pw, int ph, int x0, int y0, 
 // Clip1(Round2(p0 + p1, 5)). hp holds w * h int16 values.
 template <bool OUT = false>
 __device__ void warpPredictCompound(const uint8_t *ref0, const uint8_t *ref1, int pw, int ph, int x0, int y0, int w,
-                                    int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out, int filt = 0) {
+                                    int h, Mv mv0, Mv mv1, int sub, int16_t *tmp, int16_t *hp, uint8_t *out, int filt = 0,
+                                    int hf = -1) {
     const int lane = threadIdx.x & 31;
     const int lw = 31 - __clz(w);   // block widths are powers of two
-    const int fh = filterRow(filt, w), fv = filterRow(filt, h);
+    const int fh = filterRow(filt, w), fv = filterRow(filt, hf < 0 ? h : hf);
     for (int k = 0; k < 2; k++) {
         const uint8_t *ref = k ? ref1 : ref0;
         const Mv mv = k ? mv1 : mv0;
@@ -779,6 +780,9 @@ __global__ void pruneSquare(Cand *cc, int ccols, int crows, int n, const Cand *p
 template <int BW, int BH>
 struct EvalCfg {
     static constexpr int warps = BW * BH >= 1024 ? 1 : BW * BH >= 256 ? 2 : 4;
+    // split-external evaluations of one block per CTA: four warps predict a horizontal stripe each (prediction, the
+    // filter search and the residual), then warp 0 alone codes the luma transform
+    static constexpr int stripes = BW * BH >= 2048 ? 4 : 1;   // (32x32 and 16x64 measured slower; chroma stripes >= 4 rows)
 };
 
 struct EvalArgs {
@@ -922,19 +926,30 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
     __shared__ int16_t resS[W][AREA];
     __shared__ float tmpS[W][TS];
     __shared__ int16_t qS[W][TQ];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int S = EXT ? EvalCfg<BW, BH>::stripes : 1;   // warps per block
+    constexpr bool MW = S > 1;
+    static_assert(!MW || W == 1, "striped evaluation: one block per CTA");
+    const int warp = (threadIdx.x >> 5) / S, stripe = (threadIdx.x >> 5) % S, lane = threadIdx.x & 31;
     const int b = a.blockIndex(slot);
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     Cand &c = *a.candidate(b, x0, y0);
     if (c.pruned) {
-        if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; c.filter = 0; }
+        if (!lane && !stripe) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; c.filter = 0; }
         return;
     }
     const Frame &f = a.f;
     if (x0 >= f.w || y0 >= f.h) {
-        if (!lane) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; }
+        if (!lane && !stripe) { c.costSkip = c.costCoded = kInf; c.nz = 0; c.txSplit = 0; }
         return;
     }
+    // striped mode: stripe s predicts rows [s * BH / S, (s + 1) * BH / S) with its own interpolation scratch (the first
+    // half in interp, the second in tmpS, which the transform uses only later)
+    constexpr int SH = BH / S;
+    static_assert(!MW || (2 * (SH + 7) * BW <= (BH + 7) * BW && 2 * (SH + 7) * BW * 2 <= TS * 4), "stripe scratch");
+    int16_t *sInterp = !MW ? interp[warp]
+                           : stripe < S / 2 ? interp[0] + stripe * (SH + 7) * BW
+                                            : reinterpret_cast<int16_t *>(tmpS[0]) + (stripe - S / 2) * (SH + 7) * BW;
+    __shared__ int part[S];
     const uint8_t *ref = c.ref == 1 ? f.ref[1] : c.ref == 3 ? f.ref[2] : f.ref[0];
     const uint8_t *ref2 = f.ref[1];
     const int cw = f.w >> 1, chh = f.h >> 1;
@@ -954,38 +969,97 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
         const float fbits[3] = {0.21f, 2.9f, 7.6f};   // Default_Interp_Filter_Cdf context 3 (no neighbour information)
         float bestJ = 3.4e38f;
         uint8_t *pl = predS[warp];
+        const int s0 = stripe * SH;   // first row of this warp's stripe (0 unless striped)
+        constexpr int RH = MW ? SH : BH;
 #pragma unroll 1
         for (int t = 0; t < 3; t++) {
             if (c.ref == 2)
-                warpPredictCompound<(BW == 64 || BH == 64)>(f.ref[0], ref2, f.w, f.h, x0, y0, BW, BH, c.mv, c.mv2, 0, interp[warp], hpS[warp], pl, t);
+                warpPredictCompound<(BW == 64 || BH == 64)>(f.ref[0], ref2, f.w, f.h, x0, y0 + s0, BW, RH, c.mv, c.mv2, 0,
+                                                            sInterp, hpS[warp] + s0 * BW, pl + s0 * BW, t, BH);
             else
-                warpPredict<(BW == 64 || BH == 64)>(ref, f.w, f.h, x0, y0, BW, BH, c.mv, 0, interp[warp], pl, t);
+                warpPredict<(BW == 64 || BH == 64)>(ref, f.w, f.h, x0, y0 + s0, BW, RH, c.mv, 0, sInterp, pl + s0 * BW, t, BH);
             int v = 0;
-            for (int i = lane; i < AREA; i += 32) {
+            for (int i = s0 * BW + lane; i < (s0 + RH) * BW; i += 32) {
                 const int r = i / BW, col = i % BW;
                 if (x0 + col >= f.w || y0 + r >= f.h) continue;
                 const int d = (int)f.src[0][(y0 + r) * f.pitch[0] + x0 + col] - pl[i];
                 v += d * d;
             }
-            const float J = (float)warp_sumi(v) + a.lambda * (t ? fbits[t] * a.filterBias : fbits[t]);
+            v = warp_sumi(v);
+            if constexpr (MW) {
+                if (!lane) part[stripe] = v;
+                __syncthreads();
+                v = 0;
+#pragma unroll
+                for (int k = 0; k < S; k++) v += part[k];
+                __syncthreads();
+            }
+            const float J = (float)v + a.lambda * (t ? fbits[t] * a.filterBias : fbits[t]);
             if (J < bestJ) {
                 bestJ = J;
                 filt = t;
                 if (t < 2) {   // keep it (recS is free until the reconstruction)
-                    for (int i = lane; i < AREA / 4; i += 32)
+                    for (int i = s0 * BW / 4 + lane; i < (s0 + RH) * BW / 4; i += 32)
                         reinterpret_cast<uint32_t *>(recS[warp])[i] = reinterpret_cast<const uint32_t *>(pl)[i];
                     __syncwarp();
                 }
             }
         }
         if (filt != 2) {
-            for (int i = lane; i < AREA / 4; i += 32)
+            for (int i = s0 * BW / 4 + lane; i < (s0 + RH) * BW / 4; i += 32)
                 reinterpret_cast<uint32_t *>(pl)[i] = reinterpret_cast<const uint32_t *>(recS[warp])[i];
             __syncwarp();
         }
         searched = true;
     }
-    if (!lane) c.filter = (uint8_t)filt;
+    if (!lane && !stripe) c.filter = (uint8_t)filt;
+    // striped mode: the three planes' predictions, stored predictions and skip SSEs by all warps (luma last, so resS
+    // ends with the luma residual), then warp 0 alone continues
+    int sseP[3] = {0, 0, 0};
+    if constexpr (MW) {
+#pragma unroll
+        for (int k = 0; k < 3; k++) {
+            const int p = k == 2 ? 0 : k + 1;
+            const int sub = p > 0, bw = p ? BW / 2 : BW, bh = p ? BH / 2 : BH, sh = bh / S, r0 = stripe * sh;
+            const int lw = Log2<BW>::v - sub;
+            const int pw = p ? cw : f.w, ph = p ? chh : f.h;
+            const int px = x0 >> sub, py = y0 >> sub;
+            uint8_t *pred = predS[0] + (p ? AREA + (p - 1) * (AREA / 4) : 0);
+            const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
+            if (p == 0 && searched) {
+            } else if (c.ref == 2)
+                warpPredictCompound<(BW == 64 || BH == 64)>(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py + r0,
+                                                            bw, sh, c.mv, c.mv2, sub, sInterp, hpS[0] + r0 * bw,
+                                                            pred + r0 * bw, filt, bh);
+            else
+                warpPredict<(BW == 64 || BH == 64)>(refP, pw, ph, px, py + r0, bw, sh, c.mv, sub, sInterp, pred + r0 * bw,
+                                                    filt, bh);
+            __syncthreads();
+            const uint8_t *src = f.src[p];
+            const int pitch = f.pitch[p];
+            uint8_t *outPred = a.pred + (p ? ysz + (p - 1) * csz : 0);
+            int sse = 0;
+            for (int i = threadIdx.x; i < bw * bh; i += 32 * S) {
+                const int r = i >> lw, col = i & (bw - 1);
+                int d = 0;
+                if (px + col < pw && py + r < ph) {
+                    d = (int)src[(py + r) * pitch + px + col] - pred[i];
+                    outPred[(py + r) * pw + px + col] = pred[i];
+                }
+                sse += d * d;
+                resS[0][i] = (int16_t)d;
+            }
+            sse = warp_sumi(sse);
+            if (!lane) part[stripe] = sse;
+            __syncthreads();
+            sse = 0;
+#pragma unroll
+            for (int w4 = 0; w4 < S; w4++) sse += part[w4];
+            sseP[p] = sse;
+            __syncthreads();
+        }
+        if (stripe) return;
+    }
 #pragma unroll
     for (int p = 0; p < 3; p++) {
         const int sub = p > 0, bw = p ? BW / 2 : BW, bh = p ? BH / 2 : BH;
@@ -994,7 +1068,7 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
         const int px = x0 >> sub, py = y0 >> sub;
         uint8_t *pred = predS[warp] + (p ? AREA + (p - 1) * (AREA / 4) : 0);
         const uint8_t *refP = ref + (p ? ysz + (p - 1) * csz : 0);
-        if (p == 0 && searched) {
+        if (MW || (p == 0 && searched)) {
         } else if (c.ref == 2)
             warpPredictCompound<(BW == 64 || BH == 64)>(refP, ref2 + (p ? ysz + (p - 1) * csz : 0), pw, ph, px, py, bw, bh, c.mv, c.mv2, sub,
                                 interp[warp], hpS[warp], pred, filt);
@@ -1006,18 +1080,24 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
         int16_t *res = resS[warp];
         float energy = 0.f;
         uint8_t *outPred = a.pred + (p ? ysz + (p - 1) * csz : 0);
-        for (int i = lane; i < bw * bh; i += 32) {
-            const int r = i >> lw, col = i & (bw - 1);
-            int d = 0;
-            if (px + col < pw && py + r < ph) {
-                d = (int)src[(py + r) * pitch + px + col] - pred[i];
-                outPred[(py + r) * pw + px + col] = pred[i];
+        if constexpr (MW) {
+            if (!p)   // the luma residual is in resS (the same per-lane order as below)
+                for (int i = lane; i < bw * bh; i += 32) energy += (float)(res[i] * res[i]);
+            dSkip += (float)sseP[p];
+        } else {
+            for (int i = lane; i < bw * bh; i += 32) {
+                const int r = i >> lw, col = i & (bw - 1);
+                int d = 0;
+                if (px + col < pw && py + r < ph) {
+                    d = (int)src[(py + r) * pitch + px + col] - pred[i];
+                    outPred[(py + r) * pw + px + col] = pred[i];
+                }
+                sse += d * d;
+                res[i] = (int16_t)d;
+                energy += (float)(d * d);
             }
-            sse += d * d;
-            res[i] = (int16_t)d;
-            energy += (float)(d * d);
+            dSkip += (float)warp_sumi(sse);
         }
-        dSkip += (float)warp_sumi(sse);
         __syncwarp();
         if (EXT && p) continue;   // split-external mode: chroma is coded by evalFinal once the luma depth is known
         // transform of the whole block (64-point transforms keep 32 coefficients per side)
@@ -1303,12 +1383,16 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
 // One warp per block; grid-stride, so the sparse refinement trials launch a small grid (a full-size grid of mostly
 // empty CTAs delays every concurrent stream while it drains).
 template <int BW, int BH, bool EXT = false, bool LOOP = false>
-__global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs a) {
-    constexpr int W = EvalCfg<BW, BH>::warps;
+__global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps * (EXT ? EvalCfg<BW, BH>::stripes : 1)) evaluate(EvalArgs a) {
+    constexpr int W = EvalCfg<BW, BH>::warps, S = EXT ? EvalCfg<BW, BH>::stripes : 1;
     const int n = a.blockCount();
-    const int slot = blockIdx.x * W + (threadIdx.x >> 5);
+    const int slot = blockIdx.x * W + (threadIdx.x >> 5) / S;
     if constexpr (LOOP) {
-        for (int i = slot; i < n; i += gridDim.x * W) evaluateOne<BW, BH, EXT>(a, i);
+        // striped: warps 1.. finish a block before warp 0 (its transform still uses the shared scratch)
+        for (int i = slot; i < n; i += gridDim.x * W) {
+            evaluateOne<BW, BH, EXT>(a, i);
+            if constexpr (S > 1) __syncthreads();
+        }
     } else if (slot < n) {
         evaluateOne<BW, BH, EXT>(a, slot);
     }
@@ -1844,8 +1928,9 @@ void launchEvaluation(EvalArgs a, bool splitExternal, cudaStream_t stream,
     }
     {
         FineTimer t(a.trials ? nullptr : whole);
-        if (a.trials) evaluate<BW, BH, true, true><<<grid(blocks), 32 * warps, 0, stream>>>(a);
-        else evaluate<BW, BH, true><<<blocks, 32 * warps, 0, stream>>>(a);
+        constexpr int threads = 32 * warps * EvalCfg<BW, BH>::stripes;
+        if (a.trials) evaluate<BW, BH, true, true><<<grid(blocks), threads, 0, stream>>>(a);
+        else evaluate<BW, BH, true><<<blocks, threads, 0, stream>>>(a);
     }
     {
         FineTimer t(a.trials ? nullptr : split);
