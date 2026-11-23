@@ -1271,7 +1271,8 @@ int main(int argc, char **argv) {
             auto release = [&](int k) { if (k >= 0) freeSlots.push_back(k); };
             // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
             gopMotion = !prevFrame.empty() ? motionOf(&prevFrame, 0, n - 1) : 0.0;
-            const double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, 60) : pfAltrefBoost;
+            static const double movingBoost = getenv("AV1GPU_PF_BOOST_MOVING") ? atof(getenv("AV1GPU_PF_BOOST_MOVING")) : 60.0;
+            const double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, movingBoost) : pfAltrefBoost;
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
             auto qAt = [&](int depth) {

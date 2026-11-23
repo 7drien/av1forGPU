@@ -280,17 +280,33 @@ __global__ void verticalPhases(const int16_t *hp, int w, int h, uint8_t *out) {
 }
 
 // Lanes cooperating on one block: 8 for 8x8 blocks (4 blocks per warp), else the whole warp.
+// Lanes cooperating on one block in motion search: 8 for 8x8, 32 up to 1024 samples, 128 (four warps, one block per
+// CTA, sums through shared memory) for the 2048- and 4096-sample blocks (their SADs are memory-latency bound; 256
+// lanes for 4096 or 64 for 1024 samples measured no better).
 template <int BW, int BH> struct Grp {
-    static constexpr int G = BW * BH == 64 ? 8 : 32;
+    static constexpr int G = BW * BH == 64 ? 8 : BW * BH >= 2048 ? 128 : 32;
     __device__ static int lane() { return threadIdx.x & (G - 1); }
     __device__ static unsigned mask() {
-        return G == 32 ? 0xffffffffu : ((1u << G) - 1) << ((threadIdx.x & 31) & ~(G - 1));
+        return G >= 32 ? 0xffffffffu : ((1u << G) - 1) << ((threadIdx.x & 31) & ~(G - 1));
     }
     __device__ static int sum(int v) {
-        const unsigned m = mask();
+        if constexpr (G <= 32) {
+            const unsigned m = mask();
 #pragma unroll
-        for (int o = G / 2; o; o >>= 1) v += __shfl_xor_sync(m, v, o);
-        return v;
+            for (int o = G / 2; o; o >>= 1) v += __shfl_xor_sync(m, v, o);
+            return v;
+        } else {
+            __shared__ int part[G / 32];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = v;
+            __syncthreads();
+            int t = 0;
+#pragma unroll
+            for (int k = 0; k < G / 32; k++) t += part[k];
+            __syncthreads();
+            return t;
+        }
     }
 };
 template <int V> struct Log2 { static constexpr int v = V <= 1 ? 0 : 1 + Log2<V / 2>::v; };
@@ -345,7 +361,7 @@ __device__ __forceinline__ int groupSadCached(const uint8_t *sv, const uint8_t *
 // quarter sample steps on the phase planes. parentSize: side of the square block whose vector predicts this one.
 template <int BW, int BH>
 struct RefineCfg {
-    static constexpr int warps = BW * BH >= 4096 ? 2 : BW * BH >= 1024 ? 4 : 8;
+    static constexpr int warps = BW * BH >= 1024 ? 4 : 8;
     static constexpr int per() { return warps * 32 / Grp<BW, BH>::G; }   // blocks per CTA
 };
 template <int BW, int BH>

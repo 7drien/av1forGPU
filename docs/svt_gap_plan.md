@@ -433,3 +433,18 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
 - Split pruning (moving content: no split-transform search when the whole-block transform quantizes to nothing,
   `AV1GPU_PF_SPLITPRUNE=1`) is implemented but off: +0.3 points for 2 to 3% speed.
 
+### Motion search: four warps per large block; kernel experiments without counters
+
+- Per-stage timing (`AV1GPU_PF_PROFILE2=1`, video_2 q50): `refine` of 64x64 blocks was the largest single item (5.5 ms per
+  inter frame of 9.6 ms of refinement): one warp per block, 50-80 candidate SADs of 4096 samples each. 2048- and
+  4096-sample blocks now use four warps (one block per CTA, SAD sums through shared memory). Same output; video_2
+  17.1 → 17.6 fps (q20) and 20.8 → 21.5 (q90), video_3 6.83 → 6.90. 256 lanes for 64x64 or 64 lanes for 1024-sample
+  blocks were no better.
+- No gain (reverted, outputs identical): packed 4-byte SADs (`__vsadu4` on funnel-shifted loads) in the refinement
+  (memory-latency bound, not arithmetic; the register-cached variant was 12% slower), a parallel screen of the 16
+  types of 4x4 transforms (one type per lane, bit-exact with the sequential screen: +0.5%; the candidates' quantizer
+  and rate estimates dominate), a 128-register cap on `evalSplit` for more resident warps (-0.5%).
+- GPU idle time is 9% of an encode: 180 ms of startup in the first 213 ms, and 8 to 16 ms at each mini-GOP boundary.
+  Process start plus CUDA context cost about 0.35 s (lazy module loading is already the default).
+- Without performance counters (admin only on this machine) the kernels' limiters are guessed from such experiments.
+
