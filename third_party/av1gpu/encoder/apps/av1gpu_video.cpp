@@ -332,7 +332,7 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(argv[i], "--pf-tf-frames") && i + 1 < argc) {
             pfTfFrames = atoi(argv[++i]);
-            if (pfTfFrames < 0 || pfTfFrames > 4) { fprintf(stderr, "--pf-tf-frames must be 0..4\n"); return 2; }
+            if (pfTfFrames < 0 || pfTfFrames > 8) { fprintf(stderr, "--pf-tf-frames must be 0..8\n"); return 2; }
         } else if (!strcmp(argv[i], "--pf-tf-strength") && i + 1 < argc) {
             pfTfStrength = strtof(argv[++i], nullptr);
             if (!(pfTfStrength > 0.f && pfTfStrength <= 16.f)) { fprintf(stderr, "--pf-tf-strength must be in (0, 16]\n"); return 2; }
@@ -629,7 +629,7 @@ int main(int argc, char **argv) {
     const auto wallStart = std::chrono::steady_clock::now();
     GpEntScratch scratch;
     // ---- CUDA P/ALTREF frame path ----
-    constexpr int kTfKeyMax = 8;
+    constexpr int kTfKeyMax = 16;
     auto runPframes = [&]() -> int {
         const int G = std::max(1, pfGop);
         const size_t frameBytes = ySize * 3 / 2;
@@ -1193,7 +1193,7 @@ int main(int argc, char **argv) {
                 // keyframe
                 // AV1GPU_PF_TF_KEY=k: temporal filter of the key frame over the next k frames (as SVT-AV1 does); the key frame
                 // codes the filtered picture
-                static const int tfKey = getenv("AV1GPU_PF_TF_KEY") ? std::min(kTfKeyMax, atoi(getenv("AV1GPU_PF_TF_KEY"))) : 8;
+                static const int tfKey = getenv("AV1GPU_PF_TF_KEY") ? std::min(kTfKeyMax, atoi(getenv("AV1GPU_PF_TF_KEY"))) : 12;
                 static const double tfKeyNoise = getenv("AV1GPU_PF_TF_KEY_NOISE") ? atof(getenv("AV1GPU_PF_TF_KEY_NOISE")) : 0.25;
                 bool keyFiltered = false;
                 if (tfKey > 0) {

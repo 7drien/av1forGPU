@@ -2235,7 +2235,7 @@ __global__ void packTiles(const uint8_t *out, size_t capPerTile, const int *size
 // as in libaom: exp(-(5 * window error + block error) / 120 / decay), the window error being the mean squared
 // difference over the 5x5 window of the pixel (inside the block), decay = (0.5 + ln(2 sigma + 5)) * q decay * strength
 // with sigma the estimated noise of the centre frame and the q decay from the inter-frame quantizer.
-constexpr int kTfMax = 8, kTfRange = 6, kTfPad = 4, kTfWin = 16 + 2 * (kTfRange + kTfPad);
+constexpr int kTfMax = 16, kTfRange = 6, kTfPad = 4, kTfWin = 16 + 2 * (kTfRange + kTfPad);
 struct TfArgs {
     const uint8_t *center[3];
     const uint8_t *nb[kTfMax][3];

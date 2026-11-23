@@ -580,4 +580,6 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   coder (`--pf-gpu-entropy`) copies it in 32-bit words, so the last skip_mode CDF entry was left uninitialized in
   shared memory and some streams did not decode (found by the P-frame suite once the filters were on by default).
   The inter CDFs are padded and a static_assert guards the size. The default path (host range coder) was unaffected.
+- Filter lengths (the analyzer now takes up to 16 neighbours; `--pf-tf-frames` up to 8): ALTREF +-6 frames -0.17% on
+  the filtered clips (kept +-4: slower), key frames over 12 frames -0.24% (video_3 -0.73%): now 12.
 
