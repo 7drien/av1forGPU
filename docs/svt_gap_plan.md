@@ -411,3 +411,25 @@ GPU time: evaluation 48-55%, motion search 25%, key-frame encoder 20-25%, filter
 - Five clips: video_1 +8.5%, video_2 +32.4%, video_3 +61.3%, video_4 -16.5%, video_5 -4.7%; mean +18.2% → +16.2%.
   Same speed.
 
+### Defaults rechecked on five clips: lambda 0.5 and switchable filters
+
+BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3), from the defaults above (+16.2%):
+
+| Change | mean | video_1 | video_2 | video_3 | video_4 | video_5 | fps v2 / v3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| none | +16.2% | +8.5% | +32.4% | +61.3% | -16.5% | -4.7% | 20.5 / 7.8 |
+| `--pf-tx-types-fast` | +16.5% | +8.8% | +32.8% | +61.5% | -16.4% | -4.2% | 20.9 / 8.1 |
+| `--pf-refine-passes 3` | +18.1% | +9.9% | +35.3% | +63.8% | -14.1% | -4.4% | 21.5 / 8.5 |
+| `--pf-fast` | +17.4% | +10.1% | +33.6% | +62.8% | -15.8% | -3.9% | 22.2 / 8.6 |
+| `--pf-lambda 0.6` | +15.2% | +8.3% | +31.2% | +58.7% | -17.6% | -4.4% | 20.4 / 7.7 |
+| `--pf-lambda 0.5` | +14.6% | +8.2% | +30.4% | +56.5% | -18.4% | -3.7% | 19.1 / 7.7 |
+| `--pf-switchable` | +14.8% | +8.6% | +31.4% | +58.2% | -17.1% | -7.1% | 18.5 / 7.2 |
+| lambda 0.5 + switchable | **+13.1%** | +8.3% | +29.4% | +53.0% | -18.9% | -6.5% | 18.6 / 7.1 |
+| ... + split pruning | +13.4% | +8.3% | +30.2% | +53.1% | -18.8% | -6.0% | 19.1 / 7.3 |
+
+- New defaults: lambda multiplier 0.5 (was 0.7; with the motion-dependent mode cost a lower lambda now helps every clip
+  but video_5) and switchable interpolation filters (`--pf-no-switchable` turns them off). Mean +16.2% → +13.1%, about
+  8% slower.
+- Split pruning (moving content: no split-transform search when the whole-block transform quantizes to nothing,
+  `AV1GPU_PF_SPLITPRUNE=1`) is implemented but off: +0.3 points for 2 to 3% speed.
+

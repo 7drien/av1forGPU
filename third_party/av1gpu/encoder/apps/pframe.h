@@ -42,7 +42,7 @@ struct BlockInfo {
 
 struct Settings {
     int qindex = 100;
-    float lambdaMul = 0.7f;
+    float lambdaMul = 0.5f;
     int searchRange = 192;   // full-pel coarse search radius (quarter-resolution search, at most 192)
     float rnd = 0.40f, zbin = 0.70f;
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
@@ -50,10 +50,11 @@ struct Settings {
     bool rectPartitions = true;  // search HORZ / VERT partitions of 16x16 .. 64x64 nodes         // search four half-size luma transforms per coded block (TX_MODE_SELECT)
     int txTypes = 3;             // inter transform types: 0 DCT_DCT only, 1 IDTX / DCT_DCT (reduced_tx_set),
                                  // 2 the full inter sets (reduced_tx_set = 0) with a 7-type search, 3 every type
-    bool switchableFilter = false;  // per-block interpolation filter (is_filter_switchable, --pf-switchable)
+    bool switchableFilter = true;   // per-block interpolation filter (is_filter_switchable; --pf-no-switchable)
     int splitTypes = 0;          // split luma transforms: 0 same type search, 1 seven types, 2 DCT_DCT only (--pf-fast)
     float pruneMargin = 2.f;     // rectangular search skipped unless the square's coded cost < margin * skip cost
     bool pruneRect = true;       // skip HORZ / VERT / 4:1 searches of nodes whose square evaluation chose skip
+    bool splitPrune = false;     // no split-transform search for blocks whose whole transform is all zero
     float modeBits = 2.f;        // bits charged per block for its mode info besides the vectors (evaluation)
     float squarePrune = 0.f;     // > 0: skip the square children of nodes that clearly prefer skip (margin as pruneMargin);
                                  // the app enables it (1) for moving content only (static content gains from children)

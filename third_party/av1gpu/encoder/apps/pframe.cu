@@ -654,6 +654,7 @@ struct EvalArgs {
     float lambda, rnd, zbin;
     float mvWeight;
     float modeBase;      // bits charged per block for its mode info besides the vectors
+    int splitPrune;      // split-external: skip the split transforms of blocks whose whole transform is all zero
     int rdoq;
     // luma transform types per 4x4 unit (stride aw / 4) of the whole-block transform and of the depth 1 / 2 splits;
     // null: DCT_DCT only
@@ -1167,6 +1168,11 @@ __global__ void __launch_bounds__(128) evalSplit(EvalArgs a, int dsel) {
     const int x0 = (b % a.cols) * BW, y0 = (b / a.cols) * BH;
     const Cand &c = *a.candidate(b, x0, y0);
     if (x0 >= f.w || y0 >= f.h || c.pruned) return;
+    // split pruning (moving content): no split transform when the whole-block transform quantizes to nothing
+    if (a.splitPrune && !c.nzWhole) {
+        if (!lane) { a.subD[size_t(b) * NSUB + k] = kInf; a.subR[size_t(b) * NSUB + k] = 0.f; a.subNz[size_t(b) * NSUB + k] = 0; a.subType[size_t(b) * NSUB + k] = 0; }
+        return;
+    }
     if (dsel == 2) {
         float d1 = 0.f, r1 = 0.f;
         for (int j = 0; j < 4; j++) { d1 += a.subD[size_t(b) * NSUB + j]; r1 += a.subR[size_t(b) * NSUB + j]; }
@@ -2873,6 +2879,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
     ea.modeBase = getenv("AV1GPU_PF_MODEBITS") ? (float)atof(getenv("AV1GPU_PF_MODEBITS")) : st.modeBits;
+    ea.splitPrune = getenv("AV1GPU_PF_SPLITPRUNE") ? atoi(getenv("AV1GPU_PF_SPLITPRUNE")) : st.splitPrune;
     ea.rdoq = st.rdoq;
     ea.d2Margin = getenv("AV1GPU_PF_D2MARGIN") ? (float)atof(getenv("AV1GPU_PF_D2MARGIN")) : 1.0f;
     static const bool splitExternal = !getenv("AV1GPU_PF_INKERNEL") ;

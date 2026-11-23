@@ -874,6 +874,7 @@ int main(int argc, char **argv) {
             if (pfAdaptive) st.pruneMargin = (float)adaptiveMargin(gopMotion);
             // square-children pruning: moving content only (static content refines detail in small blocks over frames)
             st.squarePrune = pfSquarePrune >= 0.f ? pfSquarePrune : pfAdaptive && gopMotion >= 0.6 ? 1.f : 0.f;
+            // st.splitPrune (moving content, whole transform all zero): +0.3 points for 2-3% speed, left off
             // per-block mode cost of the evaluation: moving content pays more side information per block (larger
             // values there stop splits that win the estimate but lose in BD-rate); 2 bits for static content
             if (pfAdaptive) {

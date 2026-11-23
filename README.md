@@ -89,6 +89,7 @@ Options:
 - `--bitrate KBPS` enables rate control: one base quantizer per keyframe or mini-GOP period, with a buffer of `--rc-buffer` seconds (default 2).
 - `--persistent-cdf` carries adapted probabilities between frames through each reference slot.
 - `--pf-tf-frames K` enables a GPU motion-compensated temporal filter of ALTREF sources over ±K frames, with overlay frames for display. Off by default: no gain on the sample clip.
+- Switchable interpolation filters are on by default (`--pf-no-switchable`); the lambda multiplier defaults to 0.5.
 - `--pf-rdoq` enables greedy rate-distortion optimized quantization. Off by default: no gain on the sample clip.
 - `--pf-no-mode-refine` disables the final-partition motion refinement that tests the decoder's spatial and temporal vectors.
 - `--pf-no-filters` turns off in-loop filtering. `--pf-no-tx-split` and `--pf-no-rect` turn off transform split and rectangular partitions.
