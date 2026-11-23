@@ -1177,6 +1177,11 @@ int main(int argc, char **argv) {
                     keyOffset = pfAdaptive && last ? (int)std::lround(adaptive(motionOf(nullptr, 0, last), pfQoffset + keyStill, pfQoffset))
                                                    : pfQoffset;
                 }
+                // the key-frame offset grows with the inter quantizer (low rates invest relatively more in key frames,
+                // as libaom / SVT do): offset x (q / 165)^keySlope (AV1GPU_PF_KEYSLOPE)
+                static const double keySlope = getenv("AV1GPU_PF_KEYSLOPE") ? atof(getenv("AV1GPU_PF_KEYSLOPE")) : 1.0;
+                if (keySlope != 0.0)
+                    keyOffset = (int)std::lround(keyOffset * std::pow(pfSettings.qindex / 165.0, keySlope));
                 const bool restoreQ = cutNow || keyOffset != pfQoffset;
                 GpEncoder &ke = cutNow && haveCut ? cutEncoder : encoder;
                 if (restoreQ && ke.setQindex(std::max(1, std::min(255, pfSettings.qindex - keyOffset)), err)) {

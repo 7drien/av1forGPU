@@ -533,3 +533,12 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
 7 → +10.0%, fps video_2 19.2 → 20.5, video_3 6.9 → 7.4, video_4 6.1 → 6.5, video_5 19.1 → 20.4 (+4 to 7%). About 0.1
 BD point per 1% of speed, the best ratio measured; a candidate for a faster preset.
 
+### Key-frame offset grows with the quantizer
+
+- Our gap to SVT is largest at low rates (video_3: 2.0x the rate at 44.0 dB, 1.25x at 45.9 dB; video_2 1.36x → 1.18x),
+  and SVT's key frame takes a growing share of its stream as the rate drops (video_3 7.7% → 25%, video_5 13% → 36%)
+  while ours stayed near 11% on video_3. The key-frame offset is now scaled by q / 165 (q: the inter quantizer;
+  `AV1GPU_PF_KEYSLOPE` = exponent, 1 by default; 2 → mean +9.7%).
+- Five clips: video_1 +6.7% → +5.1%, video_2 +22.8% → +22.7%, video_3 +47.8% → +46.8%, video_4 -21.3% → -22.2%,
+  video_5 -9.0% → -10.4%; mean +9.4% → +8.4%. (Inter quantizers unchanged, so the curves cover the same range.)
+
