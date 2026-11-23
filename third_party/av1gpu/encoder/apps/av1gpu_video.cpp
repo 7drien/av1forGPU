@@ -1179,7 +1179,7 @@ int main(int argc, char **argv) {
                 }
                 // the key-frame offset grows with the inter quantizer (low rates invest relatively more in key frames,
                 // as libaom / SVT do): offset x (q / 165)^keySlope (AV1GPU_PF_KEYSLOPE)
-                static const double keySlope = getenv("AV1GPU_PF_KEYSLOPE") ? atof(getenv("AV1GPU_PF_KEYSLOPE")) : 1.0;
+                static const double keySlope = getenv("AV1GPU_PF_KEYSLOPE") ? atof(getenv("AV1GPU_PF_KEYSLOPE")) : 0.0;
                 if (keySlope != 0.0)
                     keyOffset = (int)std::lround(keyOffset * std::pow(pfSettings.qindex / 165.0, keySlope));
                 const bool restoreQ = cutNow || keyOffset != pfQoffset;
@@ -1328,6 +1328,9 @@ int main(int argc, char **argv) {
             // the length below which the boost scales with n / length; 0 off)
             static const double shortLen = getenv("AV1GPU_PF_SHORTGOP") ? atof(getenv("AV1GPU_PF_SHORTGOP")) : 8.0;
             if (shortLen > 0 && double(n) < shortLen) gopBoost *= double(n) / shortLen;
+            // the boost grows with the quantizer like the key-frame offset (AV1GPU_PF_BOOSTSLOPE exponent)
+            static const double boostSlope = getenv("AV1GPU_PF_BOOSTSLOPE") ? atof(getenv("AV1GPU_PF_BOOSTSLOPE")) : 0.0;
+            if (boostSlope != 0.0) gopBoost *= std::pow(pfSettings.qindex / 165.0, boostSlope);
             int depthMax = 0;
             while ((size_t(1) << depthMax) < n) ++depthMax;
             auto qAt = [&](int depth) {

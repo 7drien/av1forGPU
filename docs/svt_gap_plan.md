@@ -539,6 +539,13 @@ BD point per 1% of speed, the best ratio measured; a candidate for a faster pres
   and SVT's key frame takes a growing share of its stream as the rate drops (video_3 7.7% → 25%, video_5 13% → 36%)
   while ours stayed near 11% on video_3. The key-frame offset is now scaled by q / 165 (q: the inter quantizer;
   `AV1GPU_PF_KEYSLOPE` = exponent, 1 by default; 2 → mean +9.7%).
-- Five clips: video_1 +6.7% → +5.1%, video_2 +22.8% → +22.7%, video_3 +47.8% → +46.8%, video_4 -21.3% → -22.2%,
-  video_5 -9.0% → -10.4%; mean +9.4% → +8.4%. (Inter quantizers unchanged, so the curves cover the same range.)
+- Against SVT the five-clip mean moved +9.4% → +8.4%, but compared directly with the previous configuration
+  (`tests/bd_tags.py cut2 kslope1`) the change is neutral (+0.04%: video_4 +1.2%, the others -0.5 to 0%): moving bits
+  into the key frame shifted our curve along SVT's, and the 4-point BD against SVT reported the shift as a gain.
+  Reverted to 0 (knob kept). An ALTREF-boost exponent (`AV1GPU_PF_BOOSTSLOPE`) looked even better against SVT (slope 2:
+  +2.7%) but its curves are not monotonic (the boost drives ALTREF quantizers to 1 at high q) and slope 1 / 0.5 are
+  +0.6% / -0.2% against the previous configuration directly; off.
+- Every step adopted today, compared directly with its predecessor (mean of five clips): skip_mode -0.82%, per-SB CDEF
+  -0.65%, rounding 0.46 -0.17%, short-GOP boost -0.86%, cut detection + cut offset 30 -0.33%. Allocation changes are
+  now validated this way.
 
