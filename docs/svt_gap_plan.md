@@ -482,3 +482,16 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
 - Five clips: video_1 +8.4%, video_2 +28.4%, video_3 +50.1%, video_4 -19.8%, video_5 -7.3%; mean +13.1% → +12.0%
   (libaom: +51.4%). Same speed.
 
+### Per-superblock CDEF presets (T8)
+
+- The CDEF search already renders the frame at each of the 9 candidate strengths. It now also sums each coded 64x64
+  superblock's luma and chroma SSE per candidate, picks up to 8 presets (luma candidate, chroma candidate) greedily on
+  one CTA (exact integer sums), keeps 1, 2, 4 or 8 by SSE + lambda x cdef_bits per coded superblock, gives every
+  superblock its best preset, and gathers each superblock from its candidate (CDEF reads only the deblocked frame, so
+  this equals filtering it with its preset). The header codes cdef_bits and the presets; the tile coder codes
+  cdef_idx at the first non-skip block of each superblock (read_cdef), on both GPU and CPU paths.
+- Five clips: video_1 +8.4% → +6.7%, video_2 +28.4% → +28.3%, video_3 +50.1% → +48.7%, video_4 -19.8% → -20.1%,
+  video_5 -7.3% → -7.7%; mean +12.0% → +11.2%. Same speed. `--pf-no-cdef-sb` restores one strength per frame.
+- Decision constants rechecked (video_1/2/3/5): skip flag 0.3/2.5 or 1/1 bits instead of 0.5/1.5, partition split
+  bits x2 or x0.5: all within 0.3 points (left unchanged).
+

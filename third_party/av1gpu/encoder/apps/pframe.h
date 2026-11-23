@@ -72,6 +72,10 @@ struct FilterParams {
     int damping = 3;             // CdefDamping (3..6)
     int yPri = 0, ySec = 0, uvPri = 0, uvSec = 0;   // secondary strengths 0, 1, 2, 4
     bool lrAllowed = false;      // input: try luma Wiener loop restoration
+    bool cdefPerSb = false;      // input: choose up to 8 presets and one per 64x64 superblock (cdef_bits > 0)
+    int cdefBits = 0;            // output: cdef_bits; presets below (index 0 = yPri / ySec / uvPri / uvSec)
+    int cdefPreset[8][4] = {};   // y pri, y sec, uv pri, uv sec
+    std::vector<int8_t> cdefIdx; // output: per 64x64 superblock (raster), -1 without coded blocks
     bool lrLuma = false;         // output: some luma unit uses it (FrameRestorationType[0] = RESTORE_WIENER)
 };
 
@@ -87,6 +91,8 @@ struct EntropyIn {
     const Mv *motionField = nullptr;     // HostEntropy's copy of MotionFieldMvs[8][MiRows / 2][MiCols / 2]
     bool switchableFilter = false;
     bool skipMode = false;      // skip_mode_present (the app sets it only when SkipModeFrame = LAST, ALTREF)
+    int cdefBits = 0;           // cdef_bits (per-superblock CDEF presets)
+    const int8_t *cdefIdx = nullptr;   // host copy of the per-64x64 presets (CPU tile coder; the GPU uses its own)
     int qindex = 100;
     int primarySlot = -1;       // slot whose saved CDFs initialize the frame, or -1 for the defaults
     int saveSlot = -1;          // slot that receives the frame-end CDFs, or -1

@@ -36,6 +36,7 @@ constexpr int kCdefCount = sizeof kCdefCandidates / sizeof kCdefCandidates[0];
 
 struct FilterSelection {
     int lf[3], cdef[3], lrLuma;
+    int cdefBits, cdefPreset[8][2];   // per-superblock CDEF: presets as (luma, chroma) candidate indices
 };
 
 __constant__ int16_t c_filter[6][16][8];
@@ -673,6 +674,7 @@ struct EvalArgs {
     float lambda, rnd, zbin;
     float mvWeight;
     float modeBase;      // bits charged per block for its mode info besides the vectors
+    float skipBits1, skipBits0;   // skip flag cost of the skip / coded options
     int splitPrune;      // split-external: skip the split transforms of blocks whose whole transform is all zero
     int rdoq;
     // luma transform types per 4x4 unit (stride aw / 4) of the whole-block transform and of the depth 1 / 2 splits;
@@ -1145,7 +1147,7 @@ __global__ void __launch_bounds__(32 * EvalCfg<BW, BH>::warps) evaluate(EvalArgs
     }
     if (!lane) {
         const float modeBits = a.modeBase + c.mvBits * a.mvWeight;
-        const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
+        const float skipFlag1 = a.skipBits1, skipFlag0 = a.skipBits0;
         c.costSkip = dSkip + a.lambda * (modeBits + skipFlag1);
         if (depth) {
             dCoded += splitD[depth] - lumaD;
@@ -1369,7 +1371,7 @@ __global__ void __launch_bounds__(128) evalFinal(EvalArgs a) {
     }
     if (!lane) {
         const float modeBits = a.modeBase + c.mvBits * a.mvWeight;
-        const float skipFlag1 = 0.5f, skipFlag0 = 1.5f;
+        const float skipFlag1 = a.skipBits1, skipFlag0 = a.skipBits0;
         c.costSkip = c.dSkipAll + a.lambda * (modeBits + skipFlag1);
         float dCoded = lumaD + dC, bits = lumaBits + bC;
         bool nz = c.nzWhole || nzC;
@@ -2039,6 +2041,7 @@ __global__ void tilePhaseBlocks(TileJob j, int phase, int write) {
     t.phase = phase;
     t.recs = write ? j.recs + j.sbOffset[e] : nullptr;
     t.recCap = write ? blockRecCap(j.entries[e]) : 0xffffffffu;
+    t.sbList = j.entries + size_t(sb) * 64;
     t.runEntry(j.entries[e]);
     if (t.st.error) atomicMax(j.error, t.st.error);
     if (phase == 3) j.sbCount[e] = t.nrec;
@@ -2423,6 +2426,7 @@ struct EntropySlot {
     uint32_t *tileCount = nullptr;
     pft2::SymRec *recs = nullptr;    // records-only mode output
     pf::Mv *mf = nullptr;            // motion field of the frame (use_ref_frame_mvs)
+    int8_t *cdef = nullptr;          // per-superblock CDEF presets of the frame
     bool recordsOnly = false;
     cudaEvent_t staged = nullptr, done = nullptr;
     cudaEvent_t profile[5] = {};
@@ -2468,6 +2472,9 @@ struct State {
     uint8_t *filterCandidates = nullptr, *cdefOut = nullptr;
     FilterSelection *filterDev = nullptr, *filterHost = nullptr;
     Mv *mfDev = nullptr, *mfHost = nullptr;
+    int8_t *cdefIdxDev = nullptr;               // per-superblock CDEF presets of the last filtered frame
+    unsigned long long *cdefSbErr = nullptr;    // [candidate][superblock][luma, chroma] SSE
+    unsigned long long *cdefCur = nullptr;      // preset choice scratch, one per superblock
     bool useTmvp = false;
     BlockInfo *motionGridHost = nullptr;
     cudaStream_t compute = nullptr;
@@ -2590,12 +2597,13 @@ Analyzer::~Analyzer() {
     cudaFree(s->mfDev);
     cudaFree(s->lrCoef); cudaFree(s->lrQ); cudaFree(s->lrSse); cudaFree(s->lrOut);
     cudaFree(s->sse);
+    cudaFree(s->cdefSbErr); cudaFree(s->cdefCur);
     cudaFree(s->hphase);
     for (void *p : {(void *)s->slots, (void *)s->tileWork, (void *)s->staging, (void *)s->defaultInter, (void *)s->mi,
                     (void *)s->tileStats, (void *)s->ecBuf})
         cudaFree(p);
     for (auto &es : s->eslot) {
-        cudaFree(es.grid); cudaFree(es.levels); cudaFree(es.tileOut); cudaFree(es.packed); cudaFree(es.sizes); cudaFree(es.error); cudaFree(es.tileCount); cudaFree(es.recs); cudaFree(es.mf);
+        cudaFree(es.grid); cudaFree(es.levels); cudaFree(es.tileOut); cudaFree(es.packed); cudaFree(es.sizes); cudaFree(es.error); cudaFree(es.tileCount); cudaFree(es.recs); cudaFree(es.mf); cudaFree(es.cdef);
         if (es.staged) cudaEventDestroy(es.staged);
         if (es.done) cudaEventDestroy(es.done);
         if (es.fetch) cudaStreamDestroy(es.fetch);
@@ -2703,6 +2711,8 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->lrCoef, sizeof(float) * 6 * nu); alloc(&s->lrQ, 6 * nu);
         alloc(&s->lrSse, sizeof(unsigned long long) * 2 * nu); alloc(&s->lrOut, size_t(w) * h);
         alloc(&s->sse, sizeof(unsigned long long) * 3 * kCdefCount);
+        alloc(&s->cdefSbErr, sizeof(unsigned long long) * 2 * kCdefCount * size_t((w + 63) / 64) * ((h + 63) / 64));
+        alloc(&s->cdefCur, sizeof(unsigned long long) * size_t((w + 63) / 64) * ((h + 63) / 64));
         alloc(&s->hphase, sizeof(int16_t) * 4 * size_t(w) * h);
         for (auto *&p : s->phases) alloc(&p, 16 * size_t(w) * h);
     }
@@ -2759,6 +2769,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         for (auto &es : s->eslot) {
             alloc(&es.grid, gridCount() * sizeof(BlockInfo));
             alloc(&es.mf, sizeof(pf::Mv) * 8 * size_t(miRows / 2) * (miCols / 2));
+            alloc(&es.cdef, size_t((w + 63) / 64) * ((h + 63) / 64));
             alloc(&es.levels, levelCount() * sizeof(int16_t));
             alloc(&es.tileOut, s->ecCap * 2);
             alloc(&es.packed, s->ecCap * 2);
@@ -2916,6 +2927,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     ea.zbin = getenv("AV1GPU_PF_ZBIN") ? (float)atof(getenv("AV1GPU_PF_ZBIN")) : st.zbin;
     ea.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
     ea.modeBase = getenv("AV1GPU_PF_MODEBITS") ? (float)atof(getenv("AV1GPU_PF_MODEBITS")) : st.modeBits;
+    ea.skipBits1 = getenv("AV1GPU_PF_SKIP1") ? (float)atof(getenv("AV1GPU_PF_SKIP1")) : 0.5f;
+    ea.skipBits0 = getenv("AV1GPU_PF_SKIP0") ? (float)atof(getenv("AV1GPU_PF_SKIP0")) : 1.5f;
     ea.splitPrune = getenv("AV1GPU_PF_SPLITPRUNE") ? atoi(getenv("AV1GPU_PF_SPLITPRUNE")) : st.splitPrune;
     ea.rdoq = st.rdoq;
     ea.d2Margin = getenv("AV1GPU_PF_D2MARGIN") ? (float)atof(getenv("AV1GPU_PF_D2MARGIN")) : 1.0f;
@@ -3043,7 +3056,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
     da.rect = st.rectPartitions;
     da.w = w; da.h = h; da.gcols = s->gcols; da.grows = s->grows; da.grid = s->grid; da.lambda = lambda;
     // approximate partition symbol costs (bits)
-    const float part[kSizes][2] = {{1.0f, 0.f}, {1.0f, 2.5f}, {1.0f, 2.5f}, {1.0f, 2.0f}};
+    static const float splitScale = getenv("AV1GPU_PF_SPLITBITS") ? (float)atof(getenv("AV1GPU_PF_SPLITBITS")) : 1.f;
+    const float part[kSizes][2] = {{1.0f, 0.f}, {1.0f, 2.5f * splitScale}, {1.0f, 2.5f * splitScale}, {1.0f, 2.0f * splitScale}};
     memcpy(da.partBits, part, sizeof part);
     for (int k = 0; k < kSizes; k++)
         decideLevel<<<(s->cols[k] * s->rows[k] + 127) / 128, 128, 0, stream>>>(da, k, s->rows[k]);
@@ -3212,6 +3226,9 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
         const size_t n = 8 * size_t(miRows / 2) * (miCols / 2);
         e = cudaMemcpyAsync(es.mf, s->mfDev, n * sizeof(Mv), cudaMemcpyDeviceToDevice, s->compute);
     }
+    if (e == cudaSuccess && in.cdefBits && s->cdefIdxDev)
+        e = cudaMemcpyAsync(es.cdef, s->cdefIdxDev, size_t((w + 63) / 64) * ((h + 63) / 64), cudaMemcpyDeviceToDevice,
+                            s->compute);
     if (e == cudaSuccess) e = cudaEventRecord(es.staged, s->compute);
     if (e == cudaSuccess) e = cudaStreamWaitEvent(s->entStream, es.staged, 0);
     j.fs.refName[0] = in.refName[0];
@@ -3222,6 +3239,8 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.switchable = in.switchableFilter;
     j.fs.skipMode = in.skipMode;
+    j.fs.cdefBits = in.cdefBits;
+    j.fs.cdefIdx = es.cdef;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
     for (int k = 0; k < 8; k++) j.fs.signBias[k] = in.signBias[k];
     j.fs.useTmvp = in.useTmvp && s->useTmvp;
@@ -3483,6 +3502,8 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.reducedTxSet = in.reducedTxSet;
     fs.switchable = in.switchableFilter;
     fs.skipMode = in.skipMode;
+    fs.cdefBits = in.cdefBits;
+    fs.cdefIdx = in.cdefIdx;
     fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
     for (int k = 0; k < 8; k++) fs.signBias[k] = in.signBias[k];
     fs.useTmvp = in.useTmvp && in.motionField;
@@ -3531,6 +3552,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
                 t.fs = &fs;
                 t.phase = phase;
                 t.recs = write ? s->recs.data() + offset[e] : nullptr;
+                t.sbList = s->entries.data() + size_t(sb) * 64;
                 t.runEntry(s->entries[e]);
                 error = t.st.error;
                 if (phase == 2) {
@@ -3833,6 +3855,115 @@ __global__ void selectFilter(const unsigned long long *sse, int count, bool zero
     if (!Cdef && zeroLevel && indices[0] == 0) indices[1] = indices[2] = 0;
 }
 
+// Per-superblock CDEF: SSE of every candidate strength on each coded 64x64 superblock, luma and chroma (both planes).
+__global__ void cdefSbSse(const uint8_t *s0, const uint8_t *s1, const uint8_t *s2, int p0, int p1, int p2,
+                          const uint8_t *cands, size_t frame, int w, int h, int sbCols, int nSb, const int8_t *cdefIdx,
+                          unsigned long long *out) {
+    __shared__ unsigned long long red[2][8];
+    const int sb = blockIdx.x, k = blockIdx.y, t = threadIdx.x;
+    unsigned long long *o = out + (size_t(k) * nSb + sb) * 2;
+    if (cdefIdx[sb] < 0) { if (!t) o[0] = o[1] = 0; return; }
+    const int sx = (sb % sbCols) * 64, sy = (sb / sbCols) * 64, cw = w / 2, ch = h / 2;
+    const uint8_t *y = cands + k * frame, *u = y + size_t(w) * h, *v = u + size_t(cw) * ch;
+    unsigned long long ly = 0, lc = 0;
+    for (int i = t; i < 64 * 64; i += 256) {
+        const int x = sx + (i & 63), yy = sy + (i >> 6);
+        if (x < w && yy < h) { const int d = (int)s0[yy * p0 + x] - (int)y[yy * w + x]; ly += d * d; }
+    }
+    for (int i = t; i < 32 * 32; i += 256) {
+        const int x = sx / 2 + (i & 31), yy = sy / 2 + (i >> 5);
+        if (x < cw && yy < ch) {
+            const int du = (int)s1[yy * p1 + x] - (int)u[yy * cw + x], dv = (int)s2[yy * p2 + x] - (int)v[yy * cw + x];
+            lc += du * du + dv * dv;
+        }
+    }
+    for (int off = 16; off; off >>= 1) { ly += __shfl_xor_sync(0xffffffffu, ly, off); lc += __shfl_xor_sync(0xffffffffu, lc, off); }
+    if ((t & 31) == 0) { red[0][t >> 5] = ly; red[1][t >> 5] = lc; }
+    __syncthreads();
+    if (!t) {
+        unsigned long long a = 0, b = 0;
+        for (int i = 0; i < 8; i++) { a += red[0][i]; b += red[1][i]; }
+        o[0] = a; o[1] = b;
+    }
+}
+// Greedy choice of up to 8 presets (luma candidate, chroma candidate) over the coded superblocks: each step adds the
+// pair that lowers the summed best-preset SSE most; 1, 2, 4 or 8 presets are kept by SSE + lambda * index bits; then
+// each coded superblock takes its best preset. One CTA; exact integer sums (deterministic).
+__global__ void __launch_bounds__(256) cdefChoose(const unsigned long long *err, int nSb, int K, int8_t *cdefIdx,
+                                                 float lambda, unsigned long long *cur, FilterSelection *sel) {
+    __shared__ unsigned long long bestTot[256];
+    __shared__ int bestPair[256];
+    __shared__ int chosen[8];
+    __shared__ unsigned long long totalAfter[9];
+    __shared__ int nCoded;
+    const int t = threadIdx.x, P = K * K;
+    auto e = [&](int pair, int sb) { return err[(size_t(pair / K) * nSb + sb) * 2] + err[(size_t(pair % K) * nSb + sb) * 2 + 1]; };
+    if (!t) nCoded = 0;
+    __syncthreads();
+    int myCoded = 0;
+    for (int sb = t; sb < nSb; sb += 256) { cur[sb] = ~0ull; myCoded += cdefIdx[sb] >= 0; }
+    atomicAdd(&nCoded, myCoded);
+    __syncthreads();
+    for (int step = 0; step < 8; step++) {
+        unsigned long long tot = ~0ull;
+        int pair = 0x7fffffff;
+        for (int p = t; p < P; p += 256) {
+            unsigned long long s = 0;
+            for (int sb = 0; sb < nSb; sb++)
+                if (cdefIdx[sb] >= 0) { const unsigned long long v = e(p, sb); s += v < cur[sb] ? v : cur[sb]; }
+            if (s < tot || (s == tot && p < pair)) { tot = s; pair = p; }
+        }
+        bestTot[t] = tot; bestPair[t] = pair;
+        __syncthreads();
+        if (!t) {
+            for (int i = 1; i < 256; i++)
+                if (bestTot[i] < bestTot[0] || (bestTot[i] == bestTot[0] && bestPair[i] < bestPair[0])) {
+                    bestTot[0] = bestTot[i]; bestPair[0] = bestPair[i];
+                }
+            chosen[step] = bestPair[0];
+            totalAfter[step + 1] = bestTot[0];
+        }
+        __syncthreads();
+        for (int sb = t; sb < nSb; sb += 256)
+            if (cdefIdx[sb] >= 0) { const unsigned long long v = e(chosen[step], sb); if (v < cur[sb]) cur[sb] = v; }
+        __syncthreads();
+    }
+    __shared__ int nKeep;
+    if (!t) {
+        int best = 1;
+        double bestCost = 1e300;
+        for (int b = 0; b <= 3; b++) {
+            const int n = 1 << b;
+            const double c = (double)totalAfter[n] + (double)lambda * b * nCoded;
+            if (c < bestCost) { bestCost = c; best = n; }
+        }
+        nKeep = best;
+        sel->cdefBits = best == 1 ? 0 : best == 2 ? 1 : best == 4 ? 2 : 3;
+        for (int i = 0; i < 8; i++) { sel->cdefPreset[i][0] = chosen[i] / K; sel->cdefPreset[i][1] = chosen[i] % K; }
+    }
+    __syncthreads();
+    for (int sb = t; sb < nSb; sb += 256) {
+        if (cdefIdx[sb] < 0) continue;
+        int bi = 0;
+        unsigned long long bv = e(chosen[0], sb);
+        for (int i = 1; i < nKeep; i++) { const unsigned long long v = e(chosen[i], sb); if (v < bv) { bv = v; bi = i; } }
+        cdefIdx[sb] = (int8_t)bi;
+    }
+}
+// Per-superblock gather of the chosen candidate (CDEF reads only the deblocked frame, so this equals filtering each
+// superblock with its preset); superblocks without coded blocks keep candidate 0 (no filtering).
+__global__ void gatherCdef(const uint8_t *cands, size_t frame, int w, int h, int sbCols, const int8_t *cdefIdx,
+                           const FilterSelection *sel, uint8_t *recon, uint8_t *lumaOut) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= frame) return;
+    const size_t ysz = size_t(w) * h, csz = size_t(w / 2) * (h / 2);
+    int sb, p;
+    if (i < ysz) { p = 0; const int y = int(i / w), x = int(i % w); sb = (y >> 6) * sbCols + (x >> 6); }
+    else { p = i < ysz + csz ? 1 : 2; const size_t j = i - ysz - (p - 1) * csz; const int y = int(j / (w / 2)), x = int(j % (w / 2)); sb = (y >> 5) * sbCols + (x >> 5); }
+    const int idx = cdefIdx[sb];
+    const int cand = idx < 0 ? 0 : sel->cdefPreset[idx][p > 0];
+    (p == 0 ? lumaOut : recon)[i] = cands[frame * cand + i];
+}
 template<bool Cdef>
 __global__ void gatherFilter(const uint32_t *candidates, size_t luma, size_t chroma, uint32_t *recon,
                              uint32_t *lumaOut, const FilterSelection *selection) {
@@ -3914,7 +4045,19 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
             e = (cudaError_t)av1g_gpu_cdef(&f, dst, pw, stream);
             if (e == cudaSuccess) e = sseOf(dst, k);
         }
-        if (e == cudaSuccess) {
+        if (e == cudaSuccess && out.cdefPerSb) {
+            const int nSb = f.sbCols * f.sbRows;
+            cdefSbSse<<<dim3(nSb, kCdefCount), 256, 0, stream>>>(src[0], src[1], src[2], pitch[0], pitch[1], pitch[2],
+                                                               s->filterCandidates, frame, w, h, f.sbCols, nSb, f.cdefIdx,
+                                                               s->cdefSbErr);
+            cdefChoose<<<1, 256, 0, stream>>>(s->cdefSbErr, nSb, kCdefCount, f.cdefIdx,
+                                             gp_lambda<8>(qindex, 0.7f), s->cdefCur, s->filterDev);
+            uint8_t *lumaOut = out.lrAllowed ? s->cdefOut : recon;
+            gatherCdef<<<unsigned((frame + 255) / 256), 256, 0, stream>>>(s->filterCandidates, frame, w, h, f.sbCols,
+                                                                          f.cdefIdx, s->filterDev, recon, lumaOut);
+            s->cdefIdxDev = f.cdefIdx;
+            e = cudaGetLastError();
+        } else if (e == cudaSuccess) {
             selectFilter<true><<<1, 1, 0, stream>>>(s->sse, kCdefCount, false, s->filterDev);
             auto *lumaOut = out.lrAllowed ? reinterpret_cast<uint32_t *>(s->cdefOut) : dstWords;
             gatherFilter<true><<<blocks, 256, 0, stream>>>(candidates, ysz / 4, csz / 4, dstWords, lumaOut, s->filterDev);
@@ -3947,6 +4090,10 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
     if (e == cudaSuccess && s->profile) e = cudaEventRecord(s->ev[9], stream);
     if (e == cudaSuccess)
         e = cudaMemcpyAsync(s->filterHost, s->filterDev, sizeof(FilterSelection), cudaMemcpyDeviceToHost, stream);
+    const bool perSb = cdefAllowed && out.cdefPerSb;
+    if (perSb) out.cdefIdx.resize(size_t(f.sbCols) * f.sbRows);
+    if (e == cudaSuccess && perSb)
+        e = cudaMemcpyAsync(out.cdefIdx.data(), f.cdefIdx, out.cdefIdx.size(), cudaMemcpyDeviceToHost, stream);
     if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
     if (e != cudaSuccess) {
         snprintf(err, errLen, "P-frame filters: %s", cudaGetErrorString(e));
@@ -3958,7 +4105,18 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
     out.lf[2] = levels[selection.lf[1]];
     out.lf[3] = levels[selection.lf[2]];
     out.sharpness = 0;
-    if (cdefAllowed) {
+    if (cdefAllowed && perSb) {
+        out.cdefBits = selection.cdefBits;
+        for (int i = 0; i < 8; i++) {
+            out.cdefPreset[i][0] = kCdefCandidates[selection.cdefPreset[i][0]].pri;
+            out.cdefPreset[i][1] = kCdefCandidates[selection.cdefPreset[i][0]].sec;
+            out.cdefPreset[i][2] = kCdefCandidates[selection.cdefPreset[i][1]].pri;
+            out.cdefPreset[i][3] = kCdefCandidates[selection.cdefPreset[i][1]].sec;
+        }
+        out.yPri = out.cdefPreset[0][0]; out.ySec = out.cdefPreset[0][1];
+        out.uvPri = out.cdefPreset[0][2]; out.uvSec = out.cdefPreset[0][3];
+    } else if (cdefAllowed) {
+        out.cdefBits = 0;
         out.yPri = kCdefCandidates[selection.cdef[0]].pri;
         out.ySec = kCdefCandidates[selection.cdef[0]].sec;
         out.uvPri = kCdefCandidates[selection.cdef[1]].pri;

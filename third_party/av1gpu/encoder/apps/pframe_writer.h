@@ -37,6 +37,8 @@ struct FrameParams {
     int lfSharpness = 0;
     bool cdef = false;   // sequence enable_cdef; one CDEF strength is coded
     int cdefDamping = 3, cdefY = 0, cdefYSec = 0, cdefUV = 0, cdefUVSec = 0;
+    int cdefBits = 0;              // cdef_bits; with cdefBits > 0 the presets below are coded (index 0 = the fields above)
+    int cdefPreset[8][4] = {};     // y pri, y sec, uv pri, uv sec
     bool showFrame = true;
     bool temporalDelimiter = true;
     int tileColsLog2 = 0, tileRowsLog2 = 0, contextTile = 0;
@@ -169,11 +171,15 @@ inline void header(av1g::BitWriter &b, const FrameParams &fp, int miCols, int mi
     b.bit(0);   // loop_filter_delta_enabled
     if (fp.cdef) {
         b.put(fp.cdefDamping - 3, 2);
-        b.put(0, 2);   // cdef_bits
-        b.put(fp.cdefY, 4);
-        b.put(fp.cdefYSec == 4 ? 3 : fp.cdefYSec, 2);
-        b.put(fp.cdefUV, 4);
-        b.put(fp.cdefUVSec == 4 ? 3 : fp.cdefUVSec, 2);
+        b.put(fp.cdefBits, 2);   // cdef_bits
+        for (int i = 0; i < (1 << fp.cdefBits); i++) {
+            const int *c = fp.cdefBits ? fp.cdefPreset[i] : nullptr;
+            const int yp = c ? c[0] : fp.cdefY, ys = c ? c[1] : fp.cdefYSec, up = c ? c[2] : fp.cdefUV, us = c ? c[3] : fp.cdefUVSec;
+            b.put(yp, 4);
+            b.put(ys == 4 ? 3 : ys, 2);
+            b.put(up, 4);
+            b.put(us == 4 ? 3 : us, 2);
+        }
     }
     // lr_params (enable_restoration = 1 in the sequence header)
     for (int p = 0; p < 3; ++p) b.put(fp.lrType[p], 2);

@@ -195,6 +195,7 @@ int main(int argc, char **argv) {
     uint64_t frameOrder = 0;            // display index of the inter frame being coded
     int slotHint[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     bool pfSkipMode = true;       // --pf-no-skip-mode
+    bool pfCdefSb = true;         // per-superblock CDEF presets (--pf-no-cdef-sb)
     float pfSquarePrune = -1.f;  // --pf-square-prune M: fixed square-children pruning margin (default: motion-adaptive)
     bool pfAdaptive = true;     // content-adaptive ALTREF boost and key-frame offset (--pf-no-adaptive)
     // --pf-adaptive: mini-GOP length 16 / 8 from this block-mean motion of the next eight frames
@@ -349,6 +350,8 @@ int main(int argc, char **argv) {
             pfAdaptive = false;
         } else if (!strcmp(argv[i], "--pf-no-tmvp")) {
             pfTmvp = false;
+        } else if (!strcmp(argv[i], "--pf-no-cdef-sb")) {
+            pfCdefSb = false;
         } else if (!strcmp(argv[i], "--pf-no-skip-mode")) {
             pfSkipMode = false;
         } else if (!strcmp(argv[i], "--pf-no-rect4")) {
@@ -674,6 +677,7 @@ int main(int argc, char **argv) {
             int buf = -1, slot0 = 0, outSlot = 8, showSlot = 0;
             std::vector<uint8_t> raw;
             std::vector<pf::Mv> mf;   // projected motion field (kept with the job for the CPU entropy path)
+            std::vector<int8_t> cdefIdx;   // per-superblock CDEF presets (CPU entropy path)
             pf::EntropyOut tiles;
             bool endTU = false, resetSlots = false;
             uint64_t pts = 0;
@@ -943,6 +947,7 @@ int main(int argc, char **argv) {
             const auto tf0 = std::chrono::steady_clock::now();
             pf::FilterParams flt;
             flt.lrAllowed = pfLr;
+            flt.cdefPerSb = pfCdefSb;
             if (pfFilters && pfAnalyzer.filter(src, pitches, spare, qindex, pfCdef, flt, perr, sizeof perr)) {
                 fprintf(stderr, "%s\n", perr);
                 return 1;
@@ -958,6 +963,11 @@ int main(int argc, char **argv) {
             fp.cdef = pfCdef;
             fp.cdefDamping = flt.damping;
             fp.cdefY = flt.yPri; fp.cdefYSec = flt.ySec; fp.cdefUV = flt.uvPri; fp.cdefUVSec = flt.uvSec;
+            fp.cdefBits = pfCdef ? flt.cdefBits : 0;
+            std::copy(&flt.cdefPreset[0][0], &flt.cdefPreset[0][0] + 32, &fp.cdefPreset[0][0]);
+            ein.cdefBits = fp.cdefBits;
+            job.cdefIdx = std::move(flt.cdefIdx);
+            ein.cdefIdx = job.cdefIdx.empty() ? nullptr : job.cdefIdx.data();
             fp.tileColsLog2 = pfTileCols;
             fp.tileRowsLog2 = pfTileRows;
             fp.contextTile = 0;

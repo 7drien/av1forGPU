@@ -136,6 +136,8 @@ struct FrameSyntax {
     int signBias[8];      // RefFrameSignBias by reference frame (order hints)
     int useTmvp;          // use_ref_frame_mvs: temporal candidates from the projected motion field
     int skipMode;         // skip_mode_present (SkipModeFrame[0..1] = LAST_FRAME, ALTREF_FRAME)
+    int cdefBits;         // cdef_bits: cdef_idx literal at the first non-skip block of each 64x64
+    const int8_t *cdefIdx;   // per 64x64 superblock (raster): its preset (-1 for superblocks without coded blocks)
     int width, height;    // FrameWidth, FrameHeight
     int miRows, miCols, aw, ah, gcols;
 };
@@ -202,6 +204,7 @@ struct TileCoder {
     int run;                 // open literal run length (see CoeffSinkT)
     uint32_t sbOrder, blockIndex, curOrder;
     BlockEntry *entries;     // phase 1: decode-order block list of the superblock (up to 64)
+    const BlockEntry *sbList;   // phase 3: the block list of the current block's superblock (cdef_idx placement)
     uint32_t nEntries;
     PartNode pending[4];
     int nPending;
@@ -978,6 +981,14 @@ struct TileCoder {
         }
         const int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
         sym(cdf->skip[skipCtx], skip, 2);
+        if (fs->cdefBits && !skip) {
+            // read_cdef: the superblock's cdef_idx at its first non-skip block in decode order
+            const int k = curOrder & 0xff;
+            bool first = true;
+            for (int i = 0; i < k && first; ++i)
+                if (!grid[(sbList[i].r >> 1) * fs->gcols + (sbList[i].c >> 1)].skip) first = false;
+            if (first) bits(fs->cdefIdx[curOrder >> 8], fs->cdefBits);
+        }
         const bool aboveIntra = availU && !above->isInter, leftIntra = availL && !left->isInter;
         int interCtx;
         if (availU && availL) interCtx = (leftIntra && aboveIntra) ? 3 : (leftIntra || aboveIntra);
