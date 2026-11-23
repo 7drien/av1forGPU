@@ -3142,6 +3142,12 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         // and only accepted blocks overwrite their reconstruction, levels and transform types.
         ea.trials = s->modeTrials;
         ea.mvWeight = 0.f;
+        // experiment (AV1GPU_PF_TRIALFAST bits): 1 DCT-only split transforms, 2 seven-type whole transforms,
+        // 4 no interpolation-filter search in the trials
+        static const int trialFast = getenv("AV1GPU_PF_TRIALFAST") ? atoi(getenv("AV1GPU_PF_TRIALFAST")) : 0;
+        if (trialFast & 1) ea.splitTypes = 2;
+        if (trialFast & 2) ea.txExhaustive = 0;
+        if (trialFast & 4) ea.switchable = 0;
         {
             e = cudaEventRecord(s->trialFork, stream);
             const int nTrialShapes = st.rectPartitions ? kShapes : kSizes;

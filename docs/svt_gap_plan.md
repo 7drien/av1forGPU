@@ -526,3 +526,10 @@ BD-rate against SVT-AV1 preset 8 (mean of five clips; fps of video_2 / video_3),
   A smaller static bonus (`AV1GPU_PF_KEYSTILL`) helps video_3 but not the others: 20 → mean +9.8% (video_3 -1.8,
   video_1 +1.6, video_4 +1.3, video_5 +1.0), 0 → +10.4%; 40 kept.
 
+### Cheaper refinement trials (knob, off by default)
+
+`AV1GPU_PF_TRIALFAST` bits for the final-partition refinement's trial evaluations: 1 DCT-only split transforms,
+2 seven-type whole transforms, 4 no interpolation-filter search. Five clips: 1 → mean +9.4% → +9.8%, +2 to 3% fps;
+7 → +10.0%, fps video_2 19.2 → 20.5, video_3 6.9 → 7.4, video_4 6.1 → 6.5, video_5 19.1 → 20.4 (+4 to 7%). About 0.1
+BD point per 1% of speed, the best ratio measured; a candidate for a faster preset.
+
