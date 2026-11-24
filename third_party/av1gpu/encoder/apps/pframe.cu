@@ -918,9 +918,11 @@ __device__ __forceinline__ float fwdScore(const float *tmp, int W, int H, int tx
     for (int idx = threadIdx.x & 31; idx < tw * th; idx += 32) s += fabsf(tmp[(idx >> lt) * (W + 1) + (idx & (tw - 1))]);
     return warp_sum(s) * sqrtf(g_txg[txSz][type]);
 }
+// keep: where the caller stores this transform's levels (row stride keepStride, rows of keepW levels as in q): step 0
+// leaves the DCT_DCT levels there, and a DCT_DCT winner restores them instead of transforming again (same values).
 template <class Run>
 __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhaustive, float lambda, EvalOut &o,
-                              const int16_t *q, int nq, Run run) {
+                              int16_t *q, int nq, Run run, int16_t *keep, int keepStride, int keepW) {
     const int set = enabled ? pft2::interTxSet(txSz, reduced) : AV1G_TX_SET_DCTONLY;
     const int sq = AV1G_T(Tx_Size_Sqr)[txSz];
     const int n = pft2::interTxCount(set);
@@ -935,6 +937,8 @@ __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhausti
     for (int k = 0; k < kTop; k++) { top[k] = -1; topS[k] = 3.4e38f; }
     int best = AV1G_DCT_DCT, step = 0;
     float bestJ = 0.f;
+    EvalOut oDct{};
+    bool kept = false;
     // steps: 0 | 1..n screen (when screen) | candidates | final
     const int candBase = 1 + (screen ? n : 0), nCand = screen ? kTop : n;
     for (;;) {
@@ -955,7 +959,16 @@ __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhausti
         } else {
             t = best;
         }
-        const float score = run(t, mode);
+        float score = 0.f;
+        if (kept && step >= candBase + nCand && t == AV1G_DCT_DCT) {
+            for (int i = threadIdx.x & 31; i < nq; i += 32) q[i] = keep[size_t(i / keepW) * keepStride + i % keepW];
+            __syncwarp();
+            o = oDct;
+        } else {
+            score = run(t, mode);
+            // another type's reconstruction replaced the DCT_DCT one (the all-zero fallback then recomputes it)
+            if (mode == 2 && t != AV1G_DCT_DCT) kept = false;
+        }
         if (step == 0) {
             if (set == AV1G_TX_SET_DCTONLY) return AV1G_DCT_DCT;
             int any = 0;
@@ -963,6 +976,10 @@ __device__ int chooseLumaType(int txSz, bool enabled, int reduced, bool exhausti
             // nothing left after DCT quantization: other types rarely code such a residual better
             if (!__any_sync(0xffffffffu, any)) break;
             bestJ = o.D + lambda * (o.R + interTypeBits(set, sq, pft2::interTxIndex(set, AV1G_DCT_DCT)));
+            for (int i = threadIdx.x & 31; i < nq; i += 32) keep[size_t(i / keepW) * keepStride + i % keepW] = q[i];
+            __syncwarp();
+            oDct = o;
+            kept = true;
         } else if (step < candBase) {
             // keep the kTop smallest scores (insertion)
             float sc = score;
@@ -1231,7 +1248,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
             return warp_sumi(v);
         };
         if (p == 0) {
-            wholeType = chooseLumaType(txSz, a.types1 != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, o, q, tqw * tqh, run);
+            wholeType = chooseLumaType(txSz, a.types1 != nullptr, a.reducedTxSet, a.txExhaustive != 0, a.lambda, o, q, tqw * tqh, run,
+                                       a.levels + size_t(py) * f.aw + px, f.aw, tqw);
             if (a.types1)
                 for (int i = lane; i < (bw >> 2) * (bh >> 2); i += 32)
                     a.types1[size_t((py >> 2) + i / (bw >> 2)) * tstride + (px >> 2) + i % (bw >> 2)] = (uint8_t)wholeType;
@@ -1316,7 +1334,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
                     }
                     return warp_sumi(v);
                 };
-                const int ty = chooseLumaType(stx, a.types2 != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS);
+                const int ty = chooseLumaType(stx, a.types2 != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, (SW > 32 ? 32 : SW) * (SH > 32 ? 32 : SH), runS,
+                                              a.levels2 + size_t(py + qy) * apw + px + qx, apw, SW > 32 ? 32 : SW);
                 if (!k) splitTop[1] = ty;
                 if (a.types2)
                     for (int i = lane; i < (SW >> 2) * (SH >> 2); i += 32)
@@ -1399,7 +1418,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
                         return warp_sumi(v);
                     };
                     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
-                    const int ty = chooseLumaType(stx, tmap != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hn * hn, runS);
+                    const int ty = chooseLumaType(stx, tmap != nullptr && a.splitTypes < 2, a.reducedTxSet, a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hn * hn, runS,
+                                                  dstLev + size_t(py + qy) * apw + px + qx, apw, hn);
                     if (!k) splitTop[d] = ty;
                     if (tmap)
                         for (int i = lane; i < (hn >> 2) * (hn >> 2); i += 32)
@@ -1570,7 +1590,8 @@ __device__ __forceinline__ void evalSplitOne(EvalArgs a, const int dsel, const i
     };
     uint8_t *tmap = d == 1 ? a.types2 : a.types3;
     const int ty = chooseLumaType(stx, tmap != nullptr && a.splitTypes < 2, a.reducedTxSet,
-                                  a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hw * hh, runS);
+                                  a.txExhaustive != 0 && a.splitTypes == 0, a.lambda, os, q, hw * hh, runS,
+                                  dstLev + size_t(py + qy) * apw + px + qx, apw, hw);
     if (tmap)
         for (int i = lane; i < (hw >> 2) * (hh >> 2); i += 32)
             tmap[size_t(((py + qy) >> 2) + i / (hw >> 2)) * tstride + ((px + qx) >> 2) + i % (hw >> 2)] = (uint8_t)ty;
