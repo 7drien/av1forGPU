@@ -2444,10 +2444,12 @@ __global__ void tilePhase1(TileJob j) {
     j.entryCount[sb] = t.nEntries;
 }
 
-__global__ void refinementModeInfo(TileJob j) {
+__global__ void refinementModeInfo(TileJob j, const uint8_t *changed) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &e = j.entries[sb * 64 + k];
+    // later passes: a block's mode info changes only where the previous pass accepted a trial (changed cells)
+    if (changed && !changed[(e.r / 2) * j.fs.gcols + e.c / 2]) return;
     pft2::TileCoder t;
     t.fs = &j.fs;
     t.mi = j.mi;
@@ -2505,10 +2507,21 @@ __device__ int motionOptions(pft2::TileCoder &t, const pft2::TileCoder::RefPair 
     return n;
 }
 
-__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus, int pass, float skipModeCredit) {
+__global__ void priceMotion(TileJob j, pft2::InterCdfs *defaults, MotionOptions *menus, int pass, float skipModeCredit,
+                            const uint8_t *changed) {
     const int sb = blockIdx.x, k = threadIdx.x;
     if (k >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[sb * 64 + k];
+    if (pass > 0) {
+        // the menu depends on the block and its MV-stack neighbourhood (rows up to 5 MI above, columns up to 5 MI to
+        // the left, the top-right unit): unchanged by the previous pass, it is the same menu
+        const int gy = b.r / 2, gx = b.c / 2, w8 = max(1, (1 << b.lw) >> 3), h8 = max(1, (1 << b.lh) >> 3);
+        const int gcols = j.fs.gcols, grows = j.sbRows * 8;
+        bool any = false;
+        for (int y = max(gy - 3, 0); y < min(gy + h8, grows) && !any; y++)
+            for (int x = max(gx - 3, 0); x <= min(gx + w8, gcols - 1); x++) any |= changed[y * gcols + x] != 0;
+        if (!any) { menus[sb * 64 + k].same = true; return; }
+    }
     const BlockInfo &bi = j.grid[(b.r / 2) * j.fs.gcols + b.c / 2];
     pft2::TileCoder t;
     setupMotionCoder(t, j, sb);
@@ -3875,7 +3888,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         static const float skipModeCredit = getenv("AV1GPU_PF_SMCREDIT") ? (float)atof(getenv("AV1GPU_PF_SMCREDIT")) : 0.f;
         for (int pass = 0; pass < st.modeRefinePasses; ++pass) {
         cudaError_t e = cudaMemsetAsync(s->modeCounts, 0, sizeof(int) * kShapes, stream);
-        if (e == cudaSuccess) e = cudaMemsetAsync(s->modeChanged, 0, nSb * 64, stream);
+
         if (e != cudaSuccess) {
             snprintf(err, errLen, "P-frame mode refinement: %s", cudaGetErrorString(e));
             return -1;
@@ -3883,7 +3896,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         {
             FineTimer t("mode refinement proposals");
             if (!pass) tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(j);
-            refinementModeInfo<<<nSb, 64, 0, stream>>>(j);
+            refinementModeInfo<<<nSb, 64, 0, stream>>>(j, pass ? s->modeChanged : nullptr);
             RefinementArgs ra{};
             ra.f = f;
             std::copy_n(s->phases, refCount, ra.phases);
@@ -3899,7 +3912,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.screenWeight = 3.f * lambdaSad;
             ra.pass = pass;
             ra.keepDepth = (trialFast & 16) != 0;
-            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass, skipModeCredit);
+            priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass, skipModeCredit, s->modeChanged);
             proposeMotion<<<nSb * kProposeSlices, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
@@ -3947,6 +3960,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         {
             FineTimer t("mode refinement commit");
+            // the previous pass's changes were read by refinementModeInfo and priceMotion
+            cudaMemsetAsync(s->modeChanged, 0, nSb * 64, stream);
             acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda, pass);
             ca.changed = ta.changed = s->modeChanged;
             commitUnits<<<((aw / 8) * (ah / 8) + 7) / 8, 256, 0, stream>>>(ca);
