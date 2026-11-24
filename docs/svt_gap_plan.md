@@ -720,3 +720,29 @@ kernel (temporary).
      levels).
   4. Filters: deblocking / CDEF maps treat intra blocks like coded blocks; motion field: intra blocks store no vector.
   5. Validation: tests/check_pframes.py (dav1d must decode exactly the reconstruction), then BD-rate.
+
+### Intra blocks in inter frames: implemented (T2)
+
+- Square blocks (8x8 .. 64x64) inside the frame may switch to intra after the refinement passes. `intraDecide` (all
+  blocks in parallel, inter reconstruction around each block) codes luma mode by SAD (DC / V / H / SMOOTH* / PAETH,
+  plus D113 / D135 / D157 while `enable_intra_edge_filter` = 0; a directional SAD winner must also beat the best
+  non-directional mode by rate-distortion), the intra transform types of 8x8 / 16x16, luma transform splits
+  (tx_depth 1-2, raster order, only where intra is within 1.3x of the inter cost, DCT_DCT estimate) and the chroma mode
+  (UV_DC against the best SAD mode by RD). The intra / inter choice compares against the block's inter cost from the
+  evaluation (or its accepted refinement trial); the chroma mode does not tip it (that lost 0.5% on video_2).
+  `intraRecon` then reconstructs the chosen blocks from the final neighbours in decode order: one launch, superblocks
+  by ticket in anti-diagonal order, a superblock with intra blocks waits for its left / above / above-left
+  neighbours; luma, U and V on three warps. The tile coder codes the intra syntax (both entropy paths); the motion
+  field stores nothing for intra blocks. dav1d decodes every configuration of tests/check_pframes.py and video_2 to the
+  encoder's reconstruction.
+- Knobs: `--pf-no-intra`, `AV1GPU_PF_INTRABITS` (6; 2 / 12 within 0.3%), `AV1GPU_PF_INTRA_MARGIN` (1.0; 0.9 / 1.15 lost
+  0.3 to 1.0%), `AV1GPU_PF_INTRA_SPLITGATE` (1.3), `AV1GPU_PF_INTRA_NOSPLIT`, `AV1GPU_PF_INTRA_UVDC`,
+  `AV1GPU_PF_INTRA_NODIR`, `AV1GPU_PF_INTRA_STATS` (intra share of the area: video_1 0.5%, video_2 18-20%, nearly all
+  in 64x64 blocks).
+- BD-rate against b40 (before intra), five clips: video_1 -2.3%, video_2 -6.4%, video_3 -3.2%, video_4 -3.4%, video_5
+  -0.1%. Against SVT-AV1 preset 8: video_1 +2.8%, video_2 +11.2%, video_3 -15.7%, video_4 -28.3%, video_5 -10.9%
+  (mean -8.2%).
+- Cost: intra decision about 2 ms and reconstruction about 1.4 ms per 1080p inter frame (video_2 q90, synchronized
+  timers); a lossless bound skips the decision for blocks whose inter cost is below an intra block's minimum mode cost.
+- Speed (same session, with the startup / input-thread / upload fixes): video_1 28-32 fps (SVT 36.5), video_2 23-24
+  (34.4), video_3 7.7-8.3 (17.3), video_4 8.0-8.6 (16.4), video_5 22-23 (41.2).

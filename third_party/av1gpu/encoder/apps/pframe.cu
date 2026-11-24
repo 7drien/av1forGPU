@@ -2784,6 +2784,7 @@ struct IntraArgs {
     float splitGate;
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
+    float margin;   // intra wins when margin * its cost is below the inter cost
     int nModes;   // candidate intra modes (kIntraModesNoDir without the directional ones)   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
@@ -3217,7 +3218,7 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
     int mode = -1;
     int type = 0, depth = 0, uvMode = 0;
     const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode);
-    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
+    if (!lane) a.sel[gy * gcols + gx] = jIntra * a.margin < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
 }
 // Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
 template <int L>
@@ -4587,6 +4588,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
         ia.uvBits = getenv("AV1GPU_PF_INTRA_UVBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_UVBITS")) : 1.f;
         ia.splitGate = getenv("AV1GPU_PF_INTRA_SPLITGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SPLITGATE")) : 1.3f;
