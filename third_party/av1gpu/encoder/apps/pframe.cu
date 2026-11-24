@@ -2785,7 +2785,9 @@ struct IntraArgs {
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
     float margin;
-    float sadGate;   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
+    float sadGate;
+    int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
+    float splitPartBits;   // extra partition bits of that split   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
     int nModes;   // candidate intra modes (kIntraModesNoDir without the directional ones)   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
@@ -3236,7 +3238,50 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
     int mode = -1;
     int type = 0, depth = 0, uvMode = 0;
     const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode);
-    if (!lane) a.sel[gy * gcols + gx] = jIntra * a.margin < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
+    const bool useIntra = jIntra * a.margin < jInter;
+    uint16_t v = useIntra ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
+    if constexpr (L == 6) {
+        // four 32x32 intra blocks instead (partition SPLIT), each with its own modes; the quadrants' neighbours inside
+        // the block are approximated by the inter reconstruction, as the outer ones are
+        if (a.splitIntra && jIntra < kInf) {
+            auto &S32 = *reinterpret_cast<IntraScratch<32> *>(&S[warp]);
+            float j4 = a.lambda * a.splitPartBits;
+            uint16_t cs[4];
+            for (int q = 0; q < 4 && j4 < kInf; q++) {
+                int m = -1, t = 0, d = 0, uv = 0;
+                const float jq = intraBlock<5>(a, S32, x0 + (q & 1) * 32, y0 + (q >> 1) * 32, (q >> 1) ? true : haveA,
+                                               (q & 1) ? true : haveL, m, t, d, kInf, uv);
+                j4 += jq;
+                cs[q] = (uint16_t)((m + 1) | t << 4 | d << 8 | uv << 10);
+            }
+            if (j4 * a.margin < jInter && j4 < (useIntra ? jIntra : kInf)) {
+                if (!lane) {
+                    a.sel[gy * gcols + gx] = (uint16_t)(cs[0] | 1u << 14);   // bit 14: the 64x64 block splits
+                    a.sel[gy * gcols + gx + 4] = cs[1];
+                    a.sel[(gy + 4) * gcols + gx] = cs[2];
+                    a.sel[(gy + 4) * gcols + gx + 4] = cs[3];
+                }
+                return;
+            }
+        }
+    }
+    if (!lane) a.sel[gy * gcols + gx] = v;
+}
+// 64x64 blocks whose intra decision chose four 32x32 intra blocks: rewrite their grid units (the block lists are
+// rebuilt after this).
+__global__ void applyIntraSplit(BlockInfo *grid, uint16_t *sel, int gcols, int grows) {
+    const int gx = (blockIdx.x * blockDim.x + threadIdx.x) * 8, gy = (blockIdx.y * blockDim.y + threadIdx.y) * 8;
+    if (gx >= gcols || gy >= grows) return;
+    if (!(sel[gy * gcols + gx] & (1u << 14))) return;
+    sel[gy * gcols + gx] &= ~(1u << 14);
+    for (int y = gy; y < min(gy + 8, grows); y++)
+        for (int x = gx; x < min(gx + 8, gcols); x++) {
+            BlockInfo &b = grid[y * gcols + x];
+            b.log2 = 5;
+            b.part = 0;
+            b.ab = 0;
+            b.abLog2 = 0;
+        }
 }
 // Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
 template <int L>
@@ -4606,6 +4651,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.splitIntra = !getenv("AV1GPU_PF_INTRA_NOQUAD");
+        ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
@@ -4636,6 +4683,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             cudaEventRecord(s->trialJoin[k], s->shapeStream[k]);
             cudaStreamWaitEvent(stream, s->trialJoin[k], 0);
         }
+        }
+        if (ia.splitIntra) {
+            applyIntraSplit<<<dim3((gc + 127) / 128, (gr + 127) / 128), dim3(16, 16), 0, stream>>>(s->grid, s->intraSel, gc, gr);
+            tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(ia.j);   // block lists of the new partition
         }
         { FineTimer t3("intra recon");
         intraRecon<<<nSb, 96, 0, stream>>>(ia); }

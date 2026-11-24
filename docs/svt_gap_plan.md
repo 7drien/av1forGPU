@@ -776,3 +776,8 @@ kernel (temporary).
   occupancy is not what limits them.
 - Rectangular prune margin 1.0 (`AV1GPU_PF_PRUNE`): video_2 +0.08%, video_5 +0.49%, no measurable speed gain. Dropped.
 - video_1 knobs rechecked (m2 defaults): `--pf-lambda` 0.45 -0.15% (noise), 0.55 +0.35%, `--pf-altref-boost 160` +8.3%.
+- Intra-aware partition, first step: a 64x64 block may become four 32x32 intra blocks (partition SPLIT, own modes per
+  quadrant; decided with the inter reconstruction as neighbours, reconstructed exactly in decode order after the grid
+  and block lists are rebuilt). dav1d-exact; video_2 -0.07%, video_1 / video_5 0.00% (rarely chosen: each child pays
+  its own mode bits, and only blocks whose 64x64 intra option passed the bound are tried). `AV1GPU_PF_INTRA_NOQUAD`,
+  `AV1GPU_PF_INTRA_QUADBITS`.
