@@ -658,3 +658,24 @@ kernel (temporary).
   longer ALTREF filtering (video_3 +11.6% to +16.7%); lambda x 0.8 / 0.9 on referenced frames (mean -0.15% / -0.14%:
   video_3 -1.0%, video_4 -0.4%, video_1 / video_5 +0.2 to +0.5%); lambda x 1.25 on leaf frames (video_2 +0.53%).
   libaom ablations on video_3: TPL +2.7%, 64x64 superblocks +5.8%, which explain little of its 2.5x lead there.
+
+### video_3 solved: the coarse motion search could not follow camera pans
+
+- The quarter-resolution coarse search covered +-192 samples around zero (the temporal filter's +-48). A camera pan
+  moves content further over the 8 to 16 frames to an ALTREF, so video_3's ALTREFs were coded almost as intra frames
+  (70 to 155 KB each at q90 against 4 to 18 KB for SVT's in-between frames). A +-384 brute-force window measured
+  video_3 -20.6%, video_4 -2.7%, video_2 -1.6% (mean -5.0%) but costs 4x the search.
+- Hierarchical search (`hierCoarse`): 1/16-resolution planes searched over +-48 steps (+-768 samples, half the lambda
+  per step), the zero-centred quarter-resolution window reduced to +-64 samples (8.6x fewer positions), then +-8 around
+  the vectors of the four nearest 1/16-resolution areas where those windows reach beyond the zero-centred one. Against
+  the old search: video_1 +0.6%, video_2 -3.3%, video_3 -30%, video_4 -4%, video_5 0. The temporal filter's alignment
+  uses the same search. Tried: lambda x4 at 1/16 (loses most of video_3's gain), zero-centred windows of 128 / 192 with
+  the four candidate areas (mean -0.61% / -0.48% instead of -1.22%: video_1 prefers the wider window, the others the
+  narrower one).
+- With aligned neighbours the ALTREF filter over +-8 frames beats +-4 on every filtered clip (video_1 -0.50%, video_3
+  -1.23%, video_5 -0.57%): now the default. Strength 0.3 instead of 0.1: neutral.
+- Retested after the change: forced 16-frame mini-GOPs video_2 -1.32%, video_3 +12.95% (kept adaptive; the block-mean
+  motion measure cannot separate video_2's lighting changes from video_3's pan); square pruning off -0.55% on the moving
+  clips (video_3 -1.41%) at a speed cost (kept on).
+- Five clips against SVT-AV1 preset 8 (base6, before the +-8 filter default): video_1 +6.0%, video_2 +18.8%, video_3
+  -13.0%, video_4 -24.7%, video_5 -9.8%; mean -4.5% (libaom +26.0%).
