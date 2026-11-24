@@ -66,7 +66,7 @@ struct OutPlanes {
 // 2-sample halo are staged in shared memory (int16, -1 = outside the frame), the per-8x8 parameters and the tap
 // offsets of every direction once; then one thread per sample (av1g_cdef_filter, the same arithmetic as
 // av1g_cdef_pixel).  An SB without CDEF is copied.
-template <int BD, int SS>
+template <int BD, int SS, bool COPY = true>
 __global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o) {
     typedef av1g_pixel_t(BD) P;
     constexpr int TL = 68, CN = 64 >> SS, TC = CN + 4, CPX = CN * CN;
@@ -83,6 +83,7 @@ __global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o) {
     auto dst = [&](int p) { return (P *)(p == 0 ? o.p[0] : p == 1 ? o.p[1] : o.p[2]); };
     auto dst_s = [&](int p) { return p == 0 ? o.s[0] : p == 1 ? o.s[1] : o.s[2]; };
     if (f.cdefIdx[sb] < 0) {
+        if constexpr (!COPY) return;   // av1g_gpu_cdef_coded: superblocks without CDEF are left unwritten
         for (int i = tid; i < 4096 + (np > 1 ? 2 * CPX : 0); i += 256) {
             const int p = i < 4096 ? 0 : 1 + (i - 4096) / CPX, j = i < 4096 ? i : (i - 4096) % CPX, n = p ? CN : 64;
             const int x = sbc * n + j % n, y = sbr * n + j / n;
@@ -190,6 +191,27 @@ extern "C" int av1g_gpu_cdef_dir(const av1g_pf_frame *f, cudaStream_t stream) {
     const dim3 grid(((f->MiCols >> 1) + 15) / 16, ((f->MiRows >> 1) + 7) / 8);
     if (f->bitDepth == 10) k_cdef_dir<10><<<grid, blk, 0, stream>>>(*f);
     else k_cdef_dir<8><<<grid, blk, 0, stream>>>(*f);
+    return (int)cudaGetLastError();
+}
+
+// av1g_gpu_cdef without the copy of superblocks that apply no CDEF (cdef_idx -1): their output samples are left as
+// they were (strength searches that take those superblocks from another output).
+extern "C" int av1g_gpu_cdef_coded(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3],
+                                   cudaStream_t stream) {
+    OutPlanes o;
+    for (int p = 0; p < 3; p++) {
+        o.p[p] = d_out[p];
+        o.s[p] = out_stride[p];
+    }
+    const unsigned nsb = (unsigned)(f->sbCols * f->sbRows);
+    const bool s444 = !f->mono && !f->ssx;
+    if (f->bitDepth == 10) {
+        if (s444) k_cdef<10, 0, false><<<nsb, 256, 0, stream>>>(*f, o);
+        else k_cdef<10, 1, false><<<nsb, 256, 0, stream>>>(*f, o);
+    } else {
+        if (s444) k_cdef<8, 0, false><<<nsb, 256, 0, stream>>>(*f, o);
+        else k_cdef<8, 1, false><<<nsb, 256, 0, stream>>>(*f, o);
+    }
     return (int)cudaGetLastError();
 }
 

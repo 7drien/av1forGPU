@@ -4898,8 +4898,14 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
             f.cdefYSec[0] = f.cdefUVSec[0] = kCdefCandidates[k].sec;
             auto *candidate = s->filterCandidates + k * frame;
             uint8_t *dst[3] = {candidate, candidate + ysz, candidate + ysz + csz};
-            e = (cudaError_t)av1g_gpu_cdef(&f, dst, pw, stream);
-            if (e == cudaSuccess) e = sseOf(dst, k);
+            // per-superblock choice: candidates after the first skip the superblocks without CDEF (the gather takes
+            // them from candidate 0) and their whole-frame SSEs (the choice uses the per-superblock ones)
+            if (out.cdefPerSb && k > 0) {
+                e = (cudaError_t)av1g_gpu_cdef_coded(&f, dst, pw, stream);
+            } else {
+                e = (cudaError_t)av1g_gpu_cdef(&f, dst, pw, stream);
+                if (e == cudaSuccess && !out.cdefPerSb) e = sseOf(dst, k);
+            }
         }
         if (e == cudaSuccess && out.cdefPerSb) {
             const int nSb = f.sbCols * f.sbRows;

@@ -39,6 +39,8 @@ void av1g_gpu_pf_attach(const av1g_frame_params *fp, void *d_scratch, av1g_pf_fr
 int av1g_gpu_deblock(const av1g_pf_frame *f, cudaStream_t stream);
 int av1g_gpu_cdef_dir(const av1g_pf_frame *f, cudaStream_t stream);
 int av1g_gpu_cdef(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], cudaStream_t stream);
+/* av1g_gpu_cdef without the copy of superblocks that apply no CDEF (cdef_idx -1): their output is left untouched. */
+int av1g_gpu_cdef_coded(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], cudaStream_t stream);
 
 #ifdef __cplusplus
 }
