@@ -2789,7 +2789,8 @@ struct IntraArgs {
     int alt2;      // RD-check the second best luma mode by SAD (else the best non-directional one)
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
-    int uvAll;    // every chroma mode by RD (else UV_DC against the best by SAD)
+    int uvAll;
+    int uvTip;    // the chosen chroma mode's cost (not UV_DC's) enters the intra / inter decision    // every chroma mode by RD (else UV_DC against the best by SAD)
     float margin;
     float sadGate;
     int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
@@ -3226,13 +3227,15 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
     if (a.uvModes && a.uvAll) {   // every chroma mode by rate-distortion (AV1GPU_PF_INTRA_UVALL)
         auto jc = [&](const IntraPart &q) { return fminf(q.dCoded + a.lambda * q.rate, q.dSkip); };
         float best = jc(pt[1]) + jc(pt[2]);
+        IntraPart bu = pt[1], bv = pt[2];
         for (int k = 1; k < a.nModes; k++) {
             const int m = c_intraModes[k];
             const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, m);
             const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, m);
             const float j = jc(u) + jc(v) + a.lambda * a.uvBits;
-            if (j < best) { best = j; uvMode = m; }
+            if (j < best) { best = j; uvMode = m; bu = u; bv = v; }
         }
+        if (a.uvTip) { pt[1] = bu; pt[2] = bv; }   // the chosen chroma mode's cost enters the decision
     } else if (uvCand != AV1G_DC_PRED) {
         const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, uvCand);
         const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, uvCand);
@@ -4734,7 +4737,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
-        ia.uvAll = !getenv("AV1GPU_PF_INTRA_UVSAD");   // every chroma mode by RD: video_2 -0.28%
+        ia.uvAll = !getenv("AV1GPU_PF_INTRA_UVSAD");
+        ia.uvTip = getenv("AV1GPU_PF_INTRA_UVTIP") != nullptr;   // every chroma mode by RD: video_2 -0.28%
         ia.topK = getenv("AV1GPU_PF_INTRA_TOPK") ? atoi(getenv("AV1GPU_PF_INTRA_TOPK")) : 10;   // every mode: video_2 -2.3% over 3
         ia.alt3 = !getenv("AV1GPU_PF_INTRA_NOALT3");   // video_1 -0.09%, video_2 -0.52%
         ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%

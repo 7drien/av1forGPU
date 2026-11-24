@@ -829,3 +829,8 @@ kernel (temporary).
   were 30-39% of the area (`AV1GPU_PF_INTRA_STATS=2`); with them the ALTREFs go from about 60% to 80-90% intra. BD-rate:
   video_2 -3.77%, video_1 -2.71%, video_3 -2.15%, video_4 -4.15%, video_5 -0.06%. Against SVT-AV1 preset 8: video_1 +0.2%,
   video_2 +6.7%, video_3 -18.2%, video_4 -32.1%, video_5 -10.9% (mean -10.9%). `AV1GPU_PF_INTRA_NORECT` turns them off.
+- Intra mode search by rate-distortion instead of SAD alone: runner-up (video_1 -0.24%, video_2 -0.48%), third (-0.09% /
+  -0.52%), every luma mode (`AV1GPU_PF_INTRA_TOPK` 10: video_2 -1.7% over three), every chroma mode (-0.07% / -0.28%).
+  Against SVT-AV1 preset 8: video_1 -0.5%, video_2 +3.3%. Rechecked and kept off: the chosen chroma mode's cost in the
+  intra / inter decision (`AV1GPU_PF_INTRA_UVTIP`: video_1 -0.48%, video_2 +0.94%), split gate 2.0 (within 0.06%),
+  intra bits 3 / 9 (within 0.13%).
