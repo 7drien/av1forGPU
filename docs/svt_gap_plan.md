@@ -775,3 +775,4 @@ kernel (temporary).
   cap on pframe.cu (`-maxrregcount=128`): identical output, same time on video_2 (4.58-4.83 s both ways, interleaved):
   occupancy is not what limits them.
 - Rectangular prune margin 1.0 (`AV1GPU_PF_PRUNE`): video_2 +0.08%, video_5 +0.49%, no measurable speed gain. Dropped.
+- video_1 knobs rechecked (m2 defaults): `--pf-lambda` 0.45 -0.15% (noise), 0.55 +0.35%, `--pf-altref-boost 160` +8.3%.
