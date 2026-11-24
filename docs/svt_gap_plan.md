@@ -761,3 +761,10 @@ kernel (temporary).
   intra, the others 0-20% (`AV1GPU_PF_INTRA_STATS=2` prints it per frame). `--pf-gop 4` is still worse (+1.3%).
 - `--pf-cpu-entropy` against the default (GPU symbol modeling, host range coder) on video_2: same output, same time
   (4.7-4.9 s for 120 frames): entropy is not on the critical path; the analysis kernels are (the encode is GPU-bound).
+- Intra decision cost cut: an exact lower bound (luma cost alone past the inter cost and split gate: identical
+  output) 584 → 481 ms, and the mode SADs of blocks >= 16 on a 2x subsampled grid 488 → 307 ms (4K video_3, 47
+  frames; BD within 0.2%). Measured and dropped: a DCT_DCT-only estimate of the intra type (video_1 +0.6%, no time saved),
+  4K speed settings (`--pf-no-8x8 --pf-no-rect4 --pf-refine-passes 4`: +8 to 14% fps for +1.2 / +1.9%).
+- Five clips (m2: fast key frames, still offset 55, intra cost cuts) against SVT-AV1 preset 8: video_1 +2.9% at 34.9 fps
+  (SVT 36.5), video_2 +10.9% at 27.0 (34.4), video_3 -16.2% at 8.7 (17.3), video_4 -29.0% at 9.4 (16.4), video_5
+  -10.8% at 26.3 (41.2); mean -8.4%.
