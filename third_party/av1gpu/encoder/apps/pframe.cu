@@ -2850,9 +2850,11 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int 
         int best = 0x7fffffff, bestNd = 0x7fffffff;
         for (int k = 0; k < a.nModes; k++) {
             const int m = c_intraModes[k];
+            // SAD screen on every other row and column of blocks >= 16x16 (the choice is checked by RD after)
+            constexpr int SS = N >= 16 ? 1 : 0, LS = L - SS, NS = N >> SS;
             int sad = 0;
-            for (int i = lane; i < N * N; i += 32) {
-                const int r = i >> L, c = i & (N - 1);
+            for (int i = lane; i < NS * NS; i += 32) {
+                const int r = (i >> LS) << SS, c = (i & (NS - 1)) << SS;
                 sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, L, ab, lb));
             }
             sad = warp_sumi(sad);
@@ -3131,9 +3133,10 @@ __device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << L> &S, int 
         const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1, *cs = a.src[k + 1];
         const int cp = a.pitch[k + 1];
         const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LC, LC);
+        constexpr int SS = C >= 16 ? 1 : 0, LS = LC - SS, CS = C >> SS;
         for (int m = 0; m < a.nModes; m++)
-            for (int i = lane; i < C * C; i += 32) {
-                const int r = i >> LC, c = i & (C - 1);
+            for (int i = lane; i < CS * CS; i += 32) {
+                const int r = (i >> LS) << SS, c = (i & (CS - 1)) << SS;
                 sad[m] += abs((int)cs[(cy + r) * cp + cx + c] - intraPixel(c_intraModes[m], dc, r, c, LC, ab, lb));
             }
     }
