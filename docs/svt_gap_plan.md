@@ -688,3 +688,25 @@ kernel (temporary).
   lambda 0.42 / 0.6 (-0.23% mixed / +0.71%). libaom without global / warped motion on video_2: +0.1% / 0.
 - Five clips against SVT-AV1 preset 8 (b40): video_1 +5.3%, video_2 +18.4%, video_3 -13.2%, video_4 -25.6%, video_5
   -10.8%; mean -5.2%.
+
+### Next: intra blocks in inter frames (T2) for video_1 / video_2
+
+- Offline estimate (16x16 blocks, intra DC / V / H from neighbouring source samples against an integer +-12 search in
+  the previous frame): residual SAD -29% on video_2 (41% of it in blocks where intra wins by 30%), -14% on video_1, 0
+  on video_5. The inter model is crude (no subpel / compound), so these are upper bounds, but the two clips behind
+  SVT-AV1 are the ones that need intra (concert flashes and occlusions; text appearing in motion graphics).
+- Minimal version planned:
+  1. BlockInfo: `intra`, `yMode` (luma DC / V / H / SMOOTH / PAETH; chroma UV_DC). Square blocks, one transform of the
+     block size (tx_depth 0), DCT_DCT. These modes use no above-right / below-left samples and no intra edge filter
+     (V / H are pAngle 90 / 180), so only haveAbove / haveLeft are needed.
+  2. Tile coder (pframe_tile.cuh, both entropy paths): is_inter = 0, y_mode (inter-frame YModeCdf[size group]: add the
+     spec default table to InterCdfs), angle_delta_y = 0 for V / H, uv_mode (cfl allowed / not allowed CDF by size),
+     use_filter_intra = 0 when the sequence enables filter intra (DC, <= 32x32), tx_depth = 0 (TX_MODE_SELECT,
+     contexts as for txfm_split), intra_tx_type (set by size and reduced_tx_set) with DCT_DCT. MiInfo: isInter = 0,
+     ref INTRA_FRAME (contexts of neighbours), txW / txH of the block.
+  3. Decision after the refinement passes: intra cost from the committed reconstruction (approximate neighbours)
+     against the block's inter cost; then an exact pass in decode order (superblock wavefront; blocks of a superblock
+     sequential) that predicts from the final reconstruction, quantizes and reconstructs (levels into the frame's
+     levels).
+  4. Filters: deblocking / CDEF maps treat intra blocks like coded blocks; motion field: intra blocks store no vector.
+  5. Validation: tests/check_pframes.py (dav1d must decode exactly the reconstruction), then BD-rate.
