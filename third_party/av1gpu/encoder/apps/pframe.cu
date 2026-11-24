@@ -2765,9 +2765,12 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
 // reconstruction around each block (all blocks in parallel); intraRecon then predicts and reconstructs the chosen
 // blocks from their final neighbours in decode order: a superblock with intra blocks waits for its left, above and
 // above-left neighbours (one launch, superblocks taken by ticket in wavefront order).
-constexpr int kIntraModes = 7;
+// The last three (D135, D113, D157: 90 < angle < 180, angle_delta 0) read only AboveRow[-1 .. w-1] and
+// LeftCol[-1 .. h-1] too; they need enable_intra_edge_filter = 0 (IntraArgs::directional).
+constexpr int kIntraModes = 10, kIntraModesNoDir = 7;
 __constant__ uint8_t c_intraModes[kIntraModes] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED,
-                                                   AV1G_SMOOTH_V_PRED, AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
+                                                   AV1G_SMOOTH_V_PRED, AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED,
+                                                   AV1G_D135_PRED, AV1G_D113_PRED, AV1G_D157_PRED};
 struct IntraArgs {
     TileJob j;   // grid, decode-order block lists, tile layout
     BlockInfo *grid;   // writable view of j.grid
@@ -2780,7 +2783,8 @@ struct IntraArgs {
     int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
     float splitGate;
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
-    float uvBits;   // extra bits charged to a chroma mode other than UV_DC_PRED
+    float uvBits;
+    int nModes;   // candidate intra modes (kIntraModesNoDir without the directional ones)   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
     int cols[kSizes];
@@ -2826,13 +2830,13 @@ __device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int n,
     __syncwarp();
 }
 __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw, const uint8_t *ab, const uint8_t *lb) {
-    return mode == AV1G_DC_PRED ? dc : av1g_pred_pixel(mode, mode == AV1G_V_PRED ? 90 : mode == AV1G_H_PRED ? 180 : 0, i, j, lw, lw, ab, lb);
+    return mode == AV1G_DC_PRED ? dc : av1g_pred_pixel(mode, av1g_is_directional(mode) ? AV1G_T(Mode_To_Angle)[mode] : 0, i, j, lw, lw, ab, lb);
 }
 // Luma of an intra block (one warp). mode < 0: choose the luma mode by SAD first; forcedType < 0: search the transform
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
 template <int L>
 __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                               int forcedType) {
+                               int forcedType, int *altMode = nullptr) {
     constexpr int N = 1 << L, T = N > 32 ? 32 : N;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
@@ -2841,8 +2845,8 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int 
     const uint8_t *ab = S.above + 1, *lb = S.left + 1;
     const int dcY = av1g_dc_value<8>(ab, lb, haveL, haveA, L, L);
     if (mode < 0) {
-        int best = 0x7fffffff;
-        for (int k = 0; k < kIntraModes; k++) {
+        int best = 0x7fffffff, bestNd = 0x7fffffff;
+        for (int k = 0; k < a.nModes; k++) {
             const int m = c_intraModes[k];
             int sad = 0;
             for (int i = lane; i < N * N; i += 32) {
@@ -2851,6 +2855,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int 
             }
             sad = warp_sumi(sad);
             if (sad < best) { best = sad; mode = m; }
+            if (k < kIntraModesNoDir && sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
         }
     }
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
@@ -3118,14 +3123,14 @@ __device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << L> &S, int 
         const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1, *cs = a.src[k + 1];
         const int cp = a.pitch[k + 1];
         const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LC, LC);
-        for (int m = 0; m < kIntraModes; m++)
+        for (int m = 0; m < a.nModes; m++)
             for (int i = lane; i < C * C; i += 32) {
                 const int r = i >> LC, c = i & (C - 1);
                 sad[m] += abs((int)cs[(cy + r) * cp + cx + c] - intraPixel(c_intraModes[m], dc, r, c, LC, ab, lb));
             }
     }
     int best = 0x7fffffff, mode = AV1G_DC_PRED;
-    for (int m = 0; m < kIntraModes; m++) {
+    for (int m = 0; m < a.nModes; m++) {
         const int v = warp_sumi(sad[m]);
         if (v < best) { best = v; mode = c_intraModes[m]; }
     }
@@ -3136,7 +3141,15 @@ template <int L>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                             int &type, int &depth, float jInter, int &uvMode) {
     IntraPart pt[3];
-    pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1);
+    int alt = -1;
+    pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1, &alt);
+    if (alt >= 0 && alt != mode) {
+        // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
+        int m2 = alt;
+        const IntraPart q = intraLuma<L>(a, S, x0, y0, haveA, haveL, m2, -1);
+        auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
+        if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt; }
+    }
     // chroma: UV_DC_PRED against the best mode by SAD, by rate-distortion (one extra bit for the other mode)
     const int uvCand = a.uvModes ? intraChromaMode<L>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
     uvMode = AV1G_DC_PRED;
@@ -4574,6 +4587,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
         ia.uvBits = getenv("AV1GPU_PF_INTRA_UVBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_UVBITS")) : 1.f;
         ia.splitGate = getenv("AV1GPU_PF_INTRA_SPLITGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SPLITGATE")) : 1.3f;
         ia.intraBits = getenv("AV1GPU_PF_INTRABITS") ? (float)atof(getenv("AV1GPU_PF_INTRABITS")) : st.intraBits;

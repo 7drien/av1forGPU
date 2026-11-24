@@ -997,6 +997,7 @@ int main(int argc, char **argv) {
             ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.switchableFilter = pfSettings.switchableFilter;
             ein.filterIntra = cfg.P.filterIntra != 0;
+            st.intraDirectional = cfg.edgeFilter == 0;   // directional intra modes are modeled without the edge filter
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;

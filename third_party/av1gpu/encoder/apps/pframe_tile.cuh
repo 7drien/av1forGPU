@@ -966,11 +966,11 @@ struct TileCoder {
         sym(ic->isInter[interCtx], 0, 2);
         const int mode = bi.yMode;
         sym(ic->yMode[imin(lw - 2, 3)], mode, 13);   // Size_Group: 8x8 1, 16x16 2, 32x32 / 64x64 3
-        if (mode == AV1G_V_PRED || mode == AV1G_H_PRED) sym(cdf->angle_delta[mode - AV1G_V_PRED], 3, 7);   // delta 0
+        if (av1g_is_directional(mode)) sym(cdf->angle_delta[mode - AV1G_V_PRED], 3, 7);   // angle_delta_y 0
         const int uvMode = bi.uvMode;
         if (lw <= 5) sym(cdf->uv_mode_cfl_allowed[mode], uvMode, 14);
         else sym(cdf->uv_mode_cfl_not_allowed[mode], uvMode, 13);
-        if (uvMode == AV1G_V_PRED || uvMode == AV1G_H_PRED) sym(cdf->angle_delta[uvMode - AV1G_V_PRED], 3, 7);   // angle_delta_uv 0
+        if (av1g_is_directional(uvMode)) sym(cdf->angle_delta[uvMode - AV1G_V_PRED], 3, 7);   // angle_delta_uv 0
         const int bsize = lw == 3 ? AV1G_BLOCK_8X8 : lw == 4 ? AV1G_BLOCK_16X16 : lw == 5 ? AV1G_BLOCK_32X32 : AV1G_BLOCK_64X64;
         if (fs->filterIntra && mode == AV1G_DC_PRED && lw <= 5) sym(cdf->filter_intra[bsize], 0, 2);
         if (fs->txModeSelect) {
