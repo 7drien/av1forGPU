@@ -771,3 +771,6 @@ kernel (temporary).
 - Per-reference motion-search chains on separate streams (identical output): 4K video_3 5.18-5.20 → 5.30-5.31 s, no
   gain (the GPU is saturated during the search). Reverted. Forcing the ALTREF filter on (`AV1GPU_PF_TF_KEY_NOISE=0`)
   leaves video_1 / video_5 byte-identical (another gate keeps it off there).
+- `evaluate` instantiations use 255 registers and 350-530 B of stack (about 8 resident warps per SM). A 128-register
+  cap on pframe.cu (`-maxrregcount=128`): identical output, same time on video_2 (4.58-4.83 s both ways, interleaved):
+  occupancy is not what limits them.
