@@ -1388,7 +1388,13 @@ int main(int argc, char **argv) {
             // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
             gopMotion = !prevFrame.empty() ? motionOf(&prevFrame, 0, n - 1) : 0.0;
             static const double movingBoost = getenv("AV1GPU_PF_BOOST_MOVING") ? atof(getenv("AV1GPU_PF_BOOST_MOVING")) : 60.0;
-            double gopBoost = pfAdaptive && !prevFrame.empty() ? adaptive(gopMotion, pfAltrefBoost, movingBoost) : pfAltrefBoost;
+            // a temporally filtered ALTREF of fast-moving content (a pan of noisy footage) stays a useful reference over
+            // its whole mini-GOP: it keeps a larger boost (AV1GPU_PF_BOOST_MOVING_FILTERED; video_3 -5.7%, no other clip
+            // reaches the motion)
+            static const double movingFiltered = getenv("AV1GPU_PF_BOOST_MOVING_FILTERED") ? atof(getenv("AV1GPU_PF_BOOST_MOVING_FILTERED")) : 100.0;
+            double gopBoost = pfAdaptive && !prevFrame.empty()
+                                  ? (filtered && gopMotion >= 1.5 ? movingFiltered : adaptive(gopMotion, pfAltrefBoost, movingBoost))
+                                  : pfAltrefBoost;
             // short mini-GOPs (shots between cuts) amortize the boosted frames over fewer pictures (AV1GPU_PF_SHORTGOP:
             // the length below which the boost scales with n / length; 0 off)
             static const double shortLen = getenv("AV1GPU_PF_SHORTGOP") ? atof(getenv("AV1GPU_PF_SHORTGOP")) : 8.0;
