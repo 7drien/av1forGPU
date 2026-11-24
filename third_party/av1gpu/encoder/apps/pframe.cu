@@ -3679,7 +3679,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
                    32 * RefineCfg<N, N>::warps, 0, stream>>>(f, r, s->phases[r], s->coarse[r], s->ccols, s->crows,             \
                                                   K == 3 ? nullptr : s->cand[K + 1], K == 3 ? 0 : s->cols[K + 1],    \
                                                   2 * N, temporal, s->gcols, s->cand[K], s->cols[K], s->rows[K], lambdaSad, \
-                                                  K == 0 && !st.blocks8)
+                                                  K == 0 && !st.blocks8, sqPasses)
+        static const int sqPasses = getenv("AV1GPU_PF_SQPASSES") ? atoi(getenv("AV1GPU_PF_SQPASSES")) : kFullPelPasses;
         PF_REFINE(3, 64);
         PF_REFINE(2, 32);
         PF_REFINE(1, 16);
