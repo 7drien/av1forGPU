@@ -348,34 +348,49 @@ __global__ void coarseAround(const uint8_t *cur, const uint8_t *ref, int dw, int
     const int b = blockIdx.x * kCoarseWarps + warp;
     if (b >= cols * rows) return;
     const int bx = b % cols, by = b / cols, x0 = bx * 8, y0 = by * 8;
-    const Mv wm = wide[min(by / 4, wrows - 1) * wcols + min(bx / 4, wcols - 1)];
-    const int cy = wm.row / 8, cx = wm.col / 8;   // 1/16-resolution vectors are stored as quarter-resolution ones: x4
-    if (abs(cy) + R <= R0 && abs(cx) + R <= R0) return;   // inside the zero-centred window: already priced there
+    // the vectors of the four 128 x 128 areas nearest the block (its own and the neighbours towards its quadrant)
+    const int ax = bx / 4, ay = by / 4, nx = (bx & 3) < 2 ? ax - 1 : ax + 1, ny = (by & 3) < 2 ? ay - 1 : ay + 1;
+    int cy[4], cx[4], nc = 0;
+    for (int k = 0; k < 4; k++) {
+        const int qx = min(max(k & 1 ? nx : ax, 0), wcols - 1), qy = min(max(k & 2 ? ny : ay, 0), wrows - 1);
+        const Mv wm = wide[qy * wcols + qx];
+        const int y = wm.row / 8, x = wm.col / 8;   // 1/16-resolution vectors are stored as quarter-resolution ones: x4
+        if (abs(y) + R <= R0 && abs(x) + R <= R0) continue;   // inside the zero-centred window: already priced there
+        bool dup = false;
+        for (int j = 0; j < nc; j++) dup |= cy[j] == y && cx[j] == x;
+        if (dup) continue;
+        cy[nc] = y; cx[nc] = x; nc++;
+    }
+    if (!nc) return;
     for (int i = lane; i < 64; i += 32) blk[warp][i] = cur[min(y0 + i / 8, dh - 1) * dw + min(x0 + i % 8, dw - 1)];
-    for (int i = lane; i < ws * stride; i += 32) {
-        const int r = i / stride, c = i - r * stride;
-        win[warp][i] = ref[min(max(y0 + cy - R + r, 0), dh - 1) * dw + min(max(x0 + cx - R + c, 0), dw - 1)];
+    float best = cost[b];
+    int bestY = 0, bestX = 0;
+    bool found = false;
+    for (int j = 0; j < nc; j++) {
+        __syncwarp();
+        for (int i = lane; i < ws * stride; i += 32) {
+            const int r = i / stride, c = i - r * stride;
+            win[warp][i] = ref[min(max(y0 + cy[j] - R + r, 0), dh - 1) * dw + min(max(x0 + cx[j] - R + c, 0), dw - 1)];
+        }
+        __syncwarp();
+        float bj = kInf;
+        int bi = 0;
+        for (int k = lane; k < side * side; k += 32) {
+            const int dy = k / side, dx = k % side;
+            int sad = 0;
+            for (int r = 0; r < 8; r++)
+                for (int c = 0; c < 8; c++) sad += abs((int)blk[warp][r * 8 + c] - (int)win[warp][(dy + r) * stride + dx + c]);
+            const float cst = (float)sad + lambda * (float)(abs(cx[j] + dx - R) + abs(cy[j] + dy - R));
+            if (cst < bj || (cst == bj && k < bi)) { bj = cst; bi = k; }
+        }
+        for (int o = 16; o; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffffu, bj, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ob < bj || (ob == bj && oi < bi)) { bj = ob; bi = oi; }
+        }
+        if (bj < best) { best = bj; bestY = cy[j] + bi / side - R; bestX = cx[j] + bi % side - R; found = true; }
     }
-    __syncwarp();
-    float best = kInf;
-    int bestIdx = 0;
-    for (int k = lane; k < side * side; k += 32) {
-        const int dy = k / side, dx = k % side;
-        int sad = 0;
-        for (int r = 0; r < 8; r++)
-            for (int c = 0; c < 8; c++) sad += abs((int)blk[warp][r * 8 + c] - (int)win[warp][(dy + r) * stride + dx + c]);
-        const float cst = (float)sad + lambda * (float)(abs(cx + dx - R) + abs(cy + dy - R));
-        if (cst < best || (cst == best && k < bestIdx)) { best = cst; bestIdx = k; }
-    }
-    for (int o = 16; o; o >>= 1) {
-        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-        const int oi = __shfl_xor_sync(0xffffffffu, bestIdx, o);
-        if (ob < best || (ob == best && oi < bestIdx)) { best = ob; bestIdx = oi; }
-    }
-    if (!lane && best < cost[b]) {
-        const int dy = cy + bestIdx / side - R, dx = cx + bestIdx % side - R;
-        out[b] = Mv{(int16_t)(dy * 4 * 8), (int16_t)(dx * 4 * 8)};
-    }
+    if (!lane && found) out[b] = Mv{(int16_t)(bestY * 4 * 8), (int16_t)(bestX * 4 * 8)};
 }
 
 // Quarter-sample phase planes of a reference luma plane: phase (fy / 4) * 4 + fx / 4 holds the exact AV1 prediction
@@ -3528,11 +3543,14 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
 }
 
 // Hierarchical coarse search of one reference: the 1/16-resolution planes (newCur: the current one too) searched over
-// +-r16 (16 x 16 full samples per step), the quarter-resolution search over +-R around zero, then +-kCoarseAroundR around
-// the 1/16-resolution vector where that window reaches beyond the zero-centred one.
+// +-r16 steps of 16 full samples (48: +-768; half the quarter-level lambda per step measured best), the
+// quarter-resolution search over +-R around zero (16: +-64 samples, the smaller window measured better than +-192), then
+// +-kCoarseAroundR around the vectors of the four nearest 1/16-resolution areas where those windows reach beyond the
+// zero-centred one. Against the +-192 zero-centred search alone: video_3 -30%, video_4 -4%, video_2 -3%, video_1 +0.6%.
 static void hierCoarse(State *s, cudaStream_t st, const uint8_t *curDs, const uint8_t *refDs, bool newCur, int R,
                        float lambda, Mv *out) {
-    static const int r16 = getenv("AV1GPU_PF_RANGE16") ? atoi(getenv("AV1GPU_PF_RANGE16")) : 32;
+    static const int r16 = getenv("AV1GPU_PF_RANGE16") ? atoi(getenv("AV1GPU_PF_RANGE16")) : 48;
+    static const float lambda16 = getenv("AV1GPU_PF_LAMBDA16") ? (float)atof(getenv("AV1GPU_PF_LAMBDA16")) : 0.5f;
     const dim3 t16(16, 16), g16((s->dw16 + 15) / 16, (s->dh16 + 15) / 16);
     const int nq = s->ccols * s->crows;
     if (r16 > 0) {
@@ -3540,7 +3558,8 @@ static void hierCoarse(State *s, cudaStream_t st, const uint8_t *curDs, const ui
         downsample4<<<g16, t16, 0, st>>>(refDs, s->dw, s->dw, s->dh, s->ds16[1], s->dw16, s->dh16);
         const int n16 = s->c16cols * s->c16rows;
         coarseSearch<<<(n16 + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps, 0, st>>>(
-            s->ds16[0], s->ds16[1], s->dw16, s->dh16, std::min(kCoarseMaxR, r16), s->c16cols, s->c16rows, lambda, s->coarse16);
+            s->ds16[0], s->ds16[1], s->dw16, s->dh16, std::min(kCoarseMaxR, r16), s->c16cols, s->c16rows, lambda * lambda16,
+            s->coarse16);
     }
     coarseSearch<<<(nq + kCoarseWarps - 1) / kCoarseWarps, 32 * kCoarseWarps, 0, st>>>(
         curDs, refDs, s->dw, s->dh, R, s->ccols, s->crows, lambda, out, s->coarseCost);

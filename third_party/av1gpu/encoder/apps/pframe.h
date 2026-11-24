@@ -43,7 +43,8 @@ struct BlockInfo {
 struct Settings {
     int qindex = 100;
     float lambdaMul = 0.5f;
-    int searchRange = 192;   // full-pel coarse search radius (quarter-resolution search, at most 192)
+    int searchRange = 64;    // full-pel radius of the zero-centred quarter-resolution search (at most 192; the 1/16-resolution
+                             // stage covers +-768)
     float rnd = 0.46f, zbin = 0.70f;   // quantizer rounding and dead zone (five-clip sweeps)
     float compoundBias = 1.0f;   // extra bits charged to compound prediction in the search
     bool txSplit = true;
