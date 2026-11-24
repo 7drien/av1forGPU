@@ -2784,7 +2784,8 @@ struct IntraArgs {
     float splitGate;
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
-    float margin;   // intra wins when margin * its cost is below the inter cost
+    float margin;
+    float sadGate;   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
     int nModes;   // candidate intra modes (kIntraModesNoDir without the directional ones)   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
@@ -2837,7 +2838,7 @@ __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
 template <int L>
 __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                               int forcedType, int *altMode = nullptr) {
+                               int forcedType, int *altMode = nullptr, float sseGate = kInf) {
     constexpr int N = 1 << L, T = N > 32 ? 32 : N;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
@@ -2857,6 +2858,12 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int 
             sad = warp_sumi(sad);
             if (sad < best) { best = sad; mode = m; }
             if (k < kIntraModesNoDir && sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
+        }
+        // the prediction error is at least SAD^2 / N^2: far above the inter cost, intra cannot win
+        if ((float)best * (float)best * (1.f / (N * N)) > sseGate) {
+            IntraPart r{};
+            r.dCoded = r.dSkip = kInf;
+            return r;
         }
     }
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
@@ -3143,7 +3150,8 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
                             int &type, int &depth, float jInter, int &uvMode) {
     IntraPart pt[3];
     int alt = -1;
-    pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1, &alt);
+    pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf);
+    if (pt[0].dSkip >= kInf) return kInf;
     if (alt >= 0 && alt != mode) {
         // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
         int m2 = alt;
@@ -4588,6 +4596,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
         ia.uvBits = getenv("AV1GPU_PF_INTRA_UVBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_UVBITS")) : 1.f;
@@ -4605,10 +4614,18 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         cudaMemsetAsync(s->intraTicket, 0, sizeof(unsigned), stream);
         const int gc = s->gcols, gr = s->grows;
         { FineTimer t2("intra decide");
-        intraDecide<6><<<((gc + 7) / 8) * ((gr + 7) / 8), 32, 0, stream>>>(ia);
-        intraDecide<5><<<(((gc + 3) / 4) * ((gr + 3) / 4) + 1) / 2, 64, 0, stream>>>(ia);
-        intraDecide<4><<<(((gc + 1) / 2) * ((gr + 1) / 2) + 3) / 4, 128, 0, stream>>>(ia);
-        intraDecide<3><<<(gc * gr + 3) / 4, 128, 0, stream>>>(ia);
+        // the four sizes are independent (they read the reconstruction, write their own block positions): one shape
+        // stream each, joined before the reconstruction pass
+        cudaEventRecord(s->trialFork, stream);
+        for (int k = 0; k < 4; k++) cudaStreamWaitEvent(s->shapeStream[k], s->trialFork, 0);
+        intraDecide<6><<<((gc + 7) / 8) * ((gr + 7) / 8), 32, 0, s->shapeStream[3]>>>(ia);
+        intraDecide<5><<<(((gc + 3) / 4) * ((gr + 3) / 4) + 1) / 2, 64, 0, s->shapeStream[2]>>>(ia);
+        intraDecide<4><<<(((gc + 1) / 2) * ((gr + 1) / 2) + 3) / 4, 128, 0, s->shapeStream[1]>>>(ia);
+        intraDecide<3><<<(gc * gr + 3) / 4, 128, 0, s->shapeStream[0]>>>(ia);
+        for (int k = 0; k < 4; k++) {
+            cudaEventRecord(s->trialJoin[k], s->shapeStream[k]);
+            cudaStreamWaitEvent(stream, s->trialJoin[k], 0);
+        }
         }
         { FineTimer t3("intra recon");
         intraRecon<<<nSb, 96, 0, stream>>>(ia); }
