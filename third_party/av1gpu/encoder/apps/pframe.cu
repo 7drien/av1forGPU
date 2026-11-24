@@ -2758,6 +2758,8 @@ struct IntraArgs {
     int qindex, qctx, reduced;
     int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
     float splitGate;
+    int uvModes;   // choose the chroma mode (else UV_DC_PRED)
+    float uvBits;   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
     int cols[kSizes];
@@ -2993,7 +2995,8 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S,
 }
 // Chroma plane p (1, 2) of an intra block, UV_DC_PRED (one warp).
 template <int L>
-__device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, int p, int x0, int y0, bool haveA, bool haveL) {
+__device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, int p, int x0, int y0, bool haveA, bool haveL,
+                                 int uvMode) {
     constexpr int C = (1 << L) / 2, LC = L - 1;
     const int lane = threadIdx.x & 31;
     const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
@@ -3001,14 +3004,16 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, in
     const uint8_t *cs = a.src[p];
     const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
     intraEdges(plane, cw, cx, cy, C, haveA, haveL, S.aboveC[k], S.leftC[k]);
-    const int dc = av1g_dc_value<8>(S.aboveC[k] + 1, S.leftC[k] + 1, haveL, haveA, LC, LC);
+    const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1;
+    const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LC, LC);
     uint8_t *pr = S.predC[k], *rc = S.recC[k];
     int16_t *q = S.qC[k], *res = S.resC[k];
     float en = 0.f;
     for (int i = lane; i < C * C; i += 32) {
         const int r = i >> LC, c = i & (C - 1);
-        const int d = (int)cs[(cy + r) * cp + cx + c] - dc;
-        pr[i] = (uint8_t)dc;
+        const int pv = intraPixel(uvMode, dc, r, c, LC, ab, lb);
+        const int d = (int)cs[(cy + r) * cp + cx + c] - pv;
+        pr[i] = (uint8_t)pv;
         res[i] = (int16_t)d;
         en += (float)(d * d);
     }
@@ -3016,7 +3021,7 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, in
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     EvalIn e{};
     e.txSz = txSizeOf(LC, LC);
-    e.txType = AV1G_DCT_DCT;
+    e.txType = av1g_chroma_tx_type(e.txSz, uvMode, a.reduced);   // Mode_To_Txfm[UVMode] when in the set
     e.plane = p;
     e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
     e.rnd = a.rnd; e.zbin = a.zbin;
@@ -3025,9 +3030,9 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, in
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
-    warp_fwd_ct<C, C>(res, S.tmpC[k], e.txSz, AV1G_DCT_DCT);
+    warp_fwd_ct<C, C>(res, S.tmpC[k], e.txSz, e.txType);
     warp_quant_rate_rt<8>(S.tmpC[k], q, e, o, C, C);
-    inverseAddCt<LC, LC>(q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, res, pr, rc);
+    inverseAddCt<LC, LC>(q, e.txSz, e.txType, dcQ, acQ, res, pr, rc);
     int sse = 0, any = 0;
     for (int i = lane; i < C * C; i += 32) {
         const int r = i >> LC, c = i & (C - 1);
@@ -3079,14 +3084,51 @@ __device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << L> &S, in
         lv[size_t(cy + r) * (a.aw / 2) + cx + c] = skip ? (int16_t)0 : S.qC[k][i];
     }
 }
+// Chroma mode of an intra block by SAD over both planes (one warp).
+template <int L>
+__device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL) {
+    constexpr int C = (1 << L) / 2, LC = L - 1;
+    const int lane = threadIdx.x & 31;
+    const int cw = a.w >> 1, ch = a.h >> 1, cx = x0 >> 1, cy = y0 >> 1;
+    int sad[kIntraModes] = {};
+    for (int k = 0; k < 2; k++) {
+        const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
+        intraEdges(plane, cw, cx, cy, C, haveA, haveL, S.aboveC[k], S.leftC[k]);
+        const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1, *cs = a.src[k + 1];
+        const int cp = a.pitch[k + 1];
+        const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LC, LC);
+        for (int m = 0; m < kIntraModes; m++)
+            for (int i = lane; i < C * C; i += 32) {
+                const int r = i >> LC, c = i & (C - 1);
+                sad[m] += abs((int)cs[(cy + r) * cp + cx + c] - intraPixel(c_intraModes[m], dc, r, c, LC, ab, lb));
+            }
+    }
+    int best = 0x7fffffff, mode = AV1G_DC_PRED;
+    for (int m = 0; m < kIntraModes; m++) {
+        const int v = warp_sumi(sad[m]);
+        if (v < best) { best = v; mode = c_intraModes[m]; }
+    }
+    return mode;
+}
 // Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
 template <int L>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            int &type, int &depth, float jInter) {
+                            int &type, int &depth, float jInter, int &uvMode) {
     IntraPart pt[3];
     pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1);
-    pt[1] = intraChroma<L>(a, S, 1, x0, y0, haveA, haveL);
-    pt[2] = intraChroma<L>(a, S, 2, x0, y0, haveA, haveL);
+    // chroma: UV_DC_PRED against the best mode by SAD, by rate-distortion (one extra bit for the other mode)
+    const int uvCand = a.uvModes ? intraChromaMode<L>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
+    uvMode = AV1G_DC_PRED;
+    pt[1] = intraChroma<L>(a, S, 1, x0, y0, haveA, haveL, AV1G_DC_PRED);
+    pt[2] = intraChroma<L>(a, S, 2, x0, y0, haveA, haveL, AV1G_DC_PRED);
+    if (uvCand != AV1G_DC_PRED) {
+        const IntraPart u = intraChroma<L>(a, S, 1, x0, y0, haveA, haveL, uvCand);
+        const IntraPart v = intraChroma<L>(a, S, 2, x0, y0, haveA, haveL, uvCand);
+        auto jc = [&](const IntraPart &q) { return fminf(q.dCoded + a.lambda * q.rate, q.dSkip); };
+        if (jc(u) + jc(v) + a.lambda * a.uvBits < jc(pt[1]) + jc(pt[2])) uvMode = uvCand;
+    }
+    // the intra / inter decision and the luma choices use the UV_DC_PRED cost (a better chroma mode only
+    // refines blocks that are intra anyway: letting it tip the decision lost on video_2)
     bool skip;
     float J = intraCombine(a, pt, skip);
     type = skip ? AV1G_DCT_DCT : pt[0].type;
@@ -3139,14 +3181,14 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
     bool haveA, haveL;
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
-    int type = 0, depth = 0;
-    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter);
-    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8) : 0;
+    int type = 0, depth = 0, uvMode = 0;
+    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode);
+    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
 }
 // Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
 template <int L>
 __device__ void intraReconBlock(const IntraArgs &a, IntraScratch<1 << L> &S, IntraPart *pt, int x0, int y0, bool haveA,
-                                bool haveL, int mode, int type, int depth, int &skipOut, int &typeOut) {
+                                bool haveL, int mode, int type, int depth, int uvMode, int &skipOut, int &typeOut) {
     const int warp = threadIdx.x >> 5;
     IntraPart r;
     if (warp == 0) {
@@ -3154,7 +3196,7 @@ __device__ void intraReconBlock(const IntraArgs &a, IntraScratch<1 << L> &S, Int
         if constexpr (L >= 4) { if (depth == 1) r = intraLumaSplit<L, 1>(a, S, x0, y0, haveA, haveL, mode, true); }
         if (depth == 0) r = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, type);
     } else {
-        r = intraChroma<L>(a, S, warp, x0, y0, haveA, haveL);
+        r = intraChroma<L>(a, S, warp, x0, y0, haveA, haveL, uvMode);
     }
     if ((threadIdx.x & 31) == 0) pt[warp] = r;
     __syncthreads();
@@ -3200,14 +3242,14 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            const int mode = (s & 15) - 1, ft = (s >> 4) & 15, depth = s >> 8;
+            const int mode = (s & 15) - 1, ft = (s >> 4) & 15, depth = (s >> 8) & 3, uvMode = s >> 10;
             int skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
             switch (be.lw) {
-            case 3: intraReconBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
-            case 4: intraReconBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
-            case 5: intraReconBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
-            default: intraReconBlock<6>(a, S, pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
+            case 3: intraReconBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, uvMode, skip, type); break;
+            case 4: intraReconBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, uvMode, skip, type); break;
+            case 5: intraReconBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, uvMode, skip, type); break;
+            default: intraReconBlock<6>(a, S, pt, x0, y0, haveA, haveL, mode, ft, depth, uvMode, skip, type); break;
             }
             if (warp == 0) {
                 const int u = 1 << (be.lw - 3);
@@ -3215,6 +3257,7 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
                     BlockInfo &bi = a.grid[(gy + i / u) * gcols + gx + i % u];
                     bi.intra = 1;
                     bi.yMode = (uint8_t)mode;
+                    bi.uvMode = (uint8_t)uvMode;
                     bi.skip = (uint8_t)skip;
                     bi.txSplit = (uint8_t)depth;
                     int t = type;
@@ -4509,6 +4552,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.qindex = st.qindex; ia.qctx = ea.qctx; ia.reduced = ea.reducedTxSet;
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
+        ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.uvBits = getenv("AV1GPU_PF_INTRA_UVBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_UVBITS")) : 1.f;
         ia.splitGate = getenv("AV1GPU_PF_INTRA_SPLITGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SPLITGATE")) : 1.3f;
         ia.intraBits = getenv("AV1GPU_PF_INTRABITS") ? (float)atof(getenv("AV1GPU_PF_INTRABITS")) : st.intraBits;
         ia.modeBase = ea.modeBase; ia.skipBits0 = ea.skipBits0; ia.skipBits1 = ea.skipBits1;
