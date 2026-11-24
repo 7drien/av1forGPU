@@ -1,4 +1,38 @@
-# Plan: SVT-AV1 tools missing from the CUDA inter encoder
+# SVT-AV1 gap: plan and measurement log
+
+## Summary (2026-11-24)
+
+**Where we stand** (five clips, against SVT-AV1 preset 8; numbers in [benchmark.md](benchmark.md)):
+
+| Clip | BD-rate | Speed vs SVT |
+| --- | --- | --- |
+| video_3, video_4, video_5 | better (−11% to −29%) | 0.5× to 0.65× |
+| video_1 | +2.9% | about 0.95× |
+| video_2 | +10.9% | about 0.8× |
+
+**What helped most:**
+
+1. **Hierarchical coarse motion search:** 1/16-resolution ±768 px, then 1/4 resolution. video_3 −30%: the earlier
+   ±192 px range lost camera pans.
+2. **Intra blocks in inter frames:** video_2 −6.4%, video_1 −2.3%, video_3 / video_4 about −3%.
+3. **Startup / I/O and identical-output kernel work:** about +35 to 50% fps over the day, together with the fast
+   key-frame preset (+9 to 22% fps for +0.2 to 1.1% BD-rate).
+
+**What the measurements say about speed:**
+
+- The encode is GPU-bound, but the frame is mostly a serial chain of dependent kernels: one kernel runs alone during
+  66% of the time (nsys).
+- Cutting work inside the 14 parallel shape streams does not shorten the frame. The register cap, concurrent motion
+  search, filter-search skip and pipelined frame finishing all gave identical output and the same time.
+- Every pruning costs about 0.25 BD-rate points per 1% of speed. The ~2× still needed on 4K needs kernels that do much
+  less work per block.
+
+**What is left for video_2:** its ALTREF frames are 44 to 65% intra. Intra modes, splits, chroma modes and a
+64x64-to-4×32x32 intra split are done; the remaining knobs are tuned.
+
+The rest of this file is the chronological log of every measurement, including the experiments that did not help.
+
+## Original plan
 
 Baseline (120 frames of `video_1.mp4`, matched bitrate): about 24 fps, BD-rate about +38% against SVT-AV1 preset 8
 with fixed quantizers. Each feature below must keep the rule that dav1d decodes exactly the encoder's

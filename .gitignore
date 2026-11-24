@@ -11,3 +11,8 @@
 *.seconds
 __pycache__/
 !benckmark/inter_sweep/README.md
+.claude/
+*.webm
+*.nsys-rep
+*.qdstrm
+*.sqlite
