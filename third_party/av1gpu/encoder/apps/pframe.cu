@@ -2571,9 +2571,8 @@ __device__ int motionSatd(const RefinementArgs &a, const MotionOption &option, i
 }
 
 // One CTA per block: its warps share the SATD tiles (large blocks bound the kernel's duration otherwise).
-__global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, RefinementArgs a,
-                                                                    const MotionOptions *menus) {
-    const int e = blockIdx.x, sb = e / 64, lane = threadIdx.x;
+__device__ __forceinline__ void proposeOne(TileJob j, RefinementArgs a, const MotionOptions *menus, const int e) {
+    const int sb = e / 64, lane = threadIdx.x;
     if (e % 64 >= (int)j.entryCount[sb]) return;
     const auto &b = j.entries[e];
     const int gy = b.r / 2, gx = b.c / 2, pos = gy * j.fs.gcols + gx;
@@ -2624,6 +2623,18 @@ __global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, R
         trial.rateSaving = saving;
         trial.active = true;
         a.trialIndices[shape][atomicAdd(a.trialCount + shape, 1)] = index;
+    }
+}
+
+// kProposeSlices CTAs per superblock, each taking every kProposeSlices-th of its entries (superblocks hold few blocks
+// where 64x64 blocks dominate: a CTA per entry slot left most CTAs empty); the CTA's threads share each block's tiles.
+constexpr int kProposeSlices = 8;
+__global__ void __launch_bounds__(32 * kProposeWarps) proposeMotion(TileJob j, RefinementArgs a,
+                                                                    const MotionOptions *menus) {
+    const int sb = blockIdx.x / kProposeSlices, slice = blockIdx.x % kProposeSlices, n = (int)j.entryCount[sb];
+    for (int k = slice; k < n; k += kProposeSlices) {
+        proposeOne(j, a, menus, sb * 64 + k);
+        __syncthreads();
     }
 }
 
@@ -3871,7 +3882,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             ra.pass = pass;
             ra.keepDepth = (trialFast & 16) != 0;
             priceMotion<<<nSb, 64, 0, stream>>>(j, s->defaultInter, s->modeMenus, pass, skipModeCredit);
-            proposeMotion<<<nSb * 64, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
+            proposeMotion<<<nSb * kProposeSlices, 32 * kProposeWarps, 0, stream>>>(j, ra, s->modeMenus);
         }
         // The original output is already committed. Trials reuse the per-shape evaluation buffers,
         // and only accepted blocks overwrite their reconstruction, levels and transform types.
