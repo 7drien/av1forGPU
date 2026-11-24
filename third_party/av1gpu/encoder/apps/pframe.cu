@@ -2801,7 +2801,7 @@ __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw
 // of skip and coded; with write, stores the reconstruction and levels of that option and sets *skipOut.
 template <int L>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            bool write, int *skipOut) {
+                            bool write, int *skipOut, int *typeOut = nullptr) {
     constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
@@ -2844,9 +2844,25 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
-    warp_fwd_ct<N, N>(S.res, S.tmp, e.txSz, AV1G_DCT_DCT);
+    // luma transform type: every type of the intra set (8x8 / 16x16) by the quantizer's estimate
+    int type = AV1G_DCT_DCT;
+    const int set = av1g_get_tx_set_intra(e.txSz, a.reduced);
+    if (set != AV1G_TX_SET_DCTONLY) {
+        float bestJ = kInf;
+        const int n = set == AV1G_TX_SET_INTRA_1 ? 7 : 5;
+        for (int k = 0; k < n; k++) {
+            const int t = set == AV1G_TX_SET_INTRA_1 ? AV1G_T(Tx_Type_Intra_Inv_Set1)[k] : AV1G_T(Tx_Type_Intra_Inv_Set2)[k];
+            e.txType = t;
+            warp_fwd_ct<N, N>(S.res, S.tmp, e.txSz, t);
+            warp_quant_rate_rt<8>(S.tmp, S.q, e, o, N, N);
+            const float J = o.D + a.lambda * o.R;
+            if (J < bestJ) { bestJ = J; type = t; }
+        }
+    }
+    e.txType = type;
+    warp_fwd_ct<N, N>(S.res, S.tmp, e.txSz, type);
     warp_quant_rate_rt<8>(S.tmp, S.q, e, o, N, N);
-    inverseAddCt<L, L>(S.q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, S.res, S.pred, S.rec);
+    inverseAddCt<L, L>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, S.rec);
     float dSkip = e.resEnergy, rate = o.R;
     int sse = 0, any = 0;
     for (int i = lane; i < N * N; i += 32) {
@@ -2855,6 +2871,7 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         sse += d * d;
     }
     for (int i = lane; i < T * T; i += 32) any |= S.q[i];
+    const bool nzY = __any_sync(0xffffffffu, any != 0);
     float dCoded = (float)warp_sumi(sse);
     const int cw = a.w >> 1, ch = a.h >> 1;
     for (int p = 1; p <= 2; p++) {
@@ -2875,6 +2892,7 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         }
         __syncwarp();
         e.txSz = txSizeOf(LC, LC);
+        e.txType = AV1G_DCT_DCT;
         e.plane = p;
         e.skipCtx = 7;
         e.resEnergy = warp_sum(enC);
@@ -2913,6 +2931,7 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         }
         __syncwarp();
         *skipOut = skip;
+        if (typeOut) *typeOut = skip || !nzY ? AV1G_DCT_DCT : type;   // an all-zero luma transform codes no type
     }
     return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
 }
@@ -2981,13 +3000,13 @@ __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            int mode = s - 1, skip = 0;
+            int mode = s - 1, skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
             switch (be.lw) {
-            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
-            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
-            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
-            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip); break;
+            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
+            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
+            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
+            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip, &type); break;
             }
             const int u = 1 << (be.lw - 3);
             for (int i = lane; i < u * u; i += 32) {
@@ -2996,7 +3015,7 @@ __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
                 bi.yMode = (uint8_t)mode;
                 bi.skip = (uint8_t)skip;
                 bi.txSplit = 0;
-                bi.txTypes = 0;
+                bi.txTypes = (uint16_t)(type * 0x1111);
                 bi.filter = 0;
             }
             __syncwarp();

@@ -827,7 +827,7 @@ struct TileCoder {
         const int lx4 = plane ? x4 << 1 : x4, ly4 = plane ? y4 << 1 : y4;
         const pf::BlockInfo &gb = grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)];
         int txType = (gb.txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
-        if (gb.intra) txType = AV1G_DCT_DCT;   // luma DCT_DCT; chroma: Mode_To_Txfm[UV_DC_PRED]
+        if (gb.intra && plane) txType = AV1G_DCT_DCT;   // chroma: Mode_To_Txfm[UV_DC_PRED]
         else if (plane) txType = interChromaType(txType, txSz, fs->reducedTxSet);
         const uint16_t *scan = av1g_get_scan(txSz, txType);
         const int n = imin(tw, 32) * imin(th, 32);
