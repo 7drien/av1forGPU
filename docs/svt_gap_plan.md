@@ -781,3 +781,11 @@ kernel (temporary).
   and block lists are rebuilt). dav1d-exact; video_2 -0.07%, video_1 / video_5 0.00% (rarely chosen: each child pays
   its own mode bits, and only blocks whose 64x64 intra option passed the bound are tried). `AV1GPU_PF_INTRA_NOQUAD`,
   `AV1GPU_PF_INTRA_QUADBITS`.
+- nsys timeline (video_2, 40 frames, q50): GPU busy 95% of the span, but only one kernel runs during 66% of it: the
+  frame is mostly a serial chain. Solo time: intraDecide<64> 139 ms (one warp per 64x64 block, 47 KB of shared memory:
+  2 CTAs per SM), intraRecon 72, tilePhaseBlocks 64 (entropy alone while the analysis waits on the host), proposeMotion
+  53, k_recon 44, k_cdef 42, evalSplit<64> 32, evaluate<64> 29. So work cut inside the 14 parallel shape streams does not
+  shorten the frame (filter-search skip, register cap, concurrent motion search: identical output, same time), while
+  serial steps do.
+- The four-quadrant intra split cost 6% of the encode (4.57 → 4.32 s) for -0.07%: now off (`AV1GPU_PF_INTRA_QUAD`).
+  The intra stage costs about 8% of a video_2 encode (4.35 vs 4.0 s with `--pf-no-intra`).

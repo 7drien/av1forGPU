@@ -4653,7 +4653,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
-        ia.splitIntra = !getenv("AV1GPU_PF_INTRA_NOQUAD");
+        ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
