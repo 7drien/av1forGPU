@@ -43,6 +43,7 @@ struct MotionField {
         for (int y = 0; y < h8; ++y)
             for (int x = 0; x < w8; ++x) {
                 const pf::BlockInfo &b = grid[size_t(y) * gcols + x];
+                if (b.intra) continue;   // RefFrames[0] = INTRA_FRAME: nothing saved
                 const int refs[2] = {refName[b.ref == 1 ? 1 : b.ref == 3 ? 2 : 0], b.ref == 2 ? refName[1] : -1};
                 const pf::Mv mvs[2] = {b.mv, b.mv2};
                 for (int list = 0; list < 2; ++list) {

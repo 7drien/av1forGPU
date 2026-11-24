@@ -33,6 +33,8 @@ struct BlockInfo {
     uint8_t ab;        // AV1 PARTITION_HORZ_A .. VERT_B when the block belongs to a three-way node, else 0
     uint8_t abLog2;    // log2 size of that node
     uint8_t filter;    // interp_filter: 0 EIGHTTAP, 1 SMOOTH, 2 SHARP
+    uint8_t intra;     // 1: intra block (square, one transform of the block size, DCT_DCT, UV_DC_PRED chroma)
+    uint8_t yMode;     // intra luma mode (DC, V, H, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH)
     // loop restoration of the 64x64 luma unit whose top-left 8x8 this is (set only there): lrUse 1 = Wiener with
     // LrWiener coefficients lrCoef[pass][0..2] (pass 0 vertical, 1 horizontal)
     int8_t lrUse;
@@ -64,6 +66,8 @@ struct Settings {
     bool rdoq = false;           // greedy rate-distortion optimized quantization (--pf-rdoq)
     bool modeRefine = true;      // recheck motion vectors on the final partition
     int modeRefinePasses = 6;    // passes of that check (each against the neighbours' vectors of the previous one)
+    bool intra = true;           // intra blocks in the inter frame (square blocks, decided after mode refinement)
+    float intraBits = 6.f;       // extra mode bits charged to an intra block in that decision
 };
 
 // In-loop filter parameters chosen for a P frame (the reconstruction already includes them).
@@ -93,6 +97,7 @@ struct EntropyIn {
     const Mv *motionField = nullptr;     // HostEntropy's copy of MotionFieldMvs[8][MiRows / 2][MiCols / 2]
     bool switchableFilter = false;
     bool skipMode = false;      // skip_mode_present (the app sets it only when SkipModeFrame = LAST, ALTREF)
+    bool filterIntra = false;   // enable_filter_intra of the sequence header (intra DC blocks <= 32x32 code the flag)
     int cdefBits = 0;           // cdef_bits (per-superblock CDEF presets)
     const int8_t *cdefIdx = nullptr;   // host copy of the per-64x64 presets (CPU tile coder; the GPU uses its own)
     int qindex = 100;

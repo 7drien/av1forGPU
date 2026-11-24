@@ -36,6 +36,7 @@ struct InterCdfs {
     uint16_t compMode[5][3], compRefType[5][3], compRef[3][3][3], compBwdRef[3][2][3], compoundMode[8][9];
     uint16_t txfmSplit[21][3];
     uint16_t skipMode[3][3];
+    uint16_t yMode[4][14];   // YModeCdf of inter frames (by Size_Group)
     uint16_t pad_;   // keep the state a multiple of 4 bytes (it is copied in 32-bit words)
 };
 // Default_Skip_Mode_Cdf (spec): skip_mode, context = above skip_mode + left skip_mode
@@ -46,6 +47,7 @@ struct EntropyState {
     InterCdfs inter;
 };
 static_assert(sizeof(EntropyState) % 4 == 0, "EntropyState is copied in 32-bit words");
+static_assert(sizeof(EntropyState) / 2 <= 65536, "symbol records address CDFs with 16-bit offsets");
 
 // Inter transform sets (spec 5.11.48 get_tx_set, is_inter = 1) and the position of a type in its set's
 // inter_tx_type alphabet (inverse of Tx_Type_Inter_Inv_Set1/2/3).
@@ -138,6 +140,7 @@ struct FrameSyntax {
     int signBias[8];      // RefFrameSignBias by reference frame (order hints)
     int useTmvp;          // use_ref_frame_mvs: temporal candidates from the projected motion field
     int skipMode;         // skip_mode_present (SkipModeFrame[0..1] = LAST_FRAME, ALTREF_FRAME)
+    int filterIntra;      // enable_filter_intra (sequence header)
     int cdefBits;         // cdef_bits: cdef_idx literal at the first non-skip block of each 64x64
     const int8_t *cdefIdx;   // per 64x64 superblock (raster): its preset (-1 for superblocks without coded blocks)
     int width, height;    // FrameWidth, FrameHeight
@@ -822,14 +825,28 @@ struct TileCoder {
         // luma: the type chosen for this transform; inter chroma: the type of the luma 4x4 at the same position
         // (spec 7.13.3 get_tx_type; every type we use is in TX_SET_INTER_3, which chroma sizes also allow)
         const int lx4 = plane ? x4 << 1 : x4, ly4 = plane ? y4 << 1 : y4;
-        int txType = (grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)].txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
-        if (plane) txType = interChromaType(txType, txSz, fs->reducedTxSet);
+        const pf::BlockInfo &gb = grid[(ly4 >> 1) * fs->gcols + (lx4 >> 1)];
+        int txType = (gb.txTypes >> (4 * ((ly4 & 1) * 2 + (lx4 & 1)))) & 15;
+        if (gb.intra) txType = AV1G_DCT_DCT;   // luma DCT_DCT; chroma: Mode_To_Txfm[UV_DC_PRED]
+        else if (plane) txType = interChromaType(txType, txSz, fs->reducedTxSet);
         const uint16_t *scan = av1g_get_scan(txSz, txType);
         const int n = imin(tw, 32) * imin(th, 32);
         int eob = n;
         while (eob && !qv[scan[eob - 1]]) --eob;
         sym(cdf->txb_skip[txSzCtx][ctx], eob == 0, 2);
         if (!eob) return;
+        if (plane == 0 && gb.intra) {   // intra_tx_type (spec 5.11.47), intraDir = YMode
+            const int set = av1g_get_tx_set_intra(txSz, fs->reducedTxSet), sq = AV1G_T(Tx_Size_Sqr)[txSz];
+            if (set == AV1G_TX_SET_INTRA_1) {
+                int idx = 0;
+                for (int i = 0; i < 7; i++) if (AV1G_T(Tx_Type_Intra_Inv_Set1)[i] == txType) idx = i;
+                sym(cdf->intra_tx_set1[sq][gb.yMode], idx, 7);
+            } else if (set == AV1G_TX_SET_INTRA_2) {
+                int idx = 0;
+                for (int i = 0; i < 5; i++) if (AV1G_T(Tx_Type_Intra_Inv_Set2)[i] == txType) idx = i;
+                sym(cdf->intra_tx_set2[sq][gb.yMode], idx, 5);
+            }
+        } else
         // DCT_DCT in TX_SET_INTER_3 (64-point transforms use TX_SET_DCTONLY: nothing coded)
         if (plane == 0) {
             const int set = interTxSet(txSz, fs->reducedTxSet), sq = AV1G_T(Tx_Size_Sqr)[txSz];
@@ -903,10 +920,71 @@ struct TileCoder {
         m.txH = (uint8_t)(imin(lh, 6) - (lw == lh ? depth : (depth && lh > lw)));
         m.order = curOrder;
         m.filter = bi.filter;
+        if (bi.intra) {   // RefFrame = INTRA_FRAME, NONE; InterTxSizes = the block's transform
+            m.isInter = 0;
+            m.ref[0] = INTRA_FRAME;
+            m.ref[1] = -1;
+            m.mv[0] = m.mv[1] = pf::Mv{0, 0};
+            m.mode = bi.yMode;
+            m.filter = 0;
+            m.txW = (uint8_t)imin(lw, 6);
+            m.txH = (uint8_t)imin(lh, 6);
+        }
         const int rowEnd = imin(miRow + (1 << (lh - 2)), fs->miRows);
         const int colEnd = imin(miCol + (1 << (lw - 2)), fs->miCols);
         for (int r = miRow; r < rowEnd; ++r)
             for (int c = miCol; c < colEnd; ++c) at(r, c) = m;
+    }
+
+    // Phase 3 of an intra block (square, 8x8 .. 64x64): inter_frame_mode_info with is_inter = 0, then
+    // intra_block_mode_info (y_mode, angle_delta_y, uv_mode = UV_DC_PRED, use_filter_intra = 0), read_tx_size
+    // (tx_depth 0) and the coefficients of one transform per plane.
+    AV1G_HDI void intraBlock(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
+        const int skip = bi.skip;
+        if (lw != lh || lw < 3) { st.error = 9; return; }
+        const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
+        const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
+        const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
+        if (fs->skipMode) {
+            const int smCtx = (availU ? above->skipMode : 0) + (availL ? left->skipMode : 0);
+            sym(ic->skipMode[smCtx], 0, 2);
+        }
+        const int skipCtx = (availU ? above->skip : 0) + (availL ? left->skip : 0);
+        sym(cdf->skip[skipCtx], skip, 2);
+        if (fs->cdefBits && !skip) {
+            const int k = curOrder & 0xff;
+            bool first = true;
+            for (int i = 0; i < k && first; ++i)
+                if (!grid[(sbList[i].r >> 1) * fs->gcols + (sbList[i].c >> 1)].skip) first = false;
+            if (first) bits(fs->cdefIdx[curOrder >> 8], fs->cdefBits);
+        }
+        const bool aboveIntra = availU && !above->isInter, leftIntra = availL && !left->isInter;
+        int interCtx;
+        if (availU && availL) interCtx = (leftIntra && aboveIntra) ? 3 : (leftIntra || aboveIntra);
+        else if (availU || availL) interCtx = 2 * (availU ? aboveIntra : leftIntra);
+        else interCtx = 0;
+        sym(ic->isInter[interCtx], 0, 2);
+        const int mode = bi.yMode;
+        sym(ic->yMode[imin(lw - 2, 3)], mode, 13);   // Size_Group: 8x8 1, 16x16 2, 32x32 / 64x64 3
+        if (mode == AV1G_V_PRED || mode == AV1G_H_PRED) sym(cdf->angle_delta[mode - AV1G_V_PRED], 3, 7);   // delta 0
+        if (lw <= 5) sym(cdf->uv_mode_cfl_allowed[mode], 0, 14);
+        else sym(cdf->uv_mode_cfl_not_allowed[mode], 0, 13);
+        const int bsize = lw == 3 ? AV1G_BLOCK_8X8 : lw == 4 ? AV1G_BLOCK_16X16 : lw == 5 ? AV1G_BLOCK_32X32 : AV1G_BLOCK_64X64;
+        if (fs->filterIntra && mode == AV1G_DC_PRED && lw <= 5) sym(cdf->filter_intra[bsize], 0, 2);
+        if (fs->txModeSelect) {
+            // tx_depth = 0; context (spec): an inter neighbour contributes its block size, an intra one its transform
+            const int maxTx = imin(lw, 6);
+            const int aboveW = !availU ? 0 : above->isInter ? above->wLog2 : above->txW;
+            const int leftH = !availL ? 0 : left->isInter ? left->hLog2 : left->txH;
+            const int ctx = (availU && aboveW >= maxTx) + (availL && leftH >= maxTx);
+            if (lw == 6) sym(cdf->tx_64x64[ctx], 0, 3);
+            else if (lw == 5) sym(cdf->tx_32x32[ctx], 0, 3);
+            else if (lw == 4) sym(cdf->tx_16x16[ctx], 0, 3);
+            else sym(cdf->tx_8x8[ctx], 0, 2);
+        }
+        if (skip) return;
+        const int bw4 = 1 << (lw - 2), bh4 = 1 << (lh - 2);
+        forTransforms(miRow, miCol, lw, lh, 0, [&](int p, int x4, int y4, int t) { coeffs(p, x4, y4, t, 4 * bw4, 4 * bh4); });
     }
 
     AV1G_HDI void block(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
@@ -931,6 +1009,10 @@ struct TileCoder {
             fillModeInfo(miRow, miCol, lw, lh, bi);
             if (!skip) forTransformAreas(miRow, miCol, lw, lh, depth, [&](int p, int px, int py, int t) { txContextDirect(p, px, py, t); });
             return;
+        }
+        if (bi.intra) {
+            if (phase == 3) intraBlock(miRow, miCol, lw, lh, bi);
+            return;   // phase 2: the mode is the intra mode set by fillModeInfo
         }
         const pf::Mv target[2] = {bi.mv, bi.mv2};
         Stack s;

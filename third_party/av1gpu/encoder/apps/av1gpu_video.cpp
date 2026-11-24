@@ -361,6 +361,8 @@ int main(int argc, char **argv) {
             pfSettings.blocks8 = false;
         } else if (!strcmp(argv[i], "--pf-no-rect4")) {
             pfSettings.rect4 = false;
+        } else if (!strcmp(argv[i], "--pf-no-intra")) {
+            pfSettings.intra = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
             pfSettings.modeRefine = false;
         } else if (!strcmp(argv[i], "--pf-square-prune") && i + 1 < argc) {
@@ -538,7 +540,8 @@ int main(int argc, char **argv) {
     FILE *reconDump = getenv("AV1GPU_DUMP_RECON") ? fopen(getenv("AV1GPU_DUMP_RECON"), "wb") : nullptr;
     pf::Analyzer pfAnalyzer;
     double pfBits[4] = {};
-    double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0;
+    double pfMs = 0, pfFilterMs = 0, pfWriteMs = 0, kfEncodeMs = 0, kfEntropyMs = 0;
+    int kfCount = 0;
     uint64_t rcPeriods = 0;
     uint64_t pfModes[4] = {}, pfCompound = 0;
     if (usePframes) {
@@ -911,6 +914,7 @@ int main(int argc, char **argv) {
             ein.txModeSelect = pfSettings.txSplit;
             ein.reducedTxSet = pfSettings.txTypes < 2;
             ein.switchableFilter = pfSettings.switchableFilter;
+            ein.filterIntra = cfg.P.filterIntra != 0;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;
@@ -1255,10 +1259,15 @@ int main(int argc, char **argv) {
                 GpDevRecords records;
                 av1g_set_video_order_hint(kOrderHintBits, int(frameCount & ((1u << kOrderHintBits) - 1)));
                 for (int &v : slotHint) v = int(frameCount & ((1u << kOrderHintBits) - 1));
+                const auto kt0 = std::chrono::steady_clock::now();
                 if (ke.encode(inputs, frames, times, err, 0, &records)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+                const auto kt1 = std::chrono::steady_clock::now();
                 std::vector<std::vector<std::vector<uint8_t>>> tiles;
                 double entropyMs = 0;
                 int status = gp_entropy_dev(records, 0, scratch, tiles, &entropyMs, err);
+                kfEncodeMs += std::chrono::duration<double, std::milli>(kt1 - kt0).count();
+                kfEntropyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - kt1).count();
+                ++kfCount;
                 gp_dev_records_free(records, 0);
                 if (status) { fprintf(stderr, "entropy: %s\n", err.c_str()); return 1; }
                 Job kj;
@@ -1652,6 +1661,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "P-frame bits: mode/partition %.0f, mv %.0f, luma coeff %.0f, chroma coeff %.0f\n",
                 pfBits[0], pfBits[1], pfBits[2], pfBits[3]),
         fprintf(stderr, "P-frame filters %.1f ms, syntax %.1f ms, loop restoration in %d frames, scene cuts %llu\n", pfFilterMs, pfWriteMs, pfLrFrames, (unsigned long long)pfCuts),
+        fprintf(stderr, "key frames %d: encode %.1f ms, entropy %.1f ms (wall)\n", kfCount, kfEncodeMs, kfEntropyMs),
         fprintf(stderr, "P-frame analysis %.1f ms; compound blocks %llu; modes nearest %llu near %llu global %llu new %llu\n", pfMs,
                 (unsigned long long)pfCompound,
                 (unsigned long long)pfModes[0], (unsigned long long)pfModes[1], (unsigned long long)pfModes[2],

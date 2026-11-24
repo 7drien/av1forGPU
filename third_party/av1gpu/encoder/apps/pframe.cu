@@ -2394,6 +2394,37 @@ __device__ __host__ inline void tileOfSb(const TileJob &j, int miRow, int miCol,
     tr = 0;
     while (tr + 1 < j.tileRows && j.rowStart[tr + 1] <= miRow) ++tr;
 }
+// Default inter-frame CDFs (spec Default_*_Cdf) of the adaptive symbols in pft2::InterCdfs.
+static void defaultInterCdfs(pft2::InterCdfs &d) {
+    memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
+    memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
+    memcpy(d.newMv, pft::Default_New_Mv_Cdf, sizeof d.newMv);
+    memcpy(d.zeroMv, pft::Default_Zero_Mv_Cdf, sizeof d.zeroMv);
+    memcpy(d.refMv, pft::Default_Ref_Mv_Cdf, sizeof d.refMv);
+    memcpy(d.drl, pft::Default_Drl_Mode_Cdf, sizeof d.drl);
+    memcpy(d.mvJoint, pft::Default_Mv_Joint_Cdf, sizeof d.mvJoint);
+    for (int c = 0; c < 2; c++) {
+        memcpy(d.mvSign[c], pft::Default_Mv_Sign_Cdf, sizeof d.mvSign[c]);
+        memcpy(d.mvClass[c], pft::Default_Mv_Class_Cdf[c], sizeof d.mvClass[c]);
+        memcpy(d.class0Bit[c], pft::Default_Mv_Class0_Bit_Cdf, sizeof d.class0Bit[c]);
+        memcpy(d.class0Fr[c], pft::Default_Mv_Class0_Fr_Cdf[c], sizeof d.class0Fr[c]);
+        memcpy(d.mvFr[c], pft::Default_Mv_Fr_Cdf[c], sizeof d.mvFr[c]);
+        memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
+    }
+    memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
+    memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
+    memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
+    { const uint16_t uw[3] = {11570, 32768, 0}; memcpy(d.useWiener, uw, sizeof uw); }
+    memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
+    memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
+    memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
+    memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
+    memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
+    memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
+    memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
+    memcpy(d.skipMode, pft2::kDefaultSkipModeCdf, sizeof d.skipMode);
+    memcpy(d.yMode, pft::Default_Y_Mode_Cdf, sizeof d.yMode);
+}
 __global__ void initFrameCdfs(pft2::EntropyState *out, const pft2::EntropyState *primary, const pft2::InterCdfs *defaults,
                               int qindex) {
     if (threadIdx.x || blockIdx.x) return;
@@ -2704,6 +2735,276 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
             if (trial.skipMode) bi.ref = 2;
             changed[y * cols + x] = 1;
         }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Intra blocks in the inter frame. Square blocks (8x8 .. 64x64) inside the frame may switch to intra prediction: luma
+// DC / V / H / SMOOTH / SMOOTH_V / SMOOTH_H / PAETH (they read no above-right or below-left samples, and the intra edge
+// filter leaves them unchanged), UV_DC_PRED chroma, one DCT_DCT transform per plane. intraDecide chooses with the inter
+// reconstruction around each block (all blocks in parallel); intraRecon then predicts and reconstructs the chosen
+// blocks from their final neighbours in decode order: a superblock with intra blocks waits for its left, above and
+// above-left neighbours (one launch, superblocks taken by ticket in wavefront order).
+constexpr int kIntraModes = 7;
+__constant__ uint8_t c_intraModes[kIntraModes] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED,
+                                                   AV1G_SMOOTH_V_PRED, AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
+struct IntraArgs {
+    TileJob j;   // grid, decode-order block lists, tile layout
+    BlockInfo *grid;   // writable view of j.grid
+    const uint8_t *src[3];
+    int pitch[3];
+    uint8_t *recon;       // tight YUV420 (reconstruction before the in-loop filters)
+    int16_t *levels;      // aligned planes
+    int w, h, aw, ah;
+    int qindex, qctx, reduced;
+    float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
+    const Cand *cand[kSizes];
+    int cols[kSizes];
+    const ModeTrial *trials;   // refinement state (accepted trials' costs), or null
+    uint8_t *sel;
+    int *done;
+    unsigned *ticket;
+    int tag;
+};
+template <int N>
+struct IntraScratch {
+    static constexpr int T = N > 32 ? 32 : N, C = N / 2;
+    uint8_t pred[N * N], rec[N * N];
+    int16_t res[N * N];
+    float tmp[T * (N + 1)];
+    int16_t q[T * T];
+    uint8_t predC[2][C * C], recC[2][C * C];
+    int16_t qC[2][C * C];
+    uint8_t above[N + 4], left[N + 4];   // [0] = AboveRow[-1] / LeftCol[-1]
+};
+// AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
+// inside the frame, so the above-right and frame limits do not matter for these indices). L2 loads: other
+// superblocks' samples were written by other CTAs of the same launch.
+__device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int n, bool haveA, bool haveL, uint8_t *ab,
+                           uint8_t *lb) {
+    const int lane = threadIdx.x & 31;
+    for (int i = lane; i < n; i += 32) {
+        ab[1 + i] = haveA ? __ldcg(plane + size_t(y - 1) * pitch + x + i) : haveL ? __ldcg(plane + size_t(y) * pitch + x - 1) : 127;
+        lb[1 + i] = haveL ? __ldcg(plane + size_t(y + i) * pitch + x - 1) : haveA ? __ldcg(plane + size_t(y - 1) * pitch + x) : 129;
+    }
+    if (!lane) {
+        const uint8_t c = haveA && haveL ? __ldcg(plane + size_t(y - 1) * pitch + x - 1)
+                        : haveA ? __ldcg(plane + size_t(y - 1) * pitch + x)
+                        : haveL ? __ldcg(plane + size_t(y) * pitch + x - 1) : 128;
+        ab[0] = lb[0] = c;
+    }
+    __syncwarp();
+}
+__device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw, const uint8_t *ab, const uint8_t *lb) {
+    return mode == AV1G_DC_PRED ? dc : av1g_pred_pixel(mode, mode == AV1G_V_PRED ? 90 : mode == AV1G_H_PRED ? 180 : 0, i, j, lw, lw, ab, lb);
+}
+// One intra block (warp). mode < 0: choose the luma mode by SAD first. Returns the rate-distortion cost of the best
+// of skip and coded; with write, stores the reconstruction and levels of that option and sets *skipOut.
+template <int L>
+__device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
+                            bool write, int *skipOut) {
+    constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
+    const int lane = threadIdx.x & 31;
+    const uint8_t *src = a.src[0];
+    const int sp = a.pitch[0];
+    intraEdges(a.recon, a.w, x0, y0, N, haveA, haveL, S.above, S.left);
+    const uint8_t *ab = S.above + 1, *lb = S.left + 1;
+    const int dcY = av1g_dc_value<8>(ab, lb, haveL, haveA, L, L);
+    if (mode < 0) {
+        int best = 0x7fffffff;
+        for (int k = 0; k < kIntraModes; k++) {
+            const int m = c_intraModes[k];
+            int sad = 0;
+            for (int i = lane; i < N * N; i += 32) {
+                const int r = i >> L, c = i & (N - 1);
+                sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, L, ab, lb));
+            }
+            sad = warp_sumi(sad);
+            if (sad < best) { best = sad; mode = m; }
+        }
+    }
+    const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
+    float en = 0.f;
+    for (int i = lane; i < N * N; i += 32) {
+        const int r = i >> L, c = i & (N - 1);
+        const int p = intraPixel(mode, dcY, r, c, L, ab, lb);
+        const int d = (int)src[(y0 + r) * sp + x0 + c] - p;
+        S.pred[i] = (uint8_t)p;
+        S.res[i] = (int16_t)d;
+        en += (float)(d * d);
+    }
+    __syncwarp();
+    EvalIn e{};
+    e.txSz = txSizeOf(L, L);
+    e.txType = AV1G_DCT_DCT;
+    e.plane = 0;
+    e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
+    e.rnd = a.rnd; e.zbin = a.zbin;
+    e.skipCtx = 0; e.dcCtx = 0; e.intraDir = mode; e.reduced = a.reduced;
+    e.C = g_cost[a.qctx];
+    e.resEnergy = warp_sum(en);
+    e.qmDist = 0; e.qmRnd = 0;
+    EvalOut o;
+    warp_fwd_ct<N, N>(S.res, S.tmp, e.txSz, AV1G_DCT_DCT);
+    warp_quant_rate_rt<8>(S.tmp, S.q, e, o, N, N);
+    inverseAddCt<L, L>(S.q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, S.res, S.pred, S.rec);
+    float dSkip = e.resEnergy, rate = o.R;
+    int sse = 0, any = 0;
+    for (int i = lane; i < N * N; i += 32) {
+        const int r = i >> L, c = i & (N - 1);
+        const int d = (int)src[(y0 + r) * sp + x0 + c] - S.rec[i];
+        sse += d * d;
+    }
+    for (int i = lane; i < T * T; i += 32) any |= S.q[i];
+    float dCoded = (float)warp_sumi(sse);
+    const int cw = a.w >> 1, ch = a.h >> 1;
+    for (int p = 1; p <= 2; p++) {
+        const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(p - 1) * cw * ch;
+        const uint8_t *cs = a.src[p];
+        const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
+        intraEdges(plane, cw, cx, cy, C, haveA, haveL, S.above, S.left);
+        const int dc = av1g_dc_value<8>(S.above + 1, S.left + 1, haveL, haveA, LC, LC);
+        uint8_t *pr = S.predC[p - 1], *rc = S.recC[p - 1];
+        int16_t *q = S.qC[p - 1];
+        float enC = 0.f;
+        for (int i = lane; i < C * C; i += 32) {
+            const int r = i >> LC, c = i & (C - 1);
+            const int d = (int)cs[(cy + r) * cp + cx + c] - dc;
+            pr[i] = (uint8_t)dc;
+            S.res[i] = (int16_t)d;
+            enC += (float)(d * d);
+        }
+        __syncwarp();
+        e.txSz = txSizeOf(LC, LC);
+        e.plane = p;
+        e.skipCtx = 7;
+        e.resEnergy = warp_sum(enC);
+        warp_fwd_ct<C, C>(S.res, S.tmp, e.txSz, AV1G_DCT_DCT);
+        warp_quant_rate_rt<8>(S.tmp, q, e, o, C, C);
+        inverseAddCt<LC, LC>(q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, S.res, pr, rc);
+        int sseC = 0;
+        for (int i = lane; i < C * C; i += 32) {
+            const int r = i >> LC, c = i & (C - 1);
+            const int d = (int)cs[(cy + r) * cp + cx + c] - rc[i];
+            sseC += d * d;
+            any |= q[i];
+        }
+        dCoded += (float)warp_sumi(sseC);
+        dSkip += e.resEnergy;
+        rate += o.R;
+    }
+    const bool nz = __any_sync(0xffffffffu, any != 0);
+    const float jCoded = dCoded + a.lambda * (rate + a.skipBits0), jSkip = dSkip + a.lambda * a.skipBits1;
+    const bool skip = !nz || jSkip <= jCoded;
+    if (write) {
+        for (int i = lane; i < N * N; i += 32) {
+            const int r = i >> L, c = i & (N - 1);
+            a.recon[size_t(y0 + r) * a.w + x0 + c] = skip ? S.pred[i] : S.rec[i];
+            a.levels[size_t(y0 + r) * a.aw + x0 + c] = (!skip && r < T && c < T) ? S.q[r * T + c] : (int16_t)0;
+        }
+        for (int p = 1; p <= 2; p++) {
+            uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(p - 1) * cw * ch;
+            int16_t *lv = a.levels + size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2);
+            const int cx = x0 >> 1, cy = y0 >> 1;
+            for (int i = lane; i < C * C; i += 32) {
+                const int r = i >> LC, c = i & (C - 1);
+                plane[size_t(cy + r) * cw + cx + c] = skip ? S.predC[p - 1][i] : S.recC[p - 1][i];
+                lv[size_t(cy + r) * (a.aw / 2) + cx + c] = skip ? (int16_t)0 : S.qC[p - 1][i];
+            }
+        }
+        __syncwarp();
+        *skipOut = skip;
+    }
+    return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
+}
+__device__ __forceinline__ void intraAvail(const TileJob &j, int miRow, int miCol, bool &haveA, bool &haveL) {
+    int tr, tc;
+    tileOfSb(j, miRow, miCol, tr, tc);
+    haveA = miRow > j.rowStart[tr];
+    haveL = miCol > j.colStart[tc];
+}
+template <int L>
+__global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecide(IntraArgs a) {
+    constexpr int N = 1 << L, WARPS = L >= 6 ? 1 : L == 5 ? 2 : 4, U = N / 8, K = L - 3;
+    __shared__ IntraScratch<N> S[WARPS];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gcols = a.j.fs.gcols, bcols = (gcols + U - 1) / U;
+    const int idx = blockIdx.x * WARPS + warp;
+    const int gx = (idx % bcols) * U, gy = (idx / bcols) * U;
+    if (gy * 8 >= a.h) return;
+    const BlockInfo bi = a.j.grid[gy * gcols + gx];
+    const int x0 = gx * 8, y0 = gy * 8;
+    if (bi.log2 != L || bi.part || x0 + N > a.w || y0 + N > a.h) return;
+    const Cand &c = a.cand[K][(gy >> K) * a.cols[K] + (gx >> K)];
+    float jInter = bi.skip ? c.costSkip : c.costCoded;
+    if (a.trials) {
+        const ModeTrial &t = a.trials[gy * gcols + gx];
+        if (t.refined) jInter = t.curCost + a.lambda * c.mvBits * a.mvWeight;
+    }
+    bool haveA, haveL;
+    intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
+    int mode = -1;
+    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, false, nullptr);
+    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint8_t)(mode + 1) : 0;
+}
+__global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
+    __shared__ IntraScratch<64> S;
+    __shared__ int sbShared;
+    const int lane = threadIdx.x;
+    const int sbCols = a.j.sbCols, sbRows = a.j.sbRows, gcols = a.j.fs.gcols;
+    if (!lane) {
+        int t = (int)atomicAdd(a.ticket, 1u);
+        for (int d = 0;; d++) {   // the t-th superblock in (anti-diagonal, row) order
+            const int r0 = max(0, d - (sbCols - 1)), r1 = min(d, sbRows - 1), n = r1 - r0 + 1;
+            if (t < n) { sbShared = (r0 + t) * sbCols + d - (r0 + t); break; }
+            t -= n;
+        }
+    }
+    __syncwarp();
+    const int sb = sbShared, sr = sb / sbCols, sc = sb % sbCols;
+    const int n = (int)a.j.entryCount[sb];
+    const pft2::BlockEntry *list = a.j.entries + size_t(sb) * 64;
+    bool any = false;
+    for (int k = lane; k < n; k += 32) any |= a.sel[(list[k].r >> 1) * gcols + (list[k].c >> 1)] != 0;
+    if (__any_sync(0xffffffffu, any)) {
+        if (!lane) {
+            const volatile int *done = a.done;
+            if (sr > 0) while (done[(sr - 1) * sbCols + sc] != a.tag) {}
+            if (sc > 0) while (done[sr * sbCols + sc - 1] != a.tag) {}
+            if (sr > 0 && sc > 0) while (done[(sr - 1) * sbCols + sc - 1] != a.tag) {}
+            __threadfence();
+        }
+        __syncwarp();
+        for (int k = 0; k < n; k++) {
+            const pft2::BlockEntry be = list[k];
+            const int gx = be.c >> 1, gy = be.r >> 1;
+            const int s = a.sel[gy * gcols + gx];
+            if (!s) continue;
+            bool haveA, haveL;
+            intraAvail(a.j, be.r, be.c, haveA, haveL);
+            int mode = s - 1, skip = 0;
+            const int x0 = gx * 8, y0 = gy * 8;
+            switch (be.lw) {
+            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
+            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
+            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip); break;
+            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip); break;
+            }
+            const int u = 1 << (be.lw - 3);
+            for (int i = lane; i < u * u; i += 32) {
+                BlockInfo &bi = a.grid[(gy + i / u) * gcols + gx + i % u];
+                bi.intra = 1;
+                bi.yMode = (uint8_t)mode;
+                bi.skip = (uint8_t)skip;
+                bi.txSplit = 0;
+                bi.txTypes = 0;
+                bi.filter = 0;
+            }
+            __syncwarp();
+        }
+    }
+    __threadfence();
+    __syncwarp();
+    if (!lane) atomicExch(a.done + sb, a.tag);
 }
 
 // Phases 2 and 3: one thread per block of the lists.
@@ -3196,6 +3497,10 @@ struct State {
     pft2::MiInfo *modeMi = nullptr;
     pft2::BlockEntry *modeEntries = nullptr;
     uint32_t *modeEntryCount = nullptr;
+    uint8_t *intraSel = nullptr;       // per grid unit: intra mode + 1 chosen for the block starting there, 0 inter
+    int *intraDone = nullptr;          // per superblock: frame tag once its intra blocks are reconstructed
+    unsigned *intraTicket = nullptr;
+    int intraTag = 0;
     MotionOptions *modeMenus = nullptr;
     int *modeCounts = nullptr, *modeIndices[kShapes] = {};
     bool havePrev = false;
@@ -3315,6 +3620,7 @@ Analyzer::~Analyzer() {
     cudaFree(s->prevGrid);
     cudaFree(s->modeTrials); cudaFree(s->modeChanged); cudaFree(s->modeMi);
     cudaFree(s->modeEntries); cudaFree(s->modeEntryCount);
+    cudaFree(s->intraSel); cudaFree(s->intraDone); cudaFree(s->intraTicket);
     cudaFree(s->modeMenus); cudaFree(s->modeCounts); cudaFree(s->modeIndices[0]);
     cudaFree(s->pfScratch);
     cudaFree(s->filterCandidates);
@@ -3493,6 +3799,10 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->modeMi, sizeof(pft2::MiInfo) * miCols * miRows);
         alloc(&s->modeEntries, sizeof(pft2::BlockEntry) * nSb * 64);
         alloc(&s->modeEntryCount, sizeof(uint32_t) * nSb);
+        alloc(&s->intraSel, gridCount());
+        alloc(&s->intraDone, sizeof(int) * nSb);
+        alloc(&s->intraTicket, sizeof(unsigned));
+        if (e == cudaSuccess) e = cudaMemset(s->intraDone, 0, sizeof(int) * nSb);
         alloc(&s->modeMenus, sizeof(MotionOptions) * nSb * 64);
         alloc(&s->modeCounts, sizeof(int) * kShapes);
         size_t offsets[kShapes + 1] = {};
@@ -3526,33 +3836,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
             if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&es.fetch, cudaStreamNonBlocking);
         }
         pft2::InterCdfs d{};
-        memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
-        memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
-        memcpy(d.newMv, pft::Default_New_Mv_Cdf, sizeof d.newMv);
-        memcpy(d.zeroMv, pft::Default_Zero_Mv_Cdf, sizeof d.zeroMv);
-        memcpy(d.refMv, pft::Default_Ref_Mv_Cdf, sizeof d.refMv);
-        memcpy(d.drl, pft::Default_Drl_Mode_Cdf, sizeof d.drl);
-        memcpy(d.mvJoint, pft::Default_Mv_Joint_Cdf, sizeof d.mvJoint);
-        for (int c = 0; c < 2; c++) {
-            memcpy(d.mvSign[c], pft::Default_Mv_Sign_Cdf, sizeof d.mvSign[c]);
-            memcpy(d.mvClass[c], pft::Default_Mv_Class_Cdf[c], sizeof d.mvClass[c]);
-            memcpy(d.class0Bit[c], pft::Default_Mv_Class0_Bit_Cdf, sizeof d.class0Bit[c]);
-            memcpy(d.class0Fr[c], pft::Default_Mv_Class0_Fr_Cdf[c], sizeof d.class0Fr[c]);
-            memcpy(d.mvFr[c], pft::Default_Mv_Fr_Cdf[c], sizeof d.mvFr[c]);
-            memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
-        }
-        memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
-        memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
-        memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
-        { const uint16_t uw[3] = {11570, 32768, 0}; memcpy(d.useWiener, uw, sizeof uw); }
-        memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
-        memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
-        memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
-        memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
-        memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
-        memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
-        memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
-        memcpy(d.skipMode, pft2::kDefaultSkipModeCdf, sizeof d.skipMode);
+        defaultInterCdfs(d);
         if (e == cudaSuccess) e = cudaMemcpy(s->defaultInter, &d, sizeof d, cudaMemcpyHostToDevice);
     }
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(c_filter, pft::Subpel_Filters, sizeof(pft::Subpel_Filters));
@@ -3979,6 +4263,42 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         }
     }
+    if (st.intra) {
+        // intra blocks (see intraDecide / intraRecon)
+        FineTimer t("intra blocks");
+        IntraArgs ia{};
+        setTileLayout(ia.j, f.w8 * 2, f.h8 * 2, syntax.tileColsLog2, syntax.tileRowsLog2);
+        ia.j.fs.gcols = s->gcols;
+        ia.j.grid = s->grid;
+        ia.grid = s->grid;
+        ia.j.entries = s->modeEntries;
+        ia.j.entryCount = s->modeEntryCount;
+        const int nSb = ia.j.sbCols * ia.j.sbRows;
+        if (!(st.modeRefine && st.modeRefinePasses > 0)) tilePhase1<<<(nSb + 63) / 64, 64, 0, stream>>>(ia.j);
+        for (int p = 0; p < 3; p++) { ia.src[p] = src[p]; ia.pitch[p] = pitch[p]; }
+        ia.recon = recon;
+        ia.levels = s->outLevels;
+        ia.w = w; ia.h = h; ia.aw = aw; ia.ah = ah;
+        ia.qindex = st.qindex; ia.qctx = ea.qctx; ia.reduced = ea.reducedTxSet;
+        ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
+        ia.intraBits = getenv("AV1GPU_PF_INTRABITS") ? (float)atof(getenv("AV1GPU_PF_INTRABITS")) : st.intraBits;
+        ia.modeBase = ea.modeBase; ia.skipBits0 = ea.skipBits0; ia.skipBits1 = ea.skipBits1;
+        ia.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
+        for (int k = 0; k < kSizes; k++) { ia.cand[k] = s->cand[k]; ia.cols[k] = s->cols[k]; }
+        ia.trials = st.modeRefine && st.modeRefinePasses > 0 ? s->modeTrials : nullptr;
+        ia.sel = s->intraSel;
+        ia.done = s->intraDone;
+        ia.ticket = s->intraTicket;
+        ia.tag = ++s->intraTag;
+        cudaMemsetAsync(s->intraSel, 0, gridCount(), stream);
+        cudaMemsetAsync(s->intraTicket, 0, sizeof(unsigned), stream);
+        const int gc = s->gcols, gr = s->grows;
+        intraDecide<6><<<((gc + 7) / 8) * ((gr + 7) / 8), 32, 0, stream>>>(ia);
+        intraDecide<5><<<(((gc + 3) / 4) * ((gr + 3) / 4) + 1) / 2, 64, 0, stream>>>(ia);
+        intraDecide<4><<<(((gc + 1) / 2) * ((gr + 1) / 2) + 3) / 4, 128, 0, stream>>>(ia);
+        intraDecide<3><<<(gc * gr + 3) / 4, 128, 0, stream>>>(ia);
+        intraRecon<<<nSb, 32, 0, stream>>>(ia);
+    }
 #undef PF_EVAL_RECTS
 #undef PF_REVAL
 #undef PF_EVAL
@@ -4032,6 +4352,7 @@ int Analyzer::entropyLaunch(const EntropyIn &in, int k, char *err, int errLen) {
     j.fs.reducedTxSet = in.reducedTxSet;
     j.fs.switchable = in.switchableFilter;
     j.fs.skipMode = in.skipMode;
+    j.fs.filterIntra = in.filterIntra;
     j.fs.cdefBits = in.cdefBits;
     j.fs.cdefIdx = es.cdef;
     j.fs.lrLuma = in.lrLuma; j.fs.width = w; j.fs.height = h;
@@ -4248,33 +4569,7 @@ int HostEntropy::init(int width, int height, char *, int) {
     s->ecBuf.resize(size_t(aw) * ah * 3 / 2 + 65536);
     s->out.resize(s->ecBuf.size());
     pft2::InterCdfs &d = s->defaults;
-    memcpy(d.isInter, pft::Default_Is_Inter_Cdf, sizeof d.isInter);
-    memcpy(d.singleRef, pft::Default_Single_Ref_Cdf, sizeof d.singleRef);
-    memcpy(d.newMv, pft::Default_New_Mv_Cdf, sizeof d.newMv);
-    memcpy(d.zeroMv, pft::Default_Zero_Mv_Cdf, sizeof d.zeroMv);
-    memcpy(d.refMv, pft::Default_Ref_Mv_Cdf, sizeof d.refMv);
-    memcpy(d.drl, pft::Default_Drl_Mode_Cdf, sizeof d.drl);
-    memcpy(d.mvJoint, pft::Default_Mv_Joint_Cdf, sizeof d.mvJoint);
-    for (int c = 0; c < 2; c++) {
-        memcpy(d.mvSign[c], pft::Default_Mv_Sign_Cdf, sizeof d.mvSign[c]);
-        memcpy(d.mvClass[c], pft::Default_Mv_Class_Cdf[c], sizeof d.mvClass[c]);
-        memcpy(d.class0Bit[c], pft::Default_Mv_Class0_Bit_Cdf, sizeof d.class0Bit[c]);
-        memcpy(d.class0Fr[c], pft::Default_Mv_Class0_Fr_Cdf[c], sizeof d.class0Fr[c]);
-        memcpy(d.mvFr[c], pft::Default_Mv_Fr_Cdf[c], sizeof d.mvFr[c]);
-        memcpy(d.mvBit[c], pft::Default_Mv_Bit_Cdf, sizeof d.mvBit[c]);
-    }
-    memcpy(d.txSet3, pft::Default_Inter_Tx_Type_Set3_Cdf, sizeof d.txSet3);
-        memcpy(d.txSet1, pft::Default_Inter_Tx_Type_Set1_Cdf, sizeof d.txSet1);
-        memcpy(d.interpFilter, pft::Default_Interp_Filter_Cdf, sizeof d.interpFilter);
-        { const uint16_t uw[3] = {11570, 32768, 0}; memcpy(d.useWiener, uw, sizeof uw); }
-        memcpy(d.txSet2, pft::Default_Inter_Tx_Type_Set2_Cdf, sizeof d.txSet2);
-    memcpy(d.compMode, pft::Default_Comp_Mode_Cdf, sizeof d.compMode);
-    memcpy(d.compRefType, pft::Default_Comp_Ref_Type_Cdf, sizeof d.compRefType);
-    memcpy(d.compRef, pft::Default_Comp_Ref_Cdf, sizeof d.compRef);
-    memcpy(d.compBwdRef, pft::Default_Comp_Bwd_Ref_Cdf, sizeof d.compBwdRef);
-    memcpy(d.compoundMode, pft::Default_Compound_Mode_Cdf, sizeof d.compoundMode);
-        memcpy(d.txfmSplit, pft::Default_Txfm_Split_Cdf, sizeof d.txfmSplit);
-    memcpy(d.skipMode, pft2::kDefaultSkipModeCdf, sizeof d.skipMode);
+    defaultInterCdfs(d);
     return 0;
 }
 
@@ -4295,6 +4590,7 @@ int HostEntropy::code(const EntropyIn &in, const BlockInfo *grid, const int16_t 
     fs.reducedTxSet = in.reducedTxSet;
     fs.switchable = in.switchableFilter;
     fs.skipMode = in.skipMode;
+    fs.filterIntra = in.filterIntra;
     fs.cdefBits = in.cdefBits;
     fs.cdefIdx = in.cdefIdx;
     fs.lrLuma = in.lrLuma; fs.width = w; fs.height = h;
