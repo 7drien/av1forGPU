@@ -2767,15 +2767,20 @@ struct IntraArgs {
 };
 template <int N>
 struct IntraScratch {
-    static constexpr int T = N > 32 ? 32 : N, C = N / 2;
+    static constexpr int T = N > 32 ? 32 : N, C = N / 2, TC = C > 32 ? 32 : C;
     uint8_t pred[N * N], rec[N * N];
     int16_t res[N * N];
     float tmp[T * (N + 1)];
     int16_t q[T * T];
-    uint8_t predC[2][C * C], recC[2][C * C];
-    int16_t qC[2][C * C];
     uint8_t above[N + 4], left[N + 4];   // [0] = AboveRow[-1] / LeftCol[-1]
+    // chroma planes (own buffers: a warp per plane in intraRecon)
+    uint8_t predC[2][C * C], recC[2][C * C];
+    int16_t qC[2][C * C], resC[2][C * C];
+    float tmpC[2][TC * (C + 1)];
+    uint8_t aboveC[2][C + 4], leftC[2][C + 4];
 };
+// Rate-distortion terms of one plane of an intra block.
+struct IntraPart { float dSkip, dCoded, rate; int nz, type; };
 // AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
 // inside the frame, so the above-right and frame limits do not matter for these indices). L2 loads: other
 // superblocks' samples were written by other CTAs of the same launch.
@@ -2797,12 +2802,12 @@ __device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int n,
 __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw, const uint8_t *ab, const uint8_t *lb) {
     return mode == AV1G_DC_PRED ? dc : av1g_pred_pixel(mode, mode == AV1G_V_PRED ? 90 : mode == AV1G_H_PRED ? 180 : 0, i, j, lw, lw, ab, lb);
 }
-// One intra block (warp). mode < 0: choose the luma mode by SAD first. Returns the rate-distortion cost of the best
-// of skip and coded; with write, stores the reconstruction and levels of that option and sets *skipOut.
+// Luma of an intra block (one warp). mode < 0: choose the luma mode by SAD first; forcedType < 0: search the transform
+// type of the intra set (8x8 / 16x16) by the quantizer's estimate.
 template <int L>
-__device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            bool write, int *skipOut, int *typeOut = nullptr, int forcedType = -1) {
-    constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
+__device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
+                               int forcedType) {
+    constexpr int N = 1 << L, T = N > 32 ? 32 : N;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
     const int sp = a.pitch[0];
@@ -2844,11 +2849,10 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
-    // luma transform type: every type of the intra set (8x8 / 16x16) by the quantizer's estimate
     int type = AV1G_DCT_DCT;
     const int set = av1g_get_tx_set_intra(e.txSz, a.reduced);
     if (forcedType >= 0) {
-        type = forcedType;   // the decision pass's choice (reconstruction pass)
+        type = forcedType;
     } else if (set != AV1G_TX_SET_DCTONLY) {
         float bestJ = kInf;
         const int n = set == AV1G_TX_SET_INTRA_1 ? 7 : 5;
@@ -2865,7 +2869,6 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
     warp_fwd_ct<N, N>(S.res, S.tmp, e.txSz, type);
     warp_quant_rate_rt<8>(S.tmp, S.q, e, o, N, N);
     inverseAddCt<L, L>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, S.rec);
-    float dSkip = e.resEnergy, rate = o.R;
     int sse = 0, any = 0;
     for (int i = lane; i < N * N; i += 32) {
         const int r = i >> L, c = i & (N - 1);
@@ -2873,70 +2876,111 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         sse += d * d;
     }
     for (int i = lane; i < T * T; i += 32) any |= S.q[i];
-    const bool nzY = __any_sync(0xffffffffu, any != 0);
-    float dCoded = (float)warp_sumi(sse);
-    const int cw = a.w >> 1, ch = a.h >> 1;
-    for (int p = 1; p <= 2; p++) {
-        const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(p - 1) * cw * ch;
-        const uint8_t *cs = a.src[p];
-        const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
-        intraEdges(plane, cw, cx, cy, C, haveA, haveL, S.above, S.left);
-        const int dc = av1g_dc_value<8>(S.above + 1, S.left + 1, haveL, haveA, LC, LC);
-        uint8_t *pr = S.predC[p - 1], *rc = S.recC[p - 1];
-        int16_t *q = S.qC[p - 1];
-        float enC = 0.f;
-        for (int i = lane; i < C * C; i += 32) {
-            const int r = i >> LC, c = i & (C - 1);
-            const int d = (int)cs[(cy + r) * cp + cx + c] - dc;
-            pr[i] = (uint8_t)dc;
-            S.res[i] = (int16_t)d;
-            enC += (float)(d * d);
-        }
-        __syncwarp();
-        e.txSz = txSizeOf(LC, LC);
-        e.txType = AV1G_DCT_DCT;
-        e.plane = p;
-        e.skipCtx = 7;
-        e.resEnergy = warp_sum(enC);
-        warp_fwd_ct<C, C>(S.res, S.tmp, e.txSz, AV1G_DCT_DCT);
-        warp_quant_rate_rt<8>(S.tmp, q, e, o, C, C);
-        inverseAddCt<LC, LC>(q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, S.res, pr, rc);
-        int sseC = 0;
-        for (int i = lane; i < C * C; i += 32) {
-            const int r = i >> LC, c = i & (C - 1);
-            const int d = (int)cs[(cy + r) * cp + cx + c] - rc[i];
-            sseC += d * d;
-            any |= q[i];
-        }
-        dCoded += (float)warp_sumi(sseC);
-        dSkip += e.resEnergy;
-        rate += o.R;
+    IntraPart r;
+    r.nz = __any_sync(0xffffffffu, any != 0);
+    r.dCoded = (float)warp_sumi(sse);
+    r.dSkip = e.resEnergy;
+    r.rate = o.R;
+    r.type = r.nz ? type : AV1G_DCT_DCT;   // an all-zero luma transform codes no type
+    return r;
+}
+// Chroma plane p (1, 2) of an intra block, UV_DC_PRED (one warp).
+template <int L>
+__device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, int p, int x0, int y0, bool haveA, bool haveL) {
+    constexpr int C = (1 << L) / 2, LC = L - 1;
+    const int lane = threadIdx.x & 31;
+    const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
+    const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
+    const uint8_t *cs = a.src[p];
+    const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
+    intraEdges(plane, cw, cx, cy, C, haveA, haveL, S.aboveC[k], S.leftC[k]);
+    const int dc = av1g_dc_value<8>(S.aboveC[k] + 1, S.leftC[k] + 1, haveL, haveA, LC, LC);
+    uint8_t *pr = S.predC[k], *rc = S.recC[k];
+    int16_t *q = S.qC[k], *res = S.resC[k];
+    float en = 0.f;
+    for (int i = lane; i < C * C; i += 32) {
+        const int r = i >> LC, c = i & (C - 1);
+        const int d = (int)cs[(cy + r) * cp + cx + c] - dc;
+        pr[i] = (uint8_t)dc;
+        res[i] = (int16_t)d;
+        en += (float)(d * d);
     }
-    const bool nz = __any_sync(0xffffffffu, any != 0);
-    const float jCoded = dCoded + a.lambda * (rate + a.skipBits0), jSkip = dSkip + a.lambda * a.skipBits1;
-    const bool skip = !nz || jSkip <= jCoded;
-    if (write) {
+    __syncwarp();
+    const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
+    EvalIn e{};
+    e.txSz = txSizeOf(LC, LC);
+    e.txType = AV1G_DCT_DCT;
+    e.plane = p;
+    e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
+    e.rnd = a.rnd; e.zbin = a.zbin;
+    e.skipCtx = 7; e.dcCtx = 0; e.intraDir = 0; e.reduced = a.reduced;
+    e.C = g_cost[a.qctx];
+    e.resEnergy = warp_sum(en);
+    e.qmDist = 0; e.qmRnd = 0;
+    EvalOut o;
+    warp_fwd_ct<C, C>(res, S.tmpC[k], e.txSz, AV1G_DCT_DCT);
+    warp_quant_rate_rt<8>(S.tmpC[k], q, e, o, C, C);
+    inverseAddCt<LC, LC>(q, e.txSz, AV1G_DCT_DCT, dcQ, acQ, res, pr, rc);
+    int sse = 0, any = 0;
+    for (int i = lane; i < C * C; i += 32) {
+        const int r = i >> LC, c = i & (C - 1);
+        const int d = (int)cs[(cy + r) * cp + cx + c] - rc[i];
+        sse += d * d;
+        any |= q[i];
+    }
+    IntraPart r;
+    r.nz = __any_sync(0xffffffffu, any != 0);
+    r.dCoded = (float)warp_sumi(sse);
+    r.dSkip = e.resEnergy;
+    r.rate = o.R;
+    r.type = AV1G_DCT_DCT;
+    return r;
+}
+// Skip or coded, from the three planes' terms; returns the rate-distortion cost (mode bits included).
+__device__ __forceinline__ float intraCombine(const IntraArgs &a, const IntraPart *pt, bool &skip) {
+    const bool nz = pt[0].nz || pt[1].nz || pt[2].nz;
+    const float jCoded = pt[0].dCoded + pt[1].dCoded + pt[2].dCoded + a.lambda * (pt[0].rate + pt[1].rate + pt[2].rate + a.skipBits0);
+    const float jSkip = pt[0].dSkip + pt[1].dSkip + pt[2].dSkip + a.lambda * a.skipBits1;
+    skip = !nz || jSkip <= jCoded;
+    return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
+}
+// Store plane p of an intra block (reconstruction and levels of the chosen option).
+template <int L>
+__device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << L> &S, int p, int x0, int y0, bool skip) {
+    constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
+    const int lane = threadIdx.x & 31;
+    if (p == 0) {
         for (int i = lane; i < N * N; i += 32) {
             const int r = i >> L, c = i & (N - 1);
             a.recon[size_t(y0 + r) * a.w + x0 + c] = skip ? S.pred[i] : S.rec[i];
             a.levels[size_t(y0 + r) * a.aw + x0 + c] = (!skip && r < T && c < T) ? S.q[r * T + c] : (int16_t)0;
         }
-        for (int p = 1; p <= 2; p++) {
-            uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(p - 1) * cw * ch;
-            int16_t *lv = a.levels + size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2);
-            const int cx = x0 >> 1, cy = y0 >> 1;
-            for (int i = lane; i < C * C; i += 32) {
-                const int r = i >> LC, c = i & (C - 1);
-                plane[size_t(cy + r) * cw + cx + c] = skip ? S.predC[p - 1][i] : S.recC[p - 1][i];
-                lv[size_t(cy + r) * (a.aw / 2) + cx + c] = skip ? (int16_t)0 : S.qC[p - 1][i];
-            }
-        }
-        __syncwarp();
-        *skipOut = skip;
+        return;
     }
-    if (typeOut) *typeOut = skip || !nzY ? AV1G_DCT_DCT : type;   // an all-zero luma transform codes no type
-    return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
+    const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
+    uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
+    int16_t *lv = a.levels + size_t(a.aw) * a.ah + size_t(k) * (a.aw / 2) * (a.ah / 2);
+    const int cx = x0 >> 1, cy = y0 >> 1;
+    for (int i = lane; i < C * C; i += 32) {
+        const int r = i >> LC, c = i & (C - 1);
+        plane[size_t(cy + r) * cw + cx + c] = skip ? S.predC[k][i] : S.recC[k][i];
+        lv[size_t(cy + r) * (a.aw / 2) + cx + c] = skip ? (int16_t)0 : S.qC[k][i];
+    }
 }
+// Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
+template <int L>
+__device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
+                            int &type) {
+    IntraPart pt[3];
+    pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1);
+    pt[1] = intraChroma<L>(a, S, 1, x0, y0, haveA, haveL);
+    pt[2] = intraChroma<L>(a, S, 2, x0, y0, haveA, haveL);
+    bool skip;
+    const float J = intraCombine(a, pt, skip);
+    type = skip ? AV1G_DCT_DCT : pt[0].type;
+    return J;
+}
+
 __device__ __forceinline__ void intraAvail(const TileJob &j, int miRow, int miCol, bool &haveA, bool &haveL) {
     int tr, tc;
     tileOfSb(j, miRow, miCol, tr, tc);
@@ -2970,15 +3014,32 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
     int type = 0;
-    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, false, nullptr, &type);
+    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type);
     if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint8_t)((mode + 1) | type << 4) : 0;
 }
-__global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
+// Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
+template <int L>
+__device__ void intraReconBlock(const IntraArgs &a, IntraScratch<1 << L> &S, IntraPart *pt, int x0, int y0, bool haveA,
+                                bool haveL, int mode, int type, int &skipOut, int &typeOut) {
+    const int warp = threadIdx.x >> 5;
+    IntraPart r;
+    if (warp == 0) r = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, type);
+    else r = intraChroma<L>(a, S, warp, x0, y0, haveA, haveL);
+    if ((threadIdx.x & 31) == 0) pt[warp] = r;
+    __syncthreads();
+    bool skip;
+    intraCombine(a, pt, skip);
+    intraWrite<L>(a, S, warp, x0, y0, skip);
+    skipOut = skip;
+    typeOut = skip ? AV1G_DCT_DCT : pt[0].type;
+}
+__global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
     __shared__ IntraScratch<64> S;
+    __shared__ IntraPart pt[3];
     __shared__ int sbShared;
-    const int lane = threadIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int sbCols = a.j.sbCols, sbRows = a.j.sbRows, gcols = a.j.fs.gcols;
-    if (!lane) {
+    if (!tid) {
         int t = (int)atomicAdd(a.ticket, 1u);
         for (int d = 0;; d++) {   // the t-th superblock in (anti-diagonal, row) order
             const int r0 = max(0, d - (sbCols - 1)), r1 = min(d, sbRows - 1), n = r1 - r0 + 1;
@@ -2986,21 +3047,21 @@ __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
             t -= n;
         }
     }
-    __syncwarp();
+    __syncthreads();
     const int sb = sbShared, sr = sb / sbCols, sc = sb % sbCols;
     const int n = (int)a.j.entryCount[sb];
     const pft2::BlockEntry *list = a.j.entries + size_t(sb) * 64;
     bool any = false;
-    for (int k = lane; k < n; k += 32) any |= a.sel[(list[k].r >> 1) * gcols + (list[k].c >> 1)] != 0;
-    if (__any_sync(0xffffffffu, any)) {
-        if (!lane) {
+    for (int k = tid; k < n; k += 96) any |= a.sel[(list[k].r >> 1) * gcols + (list[k].c >> 1)] != 0;
+    if (__syncthreads_or(any)) {
+        if (!tid) {
             const volatile int *done = a.done;
             if (sr > 0) while (done[(sr - 1) * sbCols + sc] != a.tag) {}
             if (sc > 0) while (done[sr * sbCols + sc - 1] != a.tag) {}
             if (sr > 0 && sc > 0) while (done[(sr - 1) * sbCols + sc - 1] != a.tag) {}
             __threadfence();
         }
-        __syncwarp();
+        __syncthreads();
         for (int k = 0; k < n; k++) {
             const pft2::BlockEntry be = list[k];
             const int gx = be.c >> 1, gy = be.r >> 1;
@@ -3008,31 +3069,33 @@ __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            int mode = (s & 15) - 1, skip = 0, type = 0;
-            const int ft = s >> 4;
+            const int mode = (s & 15) - 1, ft = s >> 4;
+            int skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
             switch (be.lw) {
-            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
-            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
-            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
-            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
+            case 3: intraReconBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
+            case 4: intraReconBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
+            case 5: intraReconBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
+            default: intraReconBlock<6>(a, S, pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
             }
-            const int u = 1 << (be.lw - 3);
-            for (int i = lane; i < u * u; i += 32) {
-                BlockInfo &bi = a.grid[(gy + i / u) * gcols + gx + i % u];
-                bi.intra = 1;
-                bi.yMode = (uint8_t)mode;
-                bi.skip = (uint8_t)skip;
-                bi.txSplit = 0;
-                bi.txTypes = (uint16_t)(type * 0x1111);
-                bi.filter = 0;
+            if (warp == 0) {
+                const int u = 1 << (be.lw - 3);
+                for (int i = lane; i < u * u; i += 32) {
+                    BlockInfo &bi = a.grid[(gy + i / u) * gcols + gx + i % u];
+                    bi.intra = 1;
+                    bi.yMode = (uint8_t)mode;
+                    bi.skip = (uint8_t)skip;
+                    bi.txSplit = 0;
+                    bi.txTypes = (uint16_t)(type * 0x1111);
+                    bi.filter = 0;
+                }
             }
-            __syncwarp();
+            __syncthreads();   // the next block reads this one's reconstruction and reuses the scratch
         }
     }
     __threadfence();
-    __syncwarp();
-    if (!lane) atomicExch(a.done + sb, a.tag);
+    __syncthreads();
+    if (!tid) atomicExch(a.done + sb, a.tag);
 }
 
 // Phases 2 and 3: one thread per block of the lists.
@@ -4328,7 +4391,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         intraDecide<3><<<(gc * gr + 3) / 4, 128, 0, stream>>>(ia);
         }
         { FineTimer t3("intra recon");
-        intraRecon<<<nSb, 32, 0, stream>>>(ia); }
+        intraRecon<<<nSb, 96, 0, stream>>>(ia); }
     }
 #undef PF_EVAL_RECTS
 #undef PF_REVAL
