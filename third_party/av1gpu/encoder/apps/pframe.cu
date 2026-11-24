@@ -2784,6 +2784,7 @@ struct IntraArgs {
     int qindex, qctx, reduced;
     int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
     float splitGate;
+    int alt3;      // also RD-check the third best luma mode by SAD
     int alt2;      // RD-check the second best luma mode by SAD (else the best non-directional one)
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
@@ -2845,7 +2846,7 @@ __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
 template <int LW, int LH = LW>
 __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                               int forcedType, int *altMode = nullptr, float sseGate = kInf) {
+                               int forcedType, int *altMode = nullptr, float sseGate = kInf, int *alt3Mode = nullptr) {
     constexpr int W = 1 << LW, H = 1 << LH, TW = W > 32 ? 32 : W, TH = H > 32 ? 32 : H;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
@@ -2854,7 +2855,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
     const uint8_t *ab = S.above + 1, *lb = S.left + 1;
     const int dcY = av1g_dc_value<8>(ab, lb, haveL, haveA, LW, LH);
     if (mode < 0) {
-        int best = 0x7fffffff, bestNd = 0x7fffffff;
+        int best = 0x7fffffff, bestNd = 0x7fffffff, third = 0x7fffffff;
         for (int k = 0; k < a.nModes; k++) {
             const int m = c_intraModes[k];
             // SAD screen on every other row and column of blocks >= 16x16 (the choice is checked by RD after)
@@ -2866,8 +2867,15 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
             }
             sad = warp_sumi(sad);
             if (a.alt2) {   // runner-up by SAD (checked by RD in intraBlock)
-                if (sad < best) { bestNd = best; if (altMode) *altMode = mode; best = sad; mode = m; }
-                else if (sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
+                if (sad < best) {
+                    third = bestNd; if (alt3Mode && altMode) *alt3Mode = *altMode;
+                    bestNd = best; if (altMode) *altMode = mode; best = sad; mode = m;
+                } else if (sad < bestNd) {
+                    third = bestNd; if (alt3Mode && altMode) *alt3Mode = *altMode;
+                    bestNd = sad; if (altMode) *altMode = m;
+                } else if (sad < third) {
+                    third = sad; if (alt3Mode) *alt3Mode = m;
+                }
             } else {
                 if (sad < best) { best = sad; mode = m; }
                 if (k < kIntraModesNoDir && sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
@@ -3164,8 +3172,9 @@ template <int LW, int LH = LW>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                             int &type, int &depth, float jInter, int &uvMode) {
     IntraPart pt[3];
-    int alt = -1;
-    pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf);
+    int alt = -1, alt3 = -1;
+    pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
+                              a.alt3 ? &alt3 : nullptr);
     if (pt[0].dSkip >= kInf) return kInf;
     if (alt >= 0 && alt != mode) {
         // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
@@ -3173,6 +3182,12 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
         const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m2, -1);
         auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
         if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt; }
+    }
+    if (alt3 >= 0 && alt3 != mode && alt3 != alt) {   // third best by SAD (AV1GPU_PF_INTRA_ALT3)
+        int m3 = alt3;
+        const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m3, -1);
+        auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
+        if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt3; }
     }
     {
         // lower bound of the final cost (chroma adds distortion and bits; splits are only tried below splitGate x the
@@ -4687,6 +4702,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.alt3 = !getenv("AV1GPU_PF_INTRA_NOALT3");   // video_1 -0.09%, video_2 -0.52%
         ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%
         ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
