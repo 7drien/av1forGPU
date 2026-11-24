@@ -2239,15 +2239,10 @@ __global__ void fillTxTypes(TypeArgs a) {
     }
     bi.txTypes = v;
 }
-__global__ void commit(CommitArgs a) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int p = blockIdx.z, sub = p > 0;
-    const int apw = a.aw >> sub, aph = a.ah >> sub;
-    if (x >= apw || y >= aph) return;
-    // samples beyond the frame (aligned area) belong to the block covering the last row / column of cells: their levels
-    // are coefficients of transforms that start inside the frame (the grid is only filled inside the frame)
-    const int gyc = min((y << sub) >> 3, (a.h + 7) / 8 - 1), gxc = min((x << sub) >> 3, (a.w + 7) / 8 - 1);
-    if (a.changed && !a.changed[gyc * a.gcols + gxc]) return;
+// One sample of plane p at (x, y) of the aligned area: its level and (inside the frame) its reconstruction.
+__device__ __forceinline__ void commitSample(const CommitArgs &a, int p, int x, int y, int gyc, int gxc) {
+    const int sub = p > 0;
+    const int apw = a.aw >> sub;
     const BlockInfo bi = a.grid[gyc * a.gcols + gxc];
     const size_t lbase = p ? size_t(a.aw) * a.ah + size_t(p - 1) * (a.aw / 2) * (a.ah / 2) : 0;
     const int s = bi.log2 - 3;
@@ -2266,6 +2261,29 @@ __global__ void commit(CommitArgs a) {
         return;
     }
     a.out[off] = (bi.skip ? pickN(shape, a.pred) : pickN(shape, a.recon))[off];
+}
+__global__ void commit(CommitArgs a) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int p = blockIdx.z, sub = p > 0;
+    const int apw = a.aw >> sub, aph = a.ah >> sub;
+    if (x >= apw || y >= aph) return;
+    // samples beyond the frame (aligned area) belong to the block covering the last row / column of cells: their levels
+    // are coefficients of transforms that start inside the frame (the grid is only filled inside the frame)
+    const int gyc = min((y << sub) >> 3, (a.h + 7) / 8 - 1), gxc = min((x << sub) >> 3, (a.w + 7) / 8 - 1);
+    if (a.changed && !a.changed[gyc * a.gcols + gxc]) return;
+    commitSample(a, p, x, y, gyc, gxc);
+}
+// Refinement passes: one warp per 8 x 8 unit of the aligned area (64 luma, 2 x 16 chroma samples), only where its cell
+// changed (a per-sample grid spent most of its time on unchanged cells).
+__global__ void __launch_bounds__(256) commitUnits(CommitArgs a) {
+    const int u = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int ucols = a.aw / 8, urows = a.ah / 8;
+    if (u >= ucols * urows) return;
+    const int ux = u % ucols, uy = u / ucols;
+    const int gyc = min(uy, (a.h + 7) / 8 - 1), gxc = min(ux, (a.w + 7) / 8 - 1);
+    if (!a.changed[gyc * a.gcols + gxc]) return;
+    for (int i = lane; i < 64; i += 32) commitSample(a, 0, ux * 8 + (i & 7), uy * 8 + (i >> 3), gyc, gxc);
+    commitSample(a, 1 + (lane >> 4), ux * 4 + (lane & 3), uy * 4 + ((lane >> 2) & 3), gyc, gxc);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -3931,7 +3949,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             FineTimer t("mode refinement commit");
             acceptMotion<<<nSb, 64, 0, stream>>>(j, s->modeTrials, s->grid, s->modeChanged, lambda, pass);
             ca.changed = ta.changed = s->modeChanged;
-            commit<<<commitGrid, t16, 0, stream>>>(ca);
+            commitUnits<<<((aw / 8) * (ah / 8) + 7) / 8, 256, 0, stream>>>(ca);
             fillTxTypes<<<typeGrid, t16, 0, stream>>>(ta);
         }
         if (s->refineStats) {
