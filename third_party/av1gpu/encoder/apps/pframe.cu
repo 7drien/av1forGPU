@@ -3159,6 +3159,13 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
         if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt; }
     }
+    {
+        // lower bound of the final cost (chroma adds distortion and bits; splits are only tried below splitGate x the
+        // inter cost): above the threshold the decision cannot change, so skip chroma and splits
+        const float lb = fminf(pt[0].dCoded + a.lambda * (pt[0].rate + a.skipBits0), pt[0].dSkip + a.lambda * a.skipBits1) +
+                         a.lambda * (a.intraBits + a.modeBase);
+        if (lb * a.margin >= jInter && (!a.txSplit || lb > a.splitGate * jInter || L < 4)) return kInf;
+    }
     // chroma: UV_DC_PRED against the best mode by SAD, by rate-distortion (one extra bit for the other mode)
     const int uvCand = a.uvModes ? intraChromaMode<L>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
     uvMode = AV1G_DC_PRED;
