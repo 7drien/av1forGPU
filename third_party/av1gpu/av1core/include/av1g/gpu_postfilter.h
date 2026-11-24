@@ -41,6 +41,10 @@ int av1g_gpu_cdef_dir(const av1g_pf_frame *f, cudaStream_t stream);
 int av1g_gpu_cdef(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], cudaStream_t stream);
 /* av1g_gpu_cdef without the copy of superblocks that apply no CDEF (cdef_idx -1): their output is left untouched. */
 int av1g_gpu_cdef_coded(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], cudaStream_t stream);
+/* Strength search: candidate k (0..count-1) filters with preset strengths pri[k] / sec[k] into d_out + k * frame
+ * samples, all in one launch; superblocks without CDEF are copied into candidate 0's output only. */
+int av1g_gpu_cdef_search(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], size_t frame,
+                         int count, const int *pri, const int *sec, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

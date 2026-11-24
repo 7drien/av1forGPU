@@ -5596,7 +5596,14 @@ int Analyzer::filter(const uint8_t *const src[3], const int pitch[3], uint8_t *r
         f.cdefDamping = out.damping;
         e = (cudaError_t)av1g_gpu_cdef_dir(&f, stream);
         if (e == cudaSuccess) e = cudaMemsetAsync(s->sse, 0, sizeof(unsigned long long) * 3 * kCdefCount, stream);
-        for (int k = 0; k < kCdefCount && e == cudaSuccess; k++) {
+        if (out.cdefPerSb && e == cudaSuccess) {
+            // per-superblock choice: every candidate in one launch (candidate 0 also copies the superblocks without CDEF)
+            int pri[kCdefCount], sec[kCdefCount];
+            for (int k = 0; k < kCdefCount; k++) { pri[k] = kCdefCandidates[k].pri; sec[k] = kCdefCandidates[k].sec; }
+            uint8_t *dst[3] = {s->filterCandidates, s->filterCandidates + ysz, s->filterCandidates + ysz + csz};
+            e = (cudaError_t)av1g_gpu_cdef_search(&f, dst, pw, frame, kCdefCount, pri, sec, stream);
+        }
+        for (int k = 0; k < kCdefCount && e == cudaSuccess && !out.cdefPerSb; k++) {
             f.cdefYPri[0] = f.cdefUVPri[0] = kCdefCandidates[k].pri;
             f.cdefYSec[0] = f.cdefUVSec[0] = kCdefCandidates[k].sec;
             auto *candidate = s->filterCandidates + k * frame;

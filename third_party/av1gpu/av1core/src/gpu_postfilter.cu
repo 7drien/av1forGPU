@@ -62,12 +62,19 @@ struct OutPlanes {
     uint8_t *p[3];
     int s[3];
 };
+// Strength search in one launch (MULTI): candidate k = blockIdx.y writes to the output planes offset by k * frame
+// samples, with preset strengths pri[k] / sec[k] (luma and chroma alike) in place of the frame's; superblocks without
+// CDEF are copied by candidate 0 only.
+struct CdefMulti {
+    size_t frame;
+    int pri[16], sec[16];
+};
 // One CTA per 64x64 (SS: chroma subsampling, 1 = 4:2:0 / monochrome, 0 = 4:4:4).  The SB's deblocked samples + a
 // 2-sample halo are staged in shared memory (int16, -1 = outside the frame), the per-8x8 parameters and the tap
 // offsets of every direction once; then one thread per sample (av1g_cdef_filter, the same arithmetic as
 // av1g_cdef_pixel).  An SB without CDEF is copied.
-template <int BD, int SS, bool COPY = true>
-__global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o) {
+template <int BD, int SS, bool COPY = true, bool MULTI = false>
+__global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o, CdefMulti m) {
     typedef av1g_pixel_t(BD) P;
     constexpr int TL = 68, CN = 64 >> SS, TC = CN + 4, CPX = CN * CN;
     __shared__ int16_t tl[TL * TL];
@@ -80,10 +87,12 @@ __global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o) {
     // plane pointers by select (an indexed parameter array would be copied to local memory)
     auto src = [&](int p) { return (const P *)(p == 0 ? f.plane[0] : p == 1 ? f.plane[1] : f.plane[2]); };
     auto sst = [&](int p) { return p == 0 ? f.stride[0] : p == 1 ? f.stride[1] : f.stride[2]; };
-    auto dst = [&](int p) { return (P *)(p == 0 ? o.p[0] : p == 1 ? o.p[1] : o.p[2]); };
+    const int cand = MULTI ? (int)blockIdx.y : 0;
+    auto dst = [&](int p) { return (P *)(p == 0 ? o.p[0] : p == 1 ? o.p[1] : o.p[2]) + (MULTI ? cand * m.frame : 0); };
     auto dst_s = [&](int p) { return p == 0 ? o.s[0] : p == 1 ? o.s[1] : o.s[2]; };
     if (f.cdefIdx[sb] < 0) {
         if constexpr (!COPY) return;   // av1g_gpu_cdef_coded: superblocks without CDEF are left unwritten
+        if (MULTI && cand > 0) return;
         for (int i = tid; i < 4096 + (np > 1 ? 2 * CPX : 0); i += 256) {
             const int p = i < 4096 ? 0 : 1 + (i - 4096) / CPX, j = i < 4096 ? i : (i - 4096) % CPX, n = p ? CN : 64;
             const int x = sbc * n + j % n, y = sbr * n + j / n;
@@ -115,7 +124,15 @@ __global__ void __launch_bounds__(256) k_cdef(av1g_pf_frame f, OutPlanes o) {
             const int idx = by * 2 < f.MiRows && bx * 2 < f.MiCols ? av1g_cdef_active_idx(&f, by * 2, bx * 2) : -1;
             if (idx >= 0) {
                 const int dv = f.cdefDirVar[(size_t)by * (f.MiCols >> 1) + bx];
-                const av1g_cdef_blk c = av1g_cdef_params<BD>(&f, idx, dv & 7, dv >> 3);
+                av1g_cdef_blk c;
+                if constexpr (MULTI) {
+                    av1g_pf_frame g = f;
+                    g.cdefYPri[idx] = g.cdefUVPri[idx] = m.pri[cand];
+                    g.cdefYSec[idx] = g.cdefUVSec[idx] = m.sec[cand];
+                    c = av1g_cdef_params<BD>(&g, idx, dv & 7, dv >> 3);
+                } else {
+                    c = av1g_cdef_params<BD>(&f, idx, dv & 7, dv >> 3);
+                }
                 bp[b][0] = (int16_t)c.yPri; bp[b][1] = (int16_t)c.ySec; bp[b][2] = (int16_t)c.yDir;
                 bp[b][3] = (int16_t)c.uvPri; bp[b][4] = (int16_t)c.uvSec; bp[b][5] = (int16_t)c.uvDir;
             } else {
@@ -206,11 +223,34 @@ extern "C" int av1g_gpu_cdef_coded(const av1g_pf_frame *f, uint8_t *const d_out[
     const unsigned nsb = (unsigned)(f->sbCols * f->sbRows);
     const bool s444 = !f->mono && !f->ssx;
     if (f->bitDepth == 10) {
-        if (s444) k_cdef<10, 0, false><<<nsb, 256, 0, stream>>>(*f, o);
-        else k_cdef<10, 1, false><<<nsb, 256, 0, stream>>>(*f, o);
+        if (s444) k_cdef<10, 0, false><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
+        else k_cdef<10, 1, false><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
     } else {
-        if (s444) k_cdef<8, 0, false><<<nsb, 256, 0, stream>>>(*f, o);
-        else k_cdef<8, 1, false><<<nsb, 256, 0, stream>>>(*f, o);
+        if (s444) k_cdef<8, 0, false><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
+        else k_cdef<8, 1, false><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int av1g_gpu_cdef_search(const av1g_pf_frame *f, uint8_t *const d_out[3], const int out_stride[3], size_t frame,
+                                    int count, const int *pri, const int *sec, cudaStream_t stream) {
+    if (count < 1 || count > 16) return (int)cudaErrorInvalidValue;
+    OutPlanes o;
+    for (int p = 0; p < 3; p++) {
+        o.p[p] = d_out[p];
+        o.s[p] = out_stride[p];
+    }
+    CdefMulti m{};
+    m.frame = frame;
+    for (int k = 0; k < count; k++) { m.pri[k] = pri[k]; m.sec[k] = sec[k]; }
+    const dim3 grid((unsigned)(f->sbCols * f->sbRows), (unsigned)count);
+    const bool s444 = !f->mono && !f->ssx;
+    if (f->bitDepth == 10) {
+        if (s444) k_cdef<10, 0, true, true><<<grid, 256, 0, stream>>>(*f, o, m);
+        else k_cdef<10, 1, true, true><<<grid, 256, 0, stream>>>(*f, o, m);
+    } else {
+        if (s444) k_cdef<8, 0, true, true><<<grid, 256, 0, stream>>>(*f, o, m);
+        else k_cdef<8, 1, true, true><<<grid, 256, 0, stream>>>(*f, o, m);
     }
     return (int)cudaGetLastError();
 }
@@ -224,11 +264,11 @@ extern "C" int av1g_gpu_cdef(const av1g_pf_frame *f, uint8_t *const d_out[3], co
     const unsigned nsb = (unsigned)(f->sbCols * f->sbRows);
     const bool s444 = !f->mono && !f->ssx;
     if (f->bitDepth == 10) {
-        if (s444) k_cdef<10, 0><<<nsb, 256, 0, stream>>>(*f, o);
-        else k_cdef<10, 1><<<nsb, 256, 0, stream>>>(*f, o);
+        if (s444) k_cdef<10, 0><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
+        else k_cdef<10, 1><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
     } else {
-        if (s444) k_cdef<8, 0><<<nsb, 256, 0, stream>>>(*f, o);
-        else k_cdef<8, 1><<<nsb, 256, 0, stream>>>(*f, o);
+        if (s444) k_cdef<8, 0><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
+        else k_cdef<8, 1><<<nsb, 256, 0, stream>>>(*f, o, CdefMulti{});
     }
     return (int)cudaGetLastError();
 }
