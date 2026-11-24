@@ -927,8 +927,8 @@ struct TileCoder {
             m.mv[0] = m.mv[1] = pf::Mv{0, 0};
             m.mode = bi.yMode;
             m.filter = 0;
-            m.txW = (uint8_t)imin(lw, 6);
-            m.txH = (uint8_t)imin(lh, 6);
+            m.txW = (uint8_t)(imin(lw, 6) - bi.txSplit);   // InterTxSizes = TxSize (tx_depth), skip or not
+            m.txH = (uint8_t)(imin(lh, 6) - bi.txSplit);
         }
         const int rowEnd = imin(miRow + (1 << (lh - 2)), fs->miRows);
         const int colEnd = imin(miCol + (1 << (lw - 2)), fs->miCols);
@@ -977,13 +977,31 @@ struct TileCoder {
             const int aboveW = !availU ? 0 : above->isInter ? above->wLog2 : above->txW;
             const int leftH = !availL ? 0 : left->isInter ? left->hLog2 : left->txH;
             const int ctx = (availU && aboveW >= maxTx) + (availL && leftH >= maxTx);
-            if (lw == 6) sym(cdf->tx_64x64[ctx], 0, 3);
-            else if (lw == 5) sym(cdf->tx_32x32[ctx], 0, 3);
-            else if (lw == 4) sym(cdf->tx_16x16[ctx], 0, 3);
-            else sym(cdf->tx_8x8[ctx], 0, 2);
-        }
+            const int depth = bi.txSplit;
+            if (lw == 6) sym(cdf->tx_64x64[ctx], depth, 3);
+            else if (lw == 5) sym(cdf->tx_32x32[ctx], depth, 3);
+            else if (lw == 4) sym(cdf->tx_16x16[ctx], depth, 3);
+            else sym(cdf->tx_8x8[ctx], depth, 2);
+        } else if (bi.txSplit) { st.error = 10; return; }
         if (skip) return;
         const int bw4 = 1 << (lw - 2), bh4 = 1 << (lh - 2);
+        if (bi.txSplit) {
+            // luma transforms in raster order (residual(), not the inter transform tree), then chroma
+            const int lt = imin(lw, 6) - bi.txSplit, t = 1 << lt, per = 1 << bi.txSplit, txSz = txSizeOfLog2(lt, lt);
+            for (int k = 0; k < per * per; ++k) {
+                const int px = miCol * 4 + (k % per) * t, py = miRow * 4 + (k / per) * t;
+                if (px >= fs->miCols * 4 || py >= fs->miRows * 4) continue;
+                loadLevels(0, px, py, imin(t, 32), imin(t, 32));
+                coeffs(0, px >> 2, py >> 2, txSz, 4 * bw4, 4 * bh4);
+            }
+            for (int p = 1; p < 3; ++p) {
+                const int tl = imin(lw, 6) - 1, txc = txSizeOfLog2(tl, tl);
+                const int px = (miCol * 4) >> 1, py = (miRow * 4) >> 1;
+                loadLevels(p, px, py, imin(1 << tl, 32), imin(1 << tl, 32));
+                coeffs(p, px >> 2, py >> 2, txc, 4 * bw4, 4 * bh4);
+            }
+            return;
+        }
         forTransforms(miRow, miCol, lw, lh, 0, [&](int p, int x4, int y4, int t) { coeffs(p, x4, y4, t, 4 * bw4, 4 * bh4); });
     }
 

@@ -2756,11 +2756,13 @@ struct IntraArgs {
     int16_t *levels;      // aligned planes
     int w, h, aw, ah;
     int qindex, qctx, reduced;
+    int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
+    float splitGate;
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
     int cols[kSizes];
     const ModeTrial *trials;   // refinement state (accepted trials' costs), or null
-    uint8_t *sel;
+    uint16_t *sel;   // per grid unit (block top-left): intra mode + 1 | luma type << 4 | tx_depth << 8, 0 inter
     int *done;
     unsigned *ticket;
     int tag;
@@ -2768,6 +2770,7 @@ struct IntraArgs {
 template <int N>
 struct IntraScratch {
     static constexpr int T = N > 32 ? 32 : N, C = N / 2, TC = C > 32 ? 32 : C;
+    uint8_t ttype[16];   // luma transform types of a split block (raster order); first: same offset for every N
     uint8_t pred[N * N], rec[N * N];
     int16_t res[N * N];
     float tmp[T * (N + 1)];
@@ -2780,7 +2783,7 @@ struct IntraScratch {
     uint8_t aboveC[2][C + 4], leftC[2][C + 4];
 };
 // Rate-distortion terms of one plane of an intra block.
-struct IntraPart { float dSkip, dCoded, rate; int nz, type; };
+struct IntraPart { float dSkip, dCoded, rate; int nz, type, noSkip; };
 // AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
 // inside the frame, so the above-right and frame limits do not matter for these indices). L2 loads: other
 // superblocks' samples were written by other CTAs of the same launch.
@@ -2882,6 +2885,110 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << L> &S, int 
     r.dSkip = e.resEnergy;
     r.rate = o.R;
     r.type = r.nz ? type : AV1G_DCT_DCT;   // an all-zero luma transform codes no type
+    r.noSkip = 0;
+    return r;
+}
+// Edges of a transform at (x, y) inside the intra block at (x0, y0) (n x n): samples of the block come from its local
+// reconstruction S.rec (earlier transforms in raster order), the others from the frame.
+template <int N>
+__device__ void intraEdgesLocal(const IntraArgs &a, const IntraScratch<N> &S, int x0, int y0, int x, int y, int n, bool haveA,
+                                bool haveL, uint8_t *ab, uint8_t *lb) {
+    const int lane = threadIdx.x & 31;
+    auto at = [&](int xx, int yy) -> uint8_t {
+        if (xx >= x0 && yy >= y0) return S.rec[(yy - y0) * N + xx - x0];
+        return __ldcg(a.recon + size_t(yy) * a.w + xx);
+    };
+    for (int i = lane; i < n; i += 32) {
+        ab[1 + i] = haveA ? at(x + i, y - 1) : haveL ? at(x - 1, y) : 127;
+        lb[1 + i] = haveL ? at(x - 1, y + i) : haveA ? at(x, y - 1) : 129;
+    }
+    if (!lane) {
+        const uint8_t c = haveA && haveL ? at(x - 1, y - 1) : haveA ? at(x, y - 1) : haveL ? at(x - 1, y) : 128;
+        ab[0] = lb[0] = c;
+    }
+    __syncwarp();
+}
+// Luma of an intra block with tx_depth D (2^D x 2^D transforms of side N >> D, predicted one after the other in raster
+// order from the reconstruction of the earlier ones), one warp, for a given mode. Transform types are searched per
+// transform (S.ttype). With write, each transform's levels go to the frame's level planes. Such blocks never code skip.
+template <int L, int D>
+__device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL,
+                                    int mode, bool write) {
+    constexpr int N = 1 << L, LT = L - D, T = 1 << LT, PER = 1 << D;
+    static_assert(T <= 32 && T >= 8, "split transforms of 8..32");
+    const int lane = threadIdx.x & 31;
+    const uint8_t *src = a.src[0];
+    const int sp = a.pitch[0];
+    const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
+    EvalIn e{};
+    e.txSz = txSizeOf(LT, LT);
+    e.plane = 0;
+    e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
+    e.rnd = a.rnd; e.zbin = a.zbin;
+    e.skipCtx = 4; e.dcCtx = 0; e.intraDir = mode; e.reduced = a.reduced;
+    e.C = g_cost[a.qctx];
+    e.qmDist = 0; e.qmRnd = 0;
+    const int set = av1g_get_tx_set_intra(e.txSz, a.reduced);
+    float dTot = 0.f, rTot = 0.f;
+    int anyTot = 0;
+    uint8_t *recT = reinterpret_cast<uint8_t *>(S.res + T * T);   // compact reconstruction of one transform
+    for (int k = 0; k < PER * PER; k++) {
+        const int tx = (k % PER) * T, ty = (k / PER) * T;
+        intraEdgesLocal<N>(a, S, x0, y0, x0 + tx, y0 + ty, T, ty > 0 || haveA, tx > 0 || haveL, S.above, S.left);
+        const uint8_t *ab = S.above + 1, *lb = S.left + 1;
+        const int dc = av1g_dc_value<8>(ab, lb, tx > 0 || haveL, ty > 0 || haveA, LT, LT);
+        float en = 0.f;
+        for (int i = lane; i < T * T; i += 32) {
+            const int r = i >> LT, c = i & (T - 1);
+            const int pv = intraPixel(mode, dc, r, c, LT, ab, lb);
+            const int d = (int)src[(y0 + ty + r) * sp + x0 + tx + c] - pv;
+            S.pred[i] = (uint8_t)pv;
+            S.res[i] = (int16_t)d;
+            en += (float)(d * d);
+        }
+        __syncwarp();
+        e.resEnergy = warp_sum(en);
+        EvalOut o;
+        int type = AV1G_DCT_DCT;
+        if (set != AV1G_TX_SET_DCTONLY && write) {   // the decision pass estimates with DCT_DCT
+            float bestJ = kInf;
+            const int n = set == AV1G_TX_SET_INTRA_1 ? 7 : 5;
+            for (int t = 0; t < n; t++) {
+                const int tt = set == AV1G_TX_SET_INTRA_1 ? AV1G_T(Tx_Type_Intra_Inv_Set1)[t] : AV1G_T(Tx_Type_Intra_Inv_Set2)[t];
+                e.txType = tt;
+                warp_fwd_ct<T, T>(S.res, S.tmp, e.txSz, tt);
+                warp_quant_rate_rt<8>(S.tmp, S.q, e, o, T, T);
+                const float J = o.D + a.lambda * o.R;
+                if (J < bestJ) { bestJ = J; type = tt; }
+            }
+        }
+        e.txType = type;
+        warp_fwd_ct<T, T>(S.res, S.tmp, e.txSz, type);
+        warp_quant_rate_rt<8>(S.tmp, S.q, e, o, T, T);
+        inverseAddCt<LT, LT>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, recT);
+        int sse = 0, any = 0;
+        for (int i = lane; i < T * T; i += 32) {
+            const int r = i >> LT, c = i & (T - 1);
+            const int d = (int)src[(y0 + ty + r) * sp + x0 + tx + c] - recT[i];
+            sse += d * d;
+            S.rec[(ty + r) * N + tx + c] = recT[i];
+            any |= S.q[i];
+            if (write) a.levels[size_t(y0 + ty + r) * a.aw + x0 + tx + c] = S.q[i];
+        }
+        const bool nz = __any_sync(0xffffffffu, any != 0);
+        if (!lane) S.ttype[k] = (uint8_t)(nz ? type : AV1G_DCT_DCT);
+        anyTot |= nz;
+        dTot += (float)warp_sumi(sse);
+        rTot += o.R;
+        __syncwarp();
+    }
+    IntraPart r;
+    r.nz = anyTot;
+    r.dCoded = dTot;
+    r.dSkip = kInf;
+    r.rate = rTot + 1.f * D;   // tx_depth beyond 0 (approximate)
+    r.type = AV1G_DCT_DCT;
+    r.noSkip = 1;
     return r;
 }
 // Chroma plane p (1, 2) of an intra block, UV_DC_PRED (one warp).
@@ -2934,6 +3041,7 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << L> &S, in
     r.dSkip = e.resEnergy;
     r.rate = o.R;
     r.type = AV1G_DCT_DCT;
+    r.noSkip = 0;
     return r;
 }
 // Skip or coded, from the three planes' terms; returns the rate-distortion cost (mode bits included).
@@ -2941,14 +3049,18 @@ __device__ __forceinline__ float intraCombine(const IntraArgs &a, const IntraPar
     const bool nz = pt[0].nz || pt[1].nz || pt[2].nz;
     const float jCoded = pt[0].dCoded + pt[1].dCoded + pt[2].dCoded + a.lambda * (pt[0].rate + pt[1].rate + pt[2].rate + a.skipBits0);
     const float jSkip = pt[0].dSkip + pt[1].dSkip + pt[2].dSkip + a.lambda * a.skipBits1;
-    skip = !nz || jSkip <= jCoded;
+    skip = pt[0].noSkip ? false : !nz || jSkip <= jCoded;
     return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
 }
 // Store plane p of an intra block (reconstruction and levels of the chosen option).
 template <int L>
-__device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << L> &S, int p, int x0, int y0, bool skip) {
+__device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << L> &S, int p, int x0, int y0, bool skip, int depth = 0) {
     constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
     const int lane = threadIdx.x & 31;
+    if (p == 0 && depth) {   // split luma: levels already stored, the block's reconstruction in S.rec
+        for (int i = lane; i < N * N; i += 32) a.recon[size_t(y0 + (i >> L)) * a.w + x0 + (i & (N - 1))] = S.rec[i];
+        return;
+    }
     if (p == 0) {
         for (int i = lane; i < N * N; i += 32) {
             const int r = i >> L, c = i & (N - 1);
@@ -2970,14 +3082,28 @@ __device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << L> &S, in
 // Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
 template <int L>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            int &type) {
+                            int &type, int &depth, float jInter) {
     IntraPart pt[3];
     pt[0] = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, -1);
     pt[1] = intraChroma<L>(a, S, 1, x0, y0, haveA, haveL);
     pt[2] = intraChroma<L>(a, S, 2, x0, y0, haveA, haveL);
     bool skip;
-    const float J = intraCombine(a, pt, skip);
+    float J = intraCombine(a, pt, skip);
     type = skip ? AV1G_DCT_DCT : pt[0].type;
+    depth = 0;
+    // luma transform splits (8x8 .. 32x32 transforms) with the same mode
+    // splits only where intra is close to winning (AV1GPU_PF_INTRA_SPLITGATE, default 1.3)
+    if (!a.txSplit || J > a.splitGate * jInter) return J;
+    if constexpr (L >= 4) {
+        pt[0] = intraLumaSplit<L, 1>(a, S, x0, y0, haveA, haveL, mode, false);
+        const float j1 = intraCombine(a, pt, skip);
+        if (j1 < J) { J = j1; depth = 1; type = 0; }
+    }
+    if constexpr (L >= 5) {
+        pt[0] = intraLumaSplit<L, 2>(a, S, x0, y0, haveA, haveL, mode, false);
+        const float j2 = intraCombine(a, pt, skip);
+        if (j2 < J) { J = j2; depth = 2; type = 0; }
+    }
     return J;
 }
 
@@ -3013,23 +3139,28 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
     bool haveA, haveL;
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
-    int type = 0;
-    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type);
-    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint8_t)((mode + 1) | type << 4) : 0;
+    int type = 0, depth = 0;
+    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter);
+    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint16_t)((mode + 1) | type << 4 | depth << 8) : 0;
 }
 // Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
 template <int L>
 __device__ void intraReconBlock(const IntraArgs &a, IntraScratch<1 << L> &S, IntraPart *pt, int x0, int y0, bool haveA,
-                                bool haveL, int mode, int type, int &skipOut, int &typeOut) {
+                                bool haveL, int mode, int type, int depth, int &skipOut, int &typeOut) {
     const int warp = threadIdx.x >> 5;
     IntraPart r;
-    if (warp == 0) r = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, type);
-    else r = intraChroma<L>(a, S, warp, x0, y0, haveA, haveL);
+    if (warp == 0) {
+        if constexpr (L >= 5) { if (depth == 2) r = intraLumaSplit<L, 2>(a, S, x0, y0, haveA, haveL, mode, true); }
+        if constexpr (L >= 4) { if (depth == 1) r = intraLumaSplit<L, 1>(a, S, x0, y0, haveA, haveL, mode, true); }
+        if (depth == 0) r = intraLuma<L>(a, S, x0, y0, haveA, haveL, mode, type);
+    } else {
+        r = intraChroma<L>(a, S, warp, x0, y0, haveA, haveL);
+    }
     if ((threadIdx.x & 31) == 0) pt[warp] = r;
     __syncthreads();
     bool skip;
     intraCombine(a, pt, skip);
-    intraWrite<L>(a, S, warp, x0, y0, skip);
+    intraWrite<L>(a, S, warp, x0, y0, skip, depth);
     skipOut = skip;
     typeOut = skip ? AV1G_DCT_DCT : pt[0].type;
 }
@@ -3069,14 +3200,14 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            const int mode = (s & 15) - 1, ft = s >> 4;
+            const int mode = (s & 15) - 1, ft = (s >> 4) & 15, depth = s >> 8;
             int skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
             switch (be.lw) {
-            case 3: intraReconBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
-            case 4: intraReconBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
-            case 5: intraReconBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
-            default: intraReconBlock<6>(a, S, pt, x0, y0, haveA, haveL, mode, ft, skip, type); break;
+            case 3: intraReconBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
+            case 4: intraReconBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
+            case 5: intraReconBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
+            default: intraReconBlock<6>(a, S, pt, x0, y0, haveA, haveL, mode, ft, depth, skip, type); break;
             }
             if (warp == 0) {
                 const int u = 1 << (be.lw - 3);
@@ -3085,8 +3216,13 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
                     bi.intra = 1;
                     bi.yMode = (uint8_t)mode;
                     bi.skip = (uint8_t)skip;
-                    bi.txSplit = 0;
-                    bi.txTypes = (uint16_t)(type * 0x1111);
+                    bi.txSplit = (uint8_t)depth;
+                    int t = type;
+                    if (depth) {   // the type of the split transform covering this 8x8 unit
+                        const int lt = be.lw - depth, per = 1 << depth;
+                        t = S.ttype[(((i / u) * 8) >> lt) * per + (((i % u) * 8) >> lt)];
+                    }
+                    bi.txTypes = (uint16_t)(t * 0x1111);
                     bi.filter = 0;
                 }
             }
@@ -3588,7 +3724,7 @@ struct State {
     pft2::MiInfo *modeMi = nullptr;
     pft2::BlockEntry *modeEntries = nullptr;
     uint32_t *modeEntryCount = nullptr;
-    uint8_t *intraSel = nullptr;       // per grid unit: intra mode + 1 chosen for the block starting there, 0 inter
+ uint16_t *intraSel = nullptr;       // per grid unit: intra mode + 1 chosen for the block starting there, 0 inter
     int *intraDone = nullptr;          // per superblock: frame tag once its intra blocks are reconstructed
     unsigned *intraTicket = nullptr;
     int intraTag = 0;
@@ -3890,7 +4026,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->modeMi, sizeof(pft2::MiInfo) * miCols * miRows);
         alloc(&s->modeEntries, sizeof(pft2::BlockEntry) * nSb * 64);
         alloc(&s->modeEntryCount, sizeof(uint32_t) * nSb);
-        alloc(&s->intraSel, gridCount());
+        alloc(&s->intraSel, gridCount() * sizeof(uint16_t));
         alloc(&s->intraDone, sizeof(int) * nSb);
         alloc(&s->intraTicket, sizeof(unsigned));
         if (e == cudaSuccess) e = cudaMemset(s->intraDone, 0, sizeof(int) * nSb);
@@ -4372,6 +4508,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.w = w; ia.h = h; ia.aw = aw; ia.ah = ah;
         ia.qindex = st.qindex; ia.qctx = ea.qctx; ia.reduced = ea.reducedTxSet;
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
+        ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
+        ia.splitGate = getenv("AV1GPU_PF_INTRA_SPLITGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SPLITGATE")) : 1.3f;
         ia.intraBits = getenv("AV1GPU_PF_INTRABITS") ? (float)atof(getenv("AV1GPU_PF_INTRABITS")) : st.intraBits;
         ia.modeBase = ea.modeBase; ia.skipBits0 = ea.skipBits0; ia.skipBits1 = ea.skipBits1;
         ia.mvWeight = getenv("AV1GPU_PF_MVW") ? (float)atof(getenv("AV1GPU_PF_MVW")) : 0.5f;
@@ -4381,7 +4519,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.done = s->intraDone;
         ia.ticket = s->intraTicket;
         ia.tag = ++s->intraTag;
-        cudaMemsetAsync(s->intraSel, 0, gridCount(), stream);
+        cudaMemsetAsync(s->intraSel, 0, gridCount() * sizeof(uint16_t), stream);
         cudaMemsetAsync(s->intraTicket, 0, sizeof(unsigned), stream);
         const int gc = s->gcols, gr = s->grows;
         { FineTimer t2("intra decide");
@@ -4392,6 +4530,17 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         { FineTimer t3("intra recon");
         intraRecon<<<nSb, 96, 0, stream>>>(ia); }
+        static const bool intraStats = getenv("AV1GPU_PF_INTRA_STATS") != nullptr;
+        if (intraStats) {   // share of the frame area in intra blocks, by size (AV1GPU_PF_INTRA_STATS)
+            static long long area[5], frames;
+            std::vector<BlockInfo> g(gridCount());
+            cudaMemcpyAsync(g.data(), s->grid, g.size() * sizeof(BlockInfo), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            for (const BlockInfo &b : g) if (b.log2) { area[4]++; if (b.intra) area[b.log2 - 3]++; }
+            if (++frames % 30 == 0)
+                fprintf(stderr, "intra area: %.2f%% (8x8 %.2f, 16 %.2f, 32 %.2f, 64 %.2f)\n", 100.0 * (area[0] + area[1] + area[2] + area[3]) / area[4],
+                        100.0 * area[0] / area[4], 100.0 * area[1] / area[4], 100.0 * area[2] / area[4], 100.0 * area[3] / area[4]);
+        }
     }
 #undef PF_EVAL_RECTS
 #undef PF_REVAL
