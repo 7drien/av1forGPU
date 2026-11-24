@@ -2,7 +2,7 @@
 
 All results: NVIDIA GeForce RTX 3060 Ti (8 GB, `sm_86`), driver 595.99.02, CUDA 12.4.
 
-## Current results (`--pframes`, 2026-11-24)
+## Current results (`--pframes`, 2026-11-24, with rectangular intra blocks)
 
 First 120 frames of every clip in `benckmark/`, encoded with
 `--pframes --persistent-cdf --qindex {20,50,90,130}`, decoded with dav1d. BD-rate uses YUV-weighted PSNR (6:1:1).
@@ -10,15 +10,15 @@ First 120 frames of every clip in `benckmark/`, encoded with
 
 | Clip | Content | BD-rate vs SVT-AV1 preset 8 | BD-rate vs libaom cpu-used 8 | fps (ours) | fps (SVT-AV1 p8) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| video_1 | 1080×1920, 30 fps, static | +2.9% | +25.4% | 34.9 | 36.5 |
-| video_2 | 1920×1080, 30 fps, concert, cuts | +10.9% | +15.7% | 27.0 | 34.4 |
-| video_3 | 3840×2160, 24 fps, handheld street | **−16.2%** | +43.4% | 8.7 | 17.3 |
-| video_4 | 3840×2160, 24 fps, advert | **−29.0%** | +9.6% | 9.4 | 16.4 |
-| video_5 | 1920×1080, animation | **−10.8%** | +4.9% | 26.3 | 41.2 |
-| **Mean** | | **−8.4%** | +19.8% | | |
+| video_1 | 1080×1920, 30 fps, static | +0.2% | | 34.9 | 36.5 |
+| video_2 | 1920×1080, 30 fps, concert, cuts | +6.7% | | 27.0 | 34.4 |
+| video_3 | 3840×2160, 24 fps, handheld street | **−18.2%** | | 8.7 | 17.3 |
+| video_4 | 3840×2160, 24 fps, advert | **−32.1%** | | 9.4 | 16.4 |
+| video_5 | 1920×1080, animation | **−10.9%** | | 26.3 | 41.2 |
+| **Mean** | | **−10.9%** | | | |
 
-- **Compression:** better than SVT-AV1 preset 8 on three of five clips. Behind on video_1 and video_2, and behind libaom
-  everywhere.
+- **Compression:** better than SVT-AV1 preset 8 on three of five clips, at parity on video_1, behind on video_2.
+  libaom cpu-used 8 (before rectangular intra: +25.4%, +15.7%, +43.4%, +9.6%, +4.9%, mean +19.8%) is not re-measured.
 - **Speed:** 0.5× to 0.95× of SVT-AV1 preset 8. fps is the median of the four encodes, wall time including process
   startup.
 - SVT and libaom figures come from cached reference encodes (`tests/compare.py`).
@@ -29,17 +29,17 @@ First 120 frames of every clip in `benckmark/`, encoded with
 
 | Clip | Morning (`b40`) | Now | fps morning → now |
 | --- | ---: | ---: | ---: |
-| video_1 | +5.3% | +2.9% | 24.5 → 34.9 |
-| video_2 | +18.4% | +10.9% | 19.5 → 27.0 |
-| video_3 | −13.2% | −16.2% | 7.8 → 8.7 |
-| video_4 | −25.6% | −29.0% | 7.9 → 9.4 |
-| video_5 | −10.8% | −10.8% | 21.0 → 26.3 |
-| Mean | −5.2% | −8.4% | |
+| video_1 | +5.3% | +0.2% | 24.5 → 34.9 |
+| video_2 | +18.4% | +6.7% | 19.5 → 27.0 |
+| video_3 | −13.2% | −18.2% | 7.8 → 8.7 |
+| video_4 | −25.6% | −32.1% | 7.9 → 9.4 |
+| video_5 | −10.8% | −10.9% | 21.0 → 26.3 |
+| Mean | −5.2% | −10.9% | |
 
 Main changes:
 
-- **Intra blocks in inter frames.** These gave about −6% on video_2 and −2 to −3% elsewhere. Square blocks can switch to
-  intra using:
+- **Intra blocks in inter frames.** About −10% on video_2, −5% on video_1, −5 to −7% on the 4K clips. Blocks of every
+  shape can switch to intra using:
   - 10 luma modes and a chroma mode, both chosen by rate-distortion
   - intra transform types
   - luma transform splits

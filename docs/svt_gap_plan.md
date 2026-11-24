@@ -6,9 +6,9 @@
 
 | Clip | BD-rate | Speed vs SVT |
 | --- | --- | --- |
-| video_3, video_4, video_5 | better (−11% to −29%) | 0.5× to 0.65× |
-| video_1 | +2.9% | about 0.95× |
-| video_2 | +10.9% | about 0.8× |
+| video_3, video_4, video_5 | better (−11% to −32%) | 0.5× to 0.65× |
+| video_1 | +0.2% | about 0.95× |
+| video_2 | +6.7% | about 0.8× |
 
 **What helped most:**
 
@@ -825,3 +825,7 @@ kernel (temporary).
   The intra stage costs about 8% of a video_2 encode (4.35 vs 4.0 s with `--pf-no-intra`).
 - With intra blocks, the moving-content ALTREF boost (`AV1GPU_PF_BOOST_MOVING`, 40) rechecked on video_2: 25 +1.08%,
   60 +0.75% (kept 40). CDEF search in one launch: identical output, no measurable time change.
+- Rectangular intra blocks (HORZ / VERT halves, HORZ_4 / VERT_4 quarters, three-way halves): in video_2's ALTREFs, rectangles
+  were 30-39% of the area (`AV1GPU_PF_INTRA_STATS=2`); with them the ALTREFs go from about 60% to 80-90% intra. BD-rate:
+  video_2 -3.77%, video_1 -2.71%, video_3 -2.15%, video_4 -4.15%, video_5 -0.06%. Against SVT-AV1 preset 8: video_1 +0.2%,
+  video_2 +6.7%, video_3 -18.2%, video_4 -32.1%, video_5 -10.9% (mean -10.9%). `AV1GPU_PF_INTRA_NORECT` turns them off.

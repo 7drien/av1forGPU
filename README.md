@@ -11,11 +11,11 @@ quality ([details](docs/benchmark.md)).
 
 | Clip | BD-rate vs SVT-AV1 p8 | fps (ours / SVT-AV1 p8) |
 | --- | ---: | ---: |
-| video_1, 1080×1920 static | +2.9% | 34.9 / 36.5 |
-| video_2, 1080p concert | +10.9% | 27.0 / 34.4 |
-| video_3, 4K street | **−16.2%** | 8.7 / 17.3 |
-| video_4, 4K advert | **−29.0%** | 9.4 / 16.4 |
-| video_5, 1080p animation | **−10.8%** | 26.3 / 41.2 |
+| video_1, 1080×1920 static | +0.2% | 34.9 / 36.5 |
+| video_2, 1080p concert | +6.7% | 27.0 / 34.4 |
+| video_3, 4K street | **−18.2%** | 8.7 / 17.3 |
+| video_4, 4K advert | **−32.1%** | 9.4 / 16.4 |
+| video_5, 1080p animation | **−10.9%** | 26.3 / 41.2 |
 
 Every stream decodes with dav1d to exactly the encoder's reconstruction. The `--pframes` streams also decode
 identically with libaom and NVDEC.
@@ -58,7 +58,7 @@ ffmpeg -hide_banner -loglevel error -i benckmark/video_1.mp4 -map 0:v:0 \
   - transform size and split (TX_MODE_SELECT) and transform type
   - interpolation filter (switchable)
   - then six refinement passes re-check vectors against the decoder's candidate lists
-- **Intra blocks in inter frames:** square blocks may switch to intra. They choose among 10 luma modes, a chroma mode,
+- **Intra blocks in inter frames:** blocks of every shape may switch to intra. They choose among 10 luma modes, a chroma mode,
   intra transform types and splits, and are reconstructed in decode order by a superblock wavefront.
 - **In-loop filters (CUDA):** deblocking, CDEF (per-superblock presets) and luma Wiener loop restoration, all chosen by
   measured error.
