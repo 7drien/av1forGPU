@@ -1406,9 +1406,11 @@ int main(int argc, char **argv) {
             // Prime the ALTREF and any temporal-filter neighbours. Prefetch the remaining original
             // pictures in pyramid coding order, one per analysis launch.
             const size_t firstReady = n - 1 - std::min(n - 1, size_t(pfTfFrames));
+            // the pictures after the mini-GOP serve only as filter neighbours: uploaded below when the filter runs
+            // (each upload pads the picture on the CPU while the GPU waits for the mini-GOP to start)
             if (!inBuf.upload(n - 1, pending[n - 1])) return 1;
-            for (size_t i = firstReady; i < avail; ++i)
-                if (i != n - 1 && !inBuf.upload(i, pending[i])) return 1;
+            for (size_t i = firstReady; i < n - 1; ++i)
+                if (!inBuf.upload(i, pending[i])) return 1;
             uploadOrder.clear();
             nextUpload = 0;
             auto order = [&](auto &self, size_t lo, size_t hi) -> void {
@@ -1434,6 +1436,8 @@ int main(int argc, char **argv) {
                 tfNoisy = sigma >= tfNoise;
             }
             if (pfTfFrames > 0 && tfNoisy) {
+                for (size_t i = n; i < avail; ++i)
+                    if (!inBuf.upload(i, pending[i])) return 1;
                 std::vector<const uint8_t *> nbs[3];
                 for (size_t i = firstReady; i < avail; ++i) {
                     if (!inBuf.wait(i, compute)) return 1;
