@@ -1063,6 +1063,8 @@ __device__ __forceinline__ void evaluateOne(EvalArgs a, const int slot) {
         constexpr int RH = MW ? SH : BH;
 #pragma unroll 1
         for (int t = 0; t < 3; t++) {
+            // its bits alone exceed the best cost so far (SSE >= 0): this filter cannot win (same choice, no prediction)
+            if (t && a.lambda * fbits[t] * a.filterBias >= bestJ) continue;
             if (c.ref == 2)
                 warpPredictCompound<(BW == 64 || BH == 64)>(f.ref[0], ref2, f.w, f.h, x0, y0 + s0, BW, RH, c.mv, c.mv2, 0,
                                                             sInterp, hpS[warp] + s0 * BW, pl + s0 * BW, t, BH);
