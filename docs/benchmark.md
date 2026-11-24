@@ -96,3 +96,30 @@ Entropy paths on the first 120 frames (identical output in every case):
 | 1 | 38.7 fps | 41.5 fps | 19.4 fps |
 
 The all-GPU range coder is a single serial thread per tile, so it trails at high bitrates. Symbol modeling, the parallel part, runs on the GPU in every mode except `--pf-cpu-entropy`.
+
+## All benchmark clips against SVT-AV1 preset 8 (commit `aca6329`, 2026-11-24)
+
+`python3 tests/bench_all.py build-cuda/third_party/av1gpu/av1gpu-video --tag intra6 --refs svt`: the first 120 frames of
+every clip in `benckmark/`, `--pframes --persistent-cdf --qindex {20,50,90,130}`, decoded with dav1d, YUV-weighted PSNR,
+BD-rate against SVT-AV1 preset 8 at CRF 24/32/40/48 (negative: fewer bits than SVT for the same quality). The fps columns
+are the medians of the four encodes, wall time including startup. The SVT figures come from cached reference encodes, and
+the machine had other CPU jobs running (load average 8 to 19), so treat the speed numbers as approximate.
+
+| Clip | Content | BD-rate vs SVT (previous `b40`) | BD-rate vs SVT (intra blocks) | fps ours (previous) | fps SVT |
+| --- | --- | ---: | ---: | ---: | ---: |
+| video_1 | 1080×1920, 30 fps | +5.3% | +4.1% | 26.2 (24.5) | 36.7 |
+| video_2 | 1920×1080, 29.9 fps | +18.4% | +11.4% | 20.9 (19.5) | 33.1 |
+| video_3 | 3840×2160, 23.98 fps | −13.2% | −15.7% | 7.7 (7.8) | 17.6 |
+| video_4 | 3840×2160, 23.98 fps | −25.6% | −28.2% | 7.7 (7.9) | 16.2 |
+| video_5 | 1080p animation | −10.8% | −10.8% | 21.1 (21.0) | 41.9 |
+| Mean | | −5.2% | −7.8% | | |
+
+What changed since `b40`: square blocks of inter frames may now be intra-coded (DC / V / H / SMOOTH / SMOOTH_V / SMOOTH_H /
+PAETH luma, UV_DC chroma, one DCT_DCT transform per plane). A parallel GPU pass decides intra against the block's inter
+cost, then a single-launch superblock wavefront reconstructs the chosen blocks in decode order. `--pf-no-intra` turns it
+off. Gain over `b40`: video_1 −1.2%, video_2 −5.9%, video_3 −3.2%, video_4 −3.2%, video_5 0.0% (mean −2.7%). The streams
+decode with dav1d to exactly the encoder's reconstruction (`tests/check_pframes.py`, all configurations). The extra mode
+bits charged to an intra block (`AV1GPU_PF_INTRABITS`, default 6) barely matter: 2 and 12 moved BD-rate by at most 0.3%.
+
+Status against the goal: more efficient than SVT preset 8 on video_3, video_4 and video_5, still behind on video_1
+(+4.1%) and video_2 (+11.4%); slower than SVT on every clip (about 0.45 to 0.7× its speed).
