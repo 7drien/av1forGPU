@@ -768,3 +768,6 @@ kernel (temporary).
 - Five clips (m2: fast key frames, still offset 55, intra cost cuts) against SVT-AV1 preset 8: video_1 +2.9% at 34.9 fps
   (SVT 36.5), video_2 +10.9% at 27.0 (34.4), video_3 -16.2% at 8.7 (17.3), video_4 -29.0% at 9.4 (16.4), video_5
   -10.8% at 26.3 (41.2); mean -8.4%.
+- Per-reference motion-search chains on separate streams (identical output): 4K video_3 5.18-5.20 → 5.30-5.31 s, no
+  gain (the GPU is saturated during the search). Reverted. Forcing the ALTREF filter on (`AV1GPU_PF_TF_KEY_NOISE=0`)
+  leaves video_1 / video_5 byte-identical (another gate keeps it off there).
