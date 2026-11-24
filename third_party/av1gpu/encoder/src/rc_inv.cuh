@@ -20,10 +20,13 @@
 
 namespace rci {
 
+// bit reversal of the numBits (<= 8) low bits of x; straight-line, so it folds to a constant for unrolled indices (a
+// loop here left the 64-point transform's array indices to run time and its arrays in local memory)
 __host__ __device__ constexpr int brev(int numBits, int x) {
-    int t = 0;
-    for (int i = 0; i < numBits; i++) t |= ((x >> i) & 1) << (numBits - 1 - i);
-    return t;
+    x = ((x & 0x55) << 1) | ((x >> 1) & 0x55);
+    x = ((x & 0x33) << 2) | ((x >> 2) & 0x33);
+    x = ((x & 0x0F) << 4) | ((x >> 4) & 0x0F);
+    return x >> (8 - numBits);
 }
 __device__ __forceinline__ int cos128(int angle) { return av1g_cos128(angle); }
 __device__ __forceinline__ int sin128(int angle) { return av1g_cos128(angle - 64); }
@@ -60,11 +63,13 @@ __device__ __forceinline__ void H(int32_t (&T)[L], int a, int b, int flip, int r
 template <int n>
 __device__ __forceinline__ void idct(int32_t (&T)[1 << n], int r, uint32_t &err) {
     constexpr int n0 = 1 << n;
-    int32_t copyT[n0];
+    // step 1, the bit-reversal permutation, in place (an involution: swap each pair once); a 64-entry copy pushed
+    // the 64-point transform's arrays into local memory
 #pragma unroll
-    for (int i = 0; i < n0; i++) copyT[i] = T[i];
-#pragma unroll
-    for (int i = 0; i < n0; i++) T[i] = copyT[brev(n, i)];                                     /* step 1 */
+    for (int i = 0; i < n0; i++) {
+        const int k = brev(n, i);
+        if (i < k) { const int32_t t = T[i]; T[i] = T[k]; T[k] = t; }
+    }
     if constexpr (n == 6) {
 #pragma unroll
         for (int i = 0; i < 16; i++) B(T, 32 + i, 63 - i, 63 - 4 * brev(4, i), 0, r, err);
@@ -373,8 +378,10 @@ template <int LH>
 __device__ __forceinline__ uint32_t col(int j, int W, int ck, int16_t *res) {
     constexpr int H = 1 << LH;
     int32_t Tv[H];
+    // 64-point columns: only 32 coefficient rows exist (row() writes zeros below them), so the lower half is a
+    // compile-time zero and the 1-D transform folds the operations on it (same integer results)
 #pragma unroll
-    for (int i = 0; i < H; i++) Tv[i] = res[i * W + j];
+    for (int i = 0; i < H; i++) Tv[i] = (H == 64 && i >= 32) ? 0 : res[i * W + j];
     uint32_t err = 0;
     inv_1d<LH>(Tv, ck, 16, err);
 #pragma unroll
