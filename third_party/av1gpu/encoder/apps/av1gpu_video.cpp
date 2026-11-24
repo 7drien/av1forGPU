@@ -655,7 +655,9 @@ int main(int argc, char **argv) {
     cfg.wantRecon = false;
     GpEncoder encoder;
     std::string err;
-    if (usePframes && !kfPresetSet) apply_preset(cfg, "slow");   // key frames carry much of the quality (--kf-preset)
+    // key frames: the fast preset (9-22% faster encodes than slow for +0.2..1.1% BD-rate, five clips); --kf-preset slow
+    // for the old quality
+    if (usePframes && !kfPresetSet) apply_preset(cfg, "fast");
     if (usePframes && kfTileMp > 0) {
         // key frames of at least kfTileMp megapixels use 2^C x 2^R tiles: independent intra wavefronts and entropy
         // coders (one tile reconstructs at most one superblock diagonal at a time)

@@ -746,3 +746,11 @@ kernel (temporary).
   timers); a lossless bound skips the decision for blocks whose inter cost is below an intra block's minimum mode cost.
 - Speed (same session, with the startup / input-thread / upload fixes): video_1 28-32 fps (SVT 36.5), video_2 23-24
   (34.4), video_3 7.7-8.3 (17.3), video_4 8.0-8.6 (16.4), video_5 22-23 (41.2).
+
+### Key frames: `fast` preset by default
+
+- Remeasured with intra blocks in inter frames: `--kf-preset fast` against `slow`, five clips: video_1 +1.09% BD-rate,
+  31 → 37.9 fps; video_2 +0.33%, 24.4 → 27.9; video_3 +0.56%, 7.7 → 8.6; video_4 +0.17%, 8.0 → 8.7; video_5 +0.68%,
+  22.6 → 24.9. About 0.05 to 0.1 BD points per 1% of speed (analysis pruning costs about 0.25), so P-frame encodes now
+  default to `fast` key frames (`--kf-preset slow` restores them). `base`: video_1 +0.46% / +9% fps, video_2 +0.17% / +4%.
+- Also measured: 4 refinement passes instead of 6, video_1 +0.56% / video_2 +1.78% for +6.5% fps (kept 6).
