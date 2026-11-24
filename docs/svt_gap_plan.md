@@ -679,3 +679,12 @@ kernel (temporary).
   clips (video_3 -1.41%) at a speed cost (kept on).
 - Five clips against SVT-AV1 preset 8 (base6, before the +-8 filter default): video_1 +6.0%, video_2 +18.8%, video_3
   -13.0%, video_4 -24.7%, video_5 -9.8%; mean -4.5% (libaom +26.0%).
+- ALTREF boost retuned after the motion fix (compared directly): moving boost 80 helps video_3 (-4.9%) and hurts
+  video_2 / video_4 (+2.3 / +4.4%); 40 the reverse. video_3 is the only fast-moving clip whose ALTREFs are
+  temporally filtered: filtered ALTREFs of mini-GOPs with motion >= 1.5 now get a boost of 100 (video_3 -3.46%, the
+  other clips unchanged), and the moving boost of the other mini-GOPs is 40 (mean -0.42%; 25: +0.47%). Multiplying
+  the whole boost of filtered ALTREFs (x1.3) pushed low-motion ALTREFs towards lossless (+9%).
+- Also measured, not adopted: leaf frames at q + 10 (+0.61%), 2 full-pel search passes (+0.34% for about 5% speed),
+  lambda 0.42 / 0.6 (-0.23% mixed / +0.71%). libaom without global / warped motion on video_2: +0.1% / 0.
+- Five clips against SVT-AV1 preset 8 (b40): video_1 +5.3%, video_2 +18.4%, video_3 -13.2%, video_4 -25.6%, video_5
+  -10.8%; mean -5.2%.
