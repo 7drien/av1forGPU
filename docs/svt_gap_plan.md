@@ -823,3 +823,5 @@ kernel (temporary).
   serial steps do.
 - The four-quadrant intra split cost 6% of the encode (4.57 → 4.32 s) for -0.07%: now off (`AV1GPU_PF_INTRA_QUAD`).
   The intra stage costs about 8% of a video_2 encode (4.35 vs 4.0 s with `--pf-no-intra`).
+- With intra blocks, the moving-content ALTREF boost (`AV1GPU_PF_BOOST_MOVING`, 40) rechecked on video_2: 25 +1.08%,
+  60 +0.75% (kept 40). CDEF search in one launch: identical output, no measurable time change.
