@@ -972,7 +972,7 @@ struct TileCoder {
         sym(ic->isInter[interCtx], 0, 2);
         const int mode = bi.yMode;
         sym(ic->yMode[AV1G_T(Size_Group)[bsize]], mode, 13);
-        if (av1g_is_directional(mode)) sym(cdf->angle_delta[mode - AV1G_V_PRED], 3, 7);   // angle_delta_y 0
+        if (av1g_is_directional(mode)) sym(cdf->angle_delta[mode - AV1G_V_PRED], bi.yAngle + 3, 7);   // angle_delta_y
         const int uvMode = bi.uvMode;
         if (lw <= 5 && lh <= 5) sym(cdf->uv_mode_cfl_allowed[mode], uvMode, 14);   // CfL allowed up to 32x32
         else sym(cdf->uv_mode_cfl_not_allowed[mode], uvMode, 13);

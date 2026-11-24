@@ -2770,6 +2770,24 @@ __global__ void acceptMotion(TileJob j, ModeTrial *trials, BlockInfo *grid, uint
 // The last three (D135, D113, D157: 90 < angle < 180, angle_delta 0) read only AboveRow[-1 .. w-1] and
 // LeftCol[-1 .. h-1] too; they need enable_intra_edge_filter = 0 (IntraArgs::directional).
 constexpr int kIntraModes = 10, kIntraModesNoDir = 7;
+// Luma candidates: the modes above (angle_delta 0), then directional modes with an angle delta that keeps the angle
+// strictly between 90 and 180 degrees (V +1..+3, H -1..-3, D135 / D113 / D157 +-1..3), so no above-right / below-left
+// sample is read. Code: mode | d << 4, d = angle_delta + 4 (0: delta 0).
+#define PF_LD(m, d) ((m) | ((d) + 4) << 4)
+constexpr int kLumaCands = 34;
+__constant__ uint8_t c_lumaCands[kLumaCands] = {
+    AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED, AV1G_SMOOTH_V_PRED, AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED,
+    AV1G_D135_PRED, AV1G_D113_PRED, AV1G_D157_PRED,
+    PF_LD(AV1G_V_PRED, 1), PF_LD(AV1G_V_PRED, 2), PF_LD(AV1G_V_PRED, 3),
+    PF_LD(AV1G_H_PRED, -1), PF_LD(AV1G_H_PRED, -2), PF_LD(AV1G_H_PRED, -3),
+    PF_LD(AV1G_D135_PRED, -3), PF_LD(AV1G_D135_PRED, -2), PF_LD(AV1G_D135_PRED, -1),
+    PF_LD(AV1G_D135_PRED, 1), PF_LD(AV1G_D135_PRED, 2), PF_LD(AV1G_D135_PRED, 3),
+    PF_LD(AV1G_D113_PRED, -3), PF_LD(AV1G_D113_PRED, -2), PF_LD(AV1G_D113_PRED, -1),
+    PF_LD(AV1G_D113_PRED, 1), PF_LD(AV1G_D113_PRED, 2), PF_LD(AV1G_D113_PRED, 3),
+    PF_LD(AV1G_D157_PRED, -3), PF_LD(AV1G_D157_PRED, -2), PF_LD(AV1G_D157_PRED, -1),
+    PF_LD(AV1G_D157_PRED, 1), PF_LD(AV1G_D157_PRED, 2), PF_LD(AV1G_D157_PRED, 3)};
+#undef PF_LD
+__device__ __forceinline__ int lumaDelta(int code) { return code >> 4 ? (code >> 4) - 4 : 0; }
 __constant__ uint8_t c_intraModes[kIntraModes] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED,
                                                    AV1G_SMOOTH_V_PRED, AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED,
                                                    AV1G_D135_PRED, AV1G_D113_PRED, AV1G_D157_PRED};
@@ -2795,6 +2813,8 @@ struct IntraArgs {
     float sadGate;
     int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
     float splitPartBits;   // extra partition bits of that split   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
+    int deltaK;   // angle-delta candidates RD-checked (best by SAD) after the base modes
+    int nLuma;    // luma candidates (with the angle deltas: kLumaCands)
     int nModes;   // candidate intra modes (kIntraModesNoDir without the directional ones)   // extra bits charged to a chroma mode other than UV_DC_PRED
     float rnd, zbin, lambda, intraBits, modeBase, skipBits0, skipBits1, mvWeight;
     const Cand *cand[kSizes];
@@ -2802,7 +2822,7 @@ struct IntraArgs {
     const Cand *rcand[10];     // rectangular blocks (DecideArgs::rcand layout)
     int rcols[10];
     const ModeTrial *trials;   // refinement state (accepted trials' costs), or null
-    uint16_t *sel;   // per grid unit (block top-left): intra mode + 1 | luma type << 4 | tx_depth << 8, 0 inter
+    uint32_t *sel;   // per grid unit (block top-left): mode + 1 | type << 4 | tx_depth << 8 | uv << 10 | d << 16, 0 inter
     int *done;
     unsigned *ticket;
     int tag;
@@ -2842,8 +2862,10 @@ __device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int nA
     }
     __syncwarp();
 }
-__device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw, int lh, const uint8_t *ab, const uint8_t *lb) {
-    return mode == AV1G_DC_PRED ? dc : av1g_pred_pixel(mode, av1g_is_directional(mode) ? AV1G_T(Mode_To_Angle)[mode] : 0, i, j, lw, lh, ab, lb);
+__device__ __forceinline__ int intraPixel(int code, int dc, int i, int j, int lw, int lh, const uint8_t *ab, const uint8_t *lb) {
+    const int mode = code & 15;   // code: mode | (angle_delta + 4) << 4 for luma candidates with a delta
+    return mode == AV1G_DC_PRED ? dc
+         : av1g_pred_pixel(mode, av1g_is_directional(mode) ? AV1G_T(Mode_To_Angle)[mode] + 3 * lumaDelta(code) : 0, i, j, lw, lh, ab, lb);
 }
 // Luma of an intra block (one warp). mode < 0: choose the luma mode by SAD first; forcedType < 0: search the transform
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
@@ -2860,8 +2882,8 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
     const int dcY = av1g_dc_value<8>(ab, lb, haveL, haveA, LW, LH);
     if (mode < 0) {
         int best = 0x7fffffff, bestNd = 0x7fffffff, third = 0x7fffffff;
-        for (int k = 0; k < a.nModes; k++) {
-            const int m = c_intraModes[k];
+        for (int k = 0; k < a.nLuma; k++) {
+            const int m = c_lumaCands[k];
             // SAD screen on every other row and column of blocks >= 16x16 (the choice is checked by RD after)
             constexpr int SS = W >= 16 && H >= 16 ? 1 : 0, LS = LW - SS, WS = W >> SS, HS = H >> SS;
             int sad = 0;
@@ -2910,7 +2932,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
     e.plane = 0;
     e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
     e.rnd = a.rnd; e.zbin = a.zbin;
-    e.skipCtx = 0; e.dcCtx = 0; e.intraDir = mode; e.reduced = a.reduced;
+    e.skipCtx = 0; e.dcCtx = 0; e.intraDir = mode & 15; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
@@ -2988,7 +3010,7 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S,
     e.plane = 0;
     e.dcQ = dcQ; e.acQ = acQ; e.qm = nullptr;
     e.rnd = a.rnd; e.zbin = a.zbin;
-    e.skipCtx = 4; e.dcCtx = 0; e.intraDir = mode; e.reduced = a.reduced;
+    e.skipCtx = 4; e.dcCtx = 0; e.intraDir = mode & 15; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
     e.qmDist = 0; e.qmRnd = 0;
     const int set = av1g_get_tx_set_intra(e.txSz, a.reduced);
@@ -3177,7 +3199,7 @@ template <int LW, int LH = LW>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                             int &type, int &depth, float jInter, int &uvMode) {
     IntraPart pt[3];
-    int alt = -1, alt3 = -1, sads[kIntraModes];
+    int alt = -1, alt3 = -1, sads[kLumaCands];
     pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
                               a.alt3 ? &alt3 : nullptr, sads);
     if (pt[0].dSkip >= kInf) return kInf;
@@ -3198,18 +3220,20 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
     if (a.topK > 3 && pt[0].dSkip < kInf) {
         const int first = mode, second = alt, third = alt3;
         auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
-        for (int rank = 3; rank < a.topK; rank++) {
-            int pick = -1, ps = 0x7fffffff;   // the rank-th smallest SAD among the modes not yet tried
-            for (int k = 0; k < a.nModes; k++) {
-                const int m = c_intraModes[k];
+        // base modes (angle_delta 0) first, then the deltaK best angle-delta candidates by SAD
+        for (int rank = 0; rank < a.topK + a.deltaK; rank++) {
+            const bool deltas = rank >= a.topK;
+            int pick = -1, ps = 0x7fffffff;   // the smallest SAD among the candidates not yet tried
+            for (int k = deltas ? a.nModes : 0; k < (deltas ? a.nLuma : a.nModes); k++) {
+                const int m = c_lumaCands[k];
                 if (m == first || m == second || m == third || sads[k] < 0) continue;
                 if (sads[k] < ps) { ps = sads[k]; pick = k; }
             }
             if (pick < 0) break;
             sads[pick] = -1;
-            int mk = c_intraModes[pick];
+            int mk = c_lumaCands[pick];
             const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mk, -1);
-            if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = c_intraModes[pick]; }
+            if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = c_lumaCands[pick]; }
         }
     }
     {
@@ -3323,24 +3347,24 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
     int type = 0, depth = 0, uvMode = 0;
     const float jIntra = intraBlock<LW, LH>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode);
     const bool useIntra = jIntra * a.margin < jInter;
-    uint16_t v = useIntra ? (uint16_t)((mode + 1) | type << 4 | depth << 8 | uvMode << 10) : 0;
+    uint32_t v = useIntra ? (uint32_t)(((mode & 15) + 1) | type << 4 | depth << 8 | uvMode << 10 | (mode >> 4) << 16) : 0;
     if constexpr (LW == 6 && LH == 6) {
         // four 32x32 intra blocks instead (partition SPLIT), each with its own modes; the quadrants' neighbours inside
         // the block are approximated by the inter reconstruction, as the outer ones are
         if (a.splitIntra && jIntra < kInf) {
             auto &S32 = *reinterpret_cast<IntraScratch<32> *>(&S[warp]);
             float j4 = a.lambda * a.splitPartBits;
-            uint16_t cs[4];
+            uint32_t cs[4];
             for (int q = 0; q < 4 && j4 < kInf; q++) {
                 int m = -1, t = 0, d = 0, uv = 0;
                 const float jq = intraBlock<5, 5>(a, S32, x0 + (q & 1) * 32, y0 + (q >> 1) * 32, (q >> 1) ? true : haveA,
                                                (q & 1) ? true : haveL, m, t, d, kInf, uv);
                 j4 += jq;
-                cs[q] = (uint16_t)((m + 1) | t << 4 | d << 8 | uv << 10);
+                cs[q] = (uint32_t)(((m & 15) + 1) | t << 4 | d << 8 | uv << 10 | (m >> 4) << 16);
             }
             if (j4 * a.margin < jInter && j4 < (useIntra ? jIntra : kInf)) {
                 if (!lane) {
-                    a.sel[gy * gcols + gx] = (uint16_t)(cs[0] | 1u << 14);   // bit 14: the 64x64 block splits
+                    a.sel[gy * gcols + gx] = cs[0] | 1u << 14;   // bit 14: the 64x64 block splits
                     a.sel[gy * gcols + gx + 4] = cs[1];
                     a.sel[(gy + 4) * gcols + gx] = cs[2];
                     a.sel[(gy + 4) * gcols + gx + 4] = cs[3];
@@ -3353,7 +3377,7 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
 }
 // 64x64 blocks whose intra decision chose four 32x32 intra blocks: rewrite their grid units (the block lists are
 // rebuilt after this).
-__global__ void applyIntraSplit(BlockInfo *grid, uint16_t *sel, int gcols, int grows) {
+__global__ void applyIntraSplit(BlockInfo *grid, uint32_t *sel, int gcols, int grows) {
     const int gx = (blockIdx.x * blockDim.x + threadIdx.x) * 8, gy = (blockIdx.y * blockDim.y + threadIdx.y) * 8;
     if (gx >= gcols || gy >= grows) return;
     if (!(sel[gy * gcols + gx] & (1u << 14))) return;
@@ -3424,7 +3448,8 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            const int mode = (s & 15) - 1, ft = (s >> 4) & 15, depth = (s >> 8) & 3, uvMode = s >> 10;
+            const int mode = ((s & 15) - 1) | ((s >> 16) & 7) << 4, ft = (s >> 4) & 15, depth = (s >> 8) & 3,
+                      uvMode = (s >> 10) & 15;
             int skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
 #define PF_IRB(LW, LH)                                                                                         \
@@ -3440,7 +3465,8 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
                 for (int i = lane; i < u * uh; i += 32) {
                     BlockInfo &bi = a.grid[(gy + i / u) * gcols + gx + i % u];
                     bi.intra = 1;
-                    bi.yMode = (uint8_t)mode;
+                    bi.yMode = (uint8_t)(mode & 15);
+                    bi.yAngle = (int8_t)lumaDelta(mode);
                     bi.uvMode = (uint8_t)uvMode;
                     bi.skip = (uint8_t)skip;
                     bi.txSplit = (uint8_t)depth;
@@ -3951,7 +3977,7 @@ struct State {
     pft2::MiInfo *modeMi = nullptr;
     pft2::BlockEntry *modeEntries = nullptr;
     uint32_t *modeEntryCount = nullptr;
- uint16_t *intraSel = nullptr;       // per grid unit: intra mode + 1 chosen for the block starting there, 0 inter
+ uint32_t *intraSel = nullptr;       // per grid unit: intra mode + 1 chosen for the block starting there, 0 inter
     int *intraDone = nullptr;          // per superblock: frame tag once its intra blocks are reconstructed
     unsigned *intraTicket = nullptr;
     int intraTag = 0;
@@ -4253,7 +4279,7 @@ int Analyzer::init(int width, int height, char *err, int errLen) {
         alloc(&s->modeMi, sizeof(pft2::MiInfo) * miCols * miRows);
         alloc(&s->modeEntries, sizeof(pft2::BlockEntry) * nSb * 64);
         alloc(&s->modeEntryCount, sizeof(uint32_t) * nSb);
-        alloc(&s->intraSel, gridCount() * sizeof(uint16_t));
+        alloc(&s->intraSel, gridCount() * sizeof(uint32_t));
         alloc(&s->intraDone, sizeof(int) * nSb);
         alloc(&s->intraTicket, sizeof(unsigned));
         if (e == cudaSuccess) e = cudaMemset(s->intraDone, 0, sizeof(int) * nSb);
@@ -4747,6 +4773,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
+        ia.nLuma = ia.nModes == kIntraModes && getenv("AV1GPU_PF_INTRA_DELTA") ? kLumaCands : ia.nModes;   // off: neutral
+        ia.deltaK = getenv("AV1GPU_PF_INTRA_DELTAK") ? atoi(getenv("AV1GPU_PF_INTRA_DELTAK")) : 3;
         ia.uvBits = getenv("AV1GPU_PF_INTRA_UVBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_UVBITS")) : 1.f;
         ia.splitGate = getenv("AV1GPU_PF_INTRA_SPLITGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SPLITGATE")) : 1.3f;
         ia.intraBits = getenv("AV1GPU_PF_INTRABITS") ? (float)atof(getenv("AV1GPU_PF_INTRABITS")) : st.intraBits;
@@ -4759,7 +4787,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.done = s->intraDone;
         ia.ticket = s->intraTicket;
         ia.tag = ++s->intraTag;
-        cudaMemsetAsync(s->intraSel, 0, gridCount() * sizeof(uint16_t), stream);
+        cudaMemsetAsync(s->intraSel, 0, gridCount() * sizeof(uint32_t), stream);
         cudaMemsetAsync(s->intraTicket, 0, sizeof(unsigned), stream);
         const int gc = s->gcols, gr = s->grows;
         { FineTimer t2("intra decide");

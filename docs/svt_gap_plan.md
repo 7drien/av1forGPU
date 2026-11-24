@@ -834,3 +834,6 @@ kernel (temporary).
   Against SVT-AV1 preset 8: video_1 -0.5%, video_2 +3.3%. Rechecked and kept off: the chosen chroma mode's cost in the
   intra / inter decision (`AV1GPU_PF_INTRA_UVTIP`: video_1 -0.48%, video_2 +0.94%), split gate 2.0 (within 0.06%),
   intra bits 3 / 9 (within 0.13%).
+- Luma angle deltas (V +, H -, D113 / D135 / D157 +-1..3; bit-exact): with the ten base modes always RD-checked plus the
+  three best deltas by SAD, neutral (video_1 -0.07%, video_2 +0.07%); ranking all 34 candidates by SAD lost 1.7% on
+  video_2 (the deltas pushed base modes out of the RD check). Off (`AV1GPU_PF_INTRA_DELTA=1`).

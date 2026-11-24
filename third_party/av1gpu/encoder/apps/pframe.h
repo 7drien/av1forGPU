@@ -36,6 +36,7 @@ struct BlockInfo {
     uint8_t intra;     // 1: intra block (square, one transform of the block size, DCT_DCT, UV_DC_PRED chroma)
     uint8_t yMode;     // intra luma mode (DC, V, H, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH)
     uint8_t uvMode;    // intra chroma mode (same set, UV numbering)
+    int8_t yAngle;     // intra luma angle_delta (-3..3)
     // loop restoration of the 64x64 luma unit whose top-left 8x8 this is (set only there): lrUse 1 = Wiener with
     // LrWiener coefficients lrCoef[pass][0..2] (pass 0 vertical, 1 horizontal)
     int8_t lrUse;
