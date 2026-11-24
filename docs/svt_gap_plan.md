@@ -774,3 +774,4 @@ kernel (temporary).
 - `evaluate` instantiations use 255 registers and 350-530 B of stack (about 8 resident warps per SM). A 128-register
   cap on pframe.cu (`-maxrregcount=128`): identical output, same time on video_2 (4.58-4.83 s both ways, interleaved):
   occupancy is not what limits them.
+- Rectangular prune margin 1.0 (`AV1GPU_PF_PRUNE`): video_2 +0.08%, video_5 +0.49%, no measurable speed gain. Dropped.
