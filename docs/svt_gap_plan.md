@@ -630,3 +630,31 @@ kernel (temporary).
 - Phase planes: one tap window per thread for all four horizontal phases, and a 15-row window per thread for eight rows
   of the four vertical phases (+1.7%).
 - Tried and dropped: both split depths of 64x64 trials in one launch (no gain), grid-stride dense kernels.
+- Striped 64-wide evaluations: the split-external evaluations of 64x64, 64x32 and 32x64 blocks run four warps per
+  block, each predicting a horizontal stripe (filter search, the three planes, stored prediction, skip SSE; the vertical
+  filter row follows the whole block's height), then warp 0 codes the luma transform: these kernels take about 40% less
+  GPU time. 32x32 / 16x64 were slower striped (also in the trials only); 64x16 has 2-row chroma stripes.
+- Compile-time forward transforms (`warp_fwd_ct`, which splits columns / rows over several lanes) at every evaluation
+  call site: evaluation kernel time per frame 61.8 → 53.5 ms, a refinement pass 1.84 → 1.49 ms. A compile-time copy
+  of the quantizer / rate estimate brought nothing.
+- Filters: the loop-restoration filter in shared-memory 32 x 8 tiles (one stripe and one unit each) with one SSE
+  atomic per CTA (1.78 → 0.13 ms per frame); the restoration normal equations from a shared tile when the unit lies in
+  one stripe (1.08 → 0.61 ms); plane SSEs with four samples per thread and one atomic per CTA (1.05 → 0.37 ms).
+- Motion search skips vectors it already priced (duplicate candidates, neighbours of the previous centre): +2.6%.
+- Temporal filter: four-sample SADs in its full-pel search and the horizontal pass of each quarter-pel step's three
+  column phases computed once: 2.6x faster (4K: 148 ms for a key frame over 12 neighbours before).
+- Fixed cost per run: about 0.75 s on this machine even for a 64x64 clip: CUDA context creation 0.36 s (0.12-0.25 s
+  for a trivial program), module loading, and 0.3 s of driver teardown after `exit_group` (not avoidable from the
+  program; persistence mode is off here). `-lineinfo` (now `AV1GPU_LINEINFO`, off) made up 55 of the 77 MB of the
+  P-frame module; without it and with a SASS-only build (`-DCMAKE_CUDA_ARCHITECTURES=86-real`) the fixed cost drops by
+  about 0.2 s, which matters at 120 frames (a 1080p clip encodes in about 4 s).
+- Key frames: the intra wavefront (`k_recon`, slow preset) is about 20 ms per 64x64 superblock on 9-52 CTAs per
+  diagonal: 335 ms per 1080p key frame. 8x8 key-frame tiles: 457 → 304 ms, +0.13% BD; `--kf-preset fast`: 468 → 189
+  ms, +0.6% BD. Kept.
+- Tried, no gain: device-gated warp / lane split kernels in the trials, a lane kernel for the whole 8x8 transform,
+  grid-stride `proposeMotion` (2-4x slower), striping the 32x32 trials, motion-search groups of 4 or 16 words per lane.
+- Compression experiments compared directly (no change adopted): forced 16-frame mini-GOPs (video_2 -0.90%, video_3
+  +2.68%, mean +0.47%); pyramid boost curvature (linear best); three references (-0.14% for 6-8% speed); stronger or
+  longer ALTREF filtering (video_3 +11.6% to +16.7%); lambda x 0.8 / 0.9 on referenced frames (mean -0.15% / -0.14%:
+  video_3 -1.0%, video_4 -0.4%, video_1 / video_5 +0.2 to +0.5%); lambda x 1.25 on leaf frames (video_2 +0.53%).
+  libaom ablations on video_3: TPL +2.7%, 64x64 superblocks +5.8%, which explain little of its 2.5x lead there.
