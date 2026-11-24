@@ -1387,9 +1387,9 @@ int main(int argc, char **argv) {
             auto release = [&](int k) { if (k >= 0) freeSlots.push_back(k); };
             // ALTREF boost from the change between the anchor and the ALTREF source (--pf-adaptive)
             gopMotion = !prevFrame.empty() ? motionOf(&prevFrame, 0, n - 1) : 0.0;
-            static const double movingBoost = getenv("AV1GPU_PF_BOOST_MOVING") ? atof(getenv("AV1GPU_PF_BOOST_MOVING")) : 60.0;
+            static const double movingBoost = getenv("AV1GPU_PF_BOOST_MOVING") ? atof(getenv("AV1GPU_PF_BOOST_MOVING")) : 40.0;
             // a temporally filtered ALTREF of fast-moving content (a pan of noisy footage) stays a useful reference over
-            // its whole mini-GOP: it keeps a larger boost (AV1GPU_PF_BOOST_MOVING_FILTERED; video_3 -5.7%, no other clip
+            // its whole mini-GOP: it keeps a larger boost (AV1GPU_PF_BOOST_MOVING_FILTERED; video_3 -3.5%, no other clip
             // reaches the motion)
             static const double movingFiltered = getenv("AV1GPU_PF_BOOST_MOVING_FILTERED") ? atof(getenv("AV1GPU_PF_BOOST_MOVING_FILTERED")) : 100.0;
             double gopBoost = pfAdaptive && !prevFrame.empty()
