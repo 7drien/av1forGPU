@@ -754,3 +754,6 @@ kernel (temporary).
   22.6 → 24.9. About 0.05 to 0.1 BD points per 1% of speed (analysis pruning costs about 0.25), so P-frame encodes now
   default to `fast` key frames (`--kf-preset slow` restores them). `base`: video_1 +0.46% / +9% fps, video_2 +0.17% / +4%.
 - Also measured: 4 refinement passes instead of 6, video_1 +0.56% / video_2 +1.78% for +6.5% fps (kept 6).
+- With fast key frames, the still-content key-frame offset `AV1GPU_PF_KEYSTILL` 40 → 55: video_1 +4.1% → +2.7% against
+  SVT-AV1 (video_2 / video_5 unchanged; against our own 40 the shared-range BD is +1.0% on video_1, the points shift to
+  higher quality). Same speed. 8 refinement passes: video_1 -0.2%, video_2 -0.8% for -11% fps (kept 6).

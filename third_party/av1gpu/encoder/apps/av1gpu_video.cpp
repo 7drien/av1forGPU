@@ -1227,7 +1227,7 @@ int main(int argc, char **argv) {
         };
         static const double cutCorr = getenv("AV1GPU_PF_CUTCORR") ? atof(getenv("AV1GPU_PF_CUTCORR")) : 0.7;
         // extra key-frame quality for static content (periodic key frames; AV1GPU_PF_KEYSTILL)
-        static const int keyStill = getenv("AV1GPU_PF_KEYSTILL") ? atoi(getenv("AV1GPU_PF_KEYSTILL")) : 40;
+        static const int keyStill = getenv("AV1GPU_PF_KEYSTILL") ? atoi(getenv("AV1GPU_PF_KEYSTILL")) : 55;
         auto firstCut = [&](size_t limit) -> size_t {
             if (pfSceneCut <= 0) return limit;
             readMore(limit + 1);
