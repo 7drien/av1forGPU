@@ -2801,7 +2801,7 @@ __device__ __forceinline__ int intraPixel(int mode, int dc, int i, int j, int lw
 // of skip and coded; with write, stores the reconstruction and levels of that option and sets *skipOut.
 template <int L>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            bool write, int *skipOut, int *typeOut = nullptr) {
+                            bool write, int *skipOut, int *typeOut = nullptr, int forcedType = -1) {
     constexpr int N = 1 << L, T = N > 32 ? 32 : N, C = N / 2, LC = L - 1;
     const int lane = threadIdx.x & 31;
     const uint8_t *src = a.src[0];
@@ -2847,7 +2847,9 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
     // luma transform type: every type of the intra set (8x8 / 16x16) by the quantizer's estimate
     int type = AV1G_DCT_DCT;
     const int set = av1g_get_tx_set_intra(e.txSz, a.reduced);
-    if (set != AV1G_TX_SET_DCTONLY) {
+    if (forcedType >= 0) {
+        type = forcedType;   // the decision pass's choice (reconstruction pass)
+    } else if (set != AV1G_TX_SET_DCTONLY) {
         float bestJ = kInf;
         const int n = set == AV1G_TX_SET_INTRA_1 ? 7 : 5;
         for (int k = 0; k < n; k++) {
@@ -2931,8 +2933,8 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << L> &S, int x0,
         }
         __syncwarp();
         *skipOut = skip;
-        if (typeOut) *typeOut = skip || !nzY ? AV1G_DCT_DCT : type;   // an all-zero luma transform codes no type
     }
+    if (typeOut) *typeOut = skip || !nzY ? AV1G_DCT_DCT : type;   // an all-zero luma transform codes no type
     return (skip ? jSkip : jCoded) + a.lambda * (a.intraBits + a.modeBase);
 }
 __device__ __forceinline__ void intraAvail(const TileJob &j, int miRow, int miCol, bool &haveA, bool &haveL) {
@@ -2959,11 +2961,17 @@ __global__ void __launch_bounds__(32 * (L >= 6 ? 1 : L == 5 ? 2 : 4)) intraDecid
         const ModeTrial &t = a.trials[gy * gcols + gx];
         if (t.refined) jInter = t.curCost + a.lambda * c.mvBits * a.mvWeight;
     }
+    // an intra block costs at least its mode bits: blocks already cheaper keep inter prediction
+    if (jInter <= a.lambda * (a.intraBits + a.modeBase + fminf(a.skipBits0, a.skipBits1))) {
+        if (!lane) a.sel[gy * gcols + gx] = 0;
+        return;
+    }
     bool haveA, haveL;
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
-    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, false, nullptr);
-    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint8_t)(mode + 1) : 0;
+    int type = 0;
+    const float jIntra = intraBlock<L>(a, S[warp], x0, y0, haveA, haveL, mode, false, nullptr, &type);
+    if (!lane) a.sel[gy * gcols + gx] = jIntra < jInter ? (uint8_t)((mode + 1) | type << 4) : 0;
 }
 __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
     __shared__ IntraScratch<64> S;
@@ -3000,13 +3008,14 @@ __global__ void __launch_bounds__(32) intraRecon(IntraArgs a) {
             if (!s) continue;
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
-            int mode = s - 1, skip = 0, type = 0;
+            int mode = (s & 15) - 1, skip = 0, type = 0;
+            const int ft = s >> 4;
             const int x0 = gx * 8, y0 = gy * 8;
             switch (be.lw) {
-            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
-            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
-            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type); break;
-            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip, &type); break;
+            case 3: intraBlock<3>(a, *reinterpret_cast<IntraScratch<8> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
+            case 4: intraBlock<4>(a, *reinterpret_cast<IntraScratch<16> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
+            case 5: intraBlock<5>(a, *reinterpret_cast<IntraScratch<32> *>(&S), x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
+            default: intraBlock<6>(a, S, x0, y0, haveA, haveL, mode, true, &skip, &type, ft); break;
             }
             const int u = 1 << (be.lw - 3);
             for (int i = lane; i < u * u; i += 32) {
@@ -4312,11 +4321,14 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         cudaMemsetAsync(s->intraSel, 0, gridCount(), stream);
         cudaMemsetAsync(s->intraTicket, 0, sizeof(unsigned), stream);
         const int gc = s->gcols, gr = s->grows;
+        { FineTimer t2("intra decide");
         intraDecide<6><<<((gc + 7) / 8) * ((gr + 7) / 8), 32, 0, stream>>>(ia);
         intraDecide<5><<<(((gc + 3) / 4) * ((gr + 3) / 4) + 1) / 2, 64, 0, stream>>>(ia);
         intraDecide<4><<<(((gc + 1) / 2) * ((gr + 1) / 2) + 3) / 4, 128, 0, stream>>>(ia);
         intraDecide<3><<<(gc * gr + 3) / 4, 128, 0, stream>>>(ia);
-        intraRecon<<<nSb, 32, 0, stream>>>(ia);
+        }
+        { FineTimer t3("intra recon");
+        intraRecon<<<nSb, 32, 0, stream>>>(ia); }
     }
 #undef PF_EVAL_RECTS
 #undef PF_REVAL
