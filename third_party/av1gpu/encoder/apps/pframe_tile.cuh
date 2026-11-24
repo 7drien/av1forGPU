@@ -976,6 +976,15 @@ struct TileCoder {
         const int uvMode = bi.uvMode;
         if (lw <= 5 && lh <= 5) sym(cdf->uv_mode_cfl_allowed[mode], uvMode, 14);   // CfL allowed up to 32x32
         else sym(cdf->uv_mode_cfl_not_allowed[mode], uvMode, 13);
+        if (uvMode == AV1G_UV_CFL_PRED) {   // read_cfl_alphas
+            const int aU = bi.cflU, aV = bi.cflV;
+            const int sU = aU == 0 ? AV1G_CFL_SIGN_ZERO : aU < 0 ? AV1G_CFL_SIGN_NEG : AV1G_CFL_SIGN_POS;
+            const int sV = aV == 0 ? AV1G_CFL_SIGN_ZERO : aV < 0 ? AV1G_CFL_SIGN_NEG : AV1G_CFL_SIGN_POS;
+            if (sU == AV1G_CFL_SIGN_ZERO && sV == AV1G_CFL_SIGN_ZERO) { st.error = 11; return; }
+            sym(cdf->cfl_sign, sU * 3 + sV - 1, AV1G_CFL_JOINT_SIGNS);
+            if (sU != AV1G_CFL_SIGN_ZERO) sym(cdf->cfl_alpha[(sU - 1) * 3 + sV], iabs(aU) - 1, AV1G_CFL_ALPHABET_SIZE);
+            if (sV != AV1G_CFL_SIGN_ZERO) sym(cdf->cfl_alpha[(sV - 1) * 3 + sU], iabs(aV) - 1, AV1G_CFL_ALPHABET_SIZE);
+        }
         if (av1g_is_directional(uvMode)) sym(cdf->angle_delta[uvMode - AV1G_V_PRED], 3, 7);   // angle_delta_uv 0
         if (fs->filterIntra && mode == AV1G_DC_PRED && lw <= 5 && lh <= 5) sym(cdf->filter_intra[bsize], 0, 2);
         if (fs->txModeSelect) {

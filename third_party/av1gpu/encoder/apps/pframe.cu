@@ -2807,6 +2807,8 @@ struct IntraArgs {
     int alt2;      // RD-check the second best luma mode by SAD (else the best non-directional one)
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
+    int cfl;        // CfL chroma candidate (blocks up to 32x32)
+    float cflBits;  // extra bits charged to CfL (signs and alphas)
     int uvAll;
     int uvTip;    // the chosen chroma mode's cost (not UV_DC's) enters the intra / inter decision    // every chroma mode by RD (else UV_DC against the best by SAD)
     float margin;
@@ -3077,9 +3079,25 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S,
     return r;
 }
 // Chroma plane p (1, 2) of an intra block, UV_DC_PRED (one warp).
+// CfL (spec 7.11.5, 4:2:0): the luma value of chroma sample (r, c) from the block's W-wide luma reconstruction, and
+// the block average of those values (all lanes).
+__device__ __forceinline__ int cflLumaAt(const uint8_t *luma, int W, int r, int c) {
+    const uint8_t *l = luma + (2 * r) * W + 2 * c;
+    return (l[0] + l[1] + l[W] + l[W + 1]) << 1;
+}
+template <int LCW, int LCH>
+__device__ __forceinline__ int cflLumaAvg(const uint8_t *luma) {
+    constexpr int CW = 1 << LCW, CH = 1 << LCH;
+    int t = 0;
+    for (int i = threadIdx.x & 31; i < CW * CH; i += 32) t += cflLumaAt(luma, 2 * CW, i >> LCW, i & (CW - 1));
+    return av1g_round2(warp_sumi(t), LCW + LCH);
+}
+__device__ __forceinline__ int cflPixel(int dc, int alpha, int v, int avg) {
+    return min(max(dc + av1g_round2signed(alpha * (v - avg), 6), 0), 255);
+}
 template <int LW, int LH = LW>
 __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int p, int x0, int y0, bool haveA, bool haveL,
-                                 int uvMode) {
+                                 int uvMode, int cflAlpha = 0, const uint8_t *cflLuma = nullptr) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
     const int lane = threadIdx.x & 31;
     const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
@@ -3091,10 +3109,13 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << 
     const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LCW, LCH);
     uint8_t *pr = S.predC[k], *rc = S.recC[k];
     int16_t *q = S.qC[k], *res = S.resC[k];
+    const bool cfl = uvMode == AV1G_UV_CFL_PRED;
+    const int avg = cfl ? cflLumaAvg<LCW, LCH>(cflLuma) : 0;
     float en = 0.f;
     for (int i = lane; i < CW * CH; i += 32) {
         const int r = i >> LCW, c = i & (CW - 1);
-        const int pv = intraPixel(uvMode, dc, r, c, LCW, LCH, ab, lb);
+        const int pv = cfl ? cflPixel(dc, cflAlpha, cflLumaAt(cflLuma, 2 * CW, r, c), avg)
+                           : intraPixel(uvMode, dc, r, c, LCW, LCH, ab, lb);
         const int d = (int)cs[(cy + r) * cp + cx + c] - pv;
         pr[i] = (uint8_t)pv;
         res[i] = (int16_t)d;
@@ -3131,6 +3152,37 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << 
     r.type = AV1G_DCT_DCT;
     r.noSkip = 0;
     return r;
+}
+// CfL alpha of plane p (-16..16, 1/8 units) with the least prediction SSE, from a W-wide luma reconstruction.
+template <int LW, int LH>
+__device__ int cflBestAlpha(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int p, int x0, int y0, bool haveA, bool haveL,
+                            const uint8_t *luma) {
+    constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
+    const int lane = threadIdx.x & 31;
+    const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
+    const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
+    const uint8_t *cs = a.src[p];
+    const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
+    intraEdges(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
+    const int dc = av1g_dc_value<8>(S.aboveC[k] + 1, S.leftC[k] + 1, haveL, haveA, LCW, LCH);
+    const int avg = cflLumaAvg<LCW, LCH>(luma);
+    int sse[33] = {};
+    for (int i = lane; i < CW * CH; i += 32) {
+        const int r = i >> LCW, c = i & (CW - 1);
+        const int v = cflLumaAt(luma, 2 * CW, r, c), sv = cs[(cy + r) * cp + cx + c];
+#pragma unroll
+        for (int al = -16; al <= 16; al++) {
+            const int d = sv - cflPixel(dc, al, v, avg);
+            sse[al + 16] += d * d;
+        }
+    }
+    int best = 0x7fffffff, bestA = 0;
+#pragma unroll
+    for (int al = 0; al < 33; al++) {
+        const int t = warp_sumi(sse[al]);
+        if (t < best) { best = t; bestA = al - 16; }
+    }
+    return bestA;
 }
 // Skip or coded, from the three planes' terms; returns the rate-distortion cost (mode bits included).
 __device__ __forceinline__ float intraCombine(const IntraArgs &a, const IntraPart *pt, bool &skip) {
@@ -3197,8 +3249,9 @@ __device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
 // Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
 template <int LW, int LH = LW>
 __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
-                            int &type, int &depth, float jInter, int &uvMode) {
+                            int &type, int &depth, float jInter, int &uvMode, int &cflU, int &cflV) {
     IntraPart pt[3];
+    cflU = cflV = 0;
     int alt = -1, alt3 = -1, sads[kLumaCands];
     pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
                               a.alt3 ? &alt3 : nullptr, sads);
@@ -3260,6 +3313,21 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
             if (j < best) { best = j; uvMode = m; bu = u; bv = v; }
         }
         if (a.uvTip) { pt[1] = bu; pt[2] = bv; }   // the chosen chroma mode's cost enters the decision
+        // CfL (blocks up to 32x32): the luma reconstruction of the chosen luma mode, the best alphas by SSE
+        if constexpr ((1 << LW) <= 32 && (1 << LH) <= 32) {
+            if (a.cfl) {
+                int mt = mode;
+                intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mt, pt[0].type);   // S.rec: the luma reconstruction
+                const int aU = cflBestAlpha<LW, LH>(a, S, 1, x0, y0, haveA, haveL, S.rec);
+                const int aV = cflBestAlpha<LW, LH>(a, S, 2, x0, y0, haveA, haveL, S.rec);
+                if (aU || aV) {
+                    const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aU, S.rec);
+                    const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aV, S.rec);
+                    const float j = jc(u) + jc(v) + a.lambda * a.cflBits;
+                    if (j < best) { best = j; uvMode = AV1G_UV_CFL_PRED; cflU = aU; cflV = aV; }
+                }
+            }
+        }
     } else if (uvCand != AV1G_DC_PRED) {
         const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, uvCand);
         const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, uvCand);
@@ -3344,10 +3412,12 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
     bool haveA, haveL;
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
-    int type = 0, depth = 0, uvMode = 0;
-    const float jIntra = intraBlock<LW, LH>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode);
+    int type = 0, depth = 0, uvMode = 0, cflU = 0, cflV = 0;
+    const float jIntra = intraBlock<LW, LH>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode, cflU, cflV);
     const bool useIntra = jIntra * a.margin < jInter;
-    uint32_t v = useIntra ? (uint32_t)(((mode & 15) + 1) | type << 4 | depth << 8 | uvMode << 10 | (mode >> 4) << 16) : 0;
+    // bits 19-24 / 25-30: CfL alphas + 16
+    uint32_t v = useIntra ? (uint32_t)(((mode & 15) + 1) | type << 4 | depth << 8 | uvMode << 10 | (mode >> 4) << 16 |
+                                       (uint32_t)(cflU + 16) << 19 | (uint32_t)(cflV + 16) << 25) : 0;
     if constexpr (LW == 6 && LH == 6) {
         // four 32x32 intra blocks instead (partition SPLIT), each with its own modes; the quadrants' neighbours inside
         // the block are approximated by the inter reconstruction, as the outer ones are
@@ -3356,11 +3426,12 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
             float j4 = a.lambda * a.splitPartBits;
             uint32_t cs[4];
             for (int q = 0; q < 4 && j4 < kInf; q++) {
-                int m = -1, t = 0, d = 0, uv = 0;
+                int m = -1, t = 0, d = 0, uv = 0, cu = 0, cv = 0;
                 const float jq = intraBlock<5, 5>(a, S32, x0 + (q & 1) * 32, y0 + (q >> 1) * 32, (q >> 1) ? true : haveA,
-                                               (q & 1) ? true : haveL, m, t, d, kInf, uv);
+                                               (q & 1) ? true : haveL, m, t, d, kInf, uv, cu, cv);
                 j4 += jq;
-                cs[q] = (uint32_t)(((m & 15) + 1) | t << 4 | d << 8 | uv << 10 | (m >> 4) << 16);
+                cs[q] = (uint32_t)(((m & 15) + 1) | t << 4 | d << 8 | uv << 10 | (m >> 4) << 16 | (uint32_t)(cu + 16) << 19 |
+                                   (uint32_t)(cv + 16) << 25);
             }
             if (j4 * a.margin < jInter && j4 < (useIntra ? jIntra : kInf)) {
                 if (!lane) {
@@ -3394,20 +3465,24 @@ __global__ void applyIntraSplit(BlockInfo *grid, uint32_t *sel, int gcols, int g
 // Reconstruction pass helper: warp w codes plane w of the block, then all decide skip from the shared terms.
 template <int LW, int LH = LW>
 __device__ void intraReconBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, IntraPart *pt, int x0, int y0, bool haveA,
-                                bool haveL, int mode, int type, int depth, int uvMode, int &skipOut, int &typeOut) {
+                                bool haveL, int mode, int type, int depth, int uvMode, int cflU, int cflV, int &skipOut,
+                                int &typeOut) {
     const int warp = threadIdx.x >> 5;
+    const bool cfl = uvMode == AV1G_UV_CFL_PRED;   // chroma waits for the luma reconstruction
     IntraPart r;
     if (warp == 0) {
         if constexpr (LW == LH && LW >= 5) { if (depth == 2) r = intraLumaSplit<LW, 2>(a, S, x0, y0, haveA, haveL, mode, true); }
         if constexpr (LW == LH && LW >= 4) { if (depth == 1) r = intraLumaSplit<LW, 1>(a, S, x0, y0, haveA, haveL, mode, true); }
         if (depth == 0) r = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, type);
-    } else {
-        r = intraChroma<LW, LH>(a, S, warp, x0, y0, haveA, haveL, uvMode);
     }
+    if (cfl) __syncthreads();
+    if (warp > 0) r = intraChroma<LW, LH>(a, S, warp, x0, y0, haveA, haveL, uvMode, warp == 1 ? cflU : cflV, S.rec);
     if ((threadIdx.x & 31) == 0) pt[warp] = r;
     __syncthreads();
     bool skip;
     intraCombine(a, pt, skip);
+    // a skipped CfL block predicts chroma from the luma prediction (its reconstruction)
+    if (cfl && skip && warp > 0) intraChroma<LW, LH>(a, S, warp, x0, y0, haveA, haveL, uvMode, warp == 1 ? cflU : cflV, S.pred);
     intraWrite<LW, LH>(a, S, warp, x0, y0, skip, depth);
     skipOut = skip;
     typeOut = skip ? AV1G_DCT_DCT : pt[0].type;
@@ -3449,13 +3524,13 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
             bool haveA, haveL;
             intraAvail(a.j, be.r, be.c, haveA, haveL);
             const int mode = ((s & 15) - 1) | ((s >> 16) & 7) << 4, ft = (s >> 4) & 15, depth = (s >> 8) & 3,
-                      uvMode = (s >> 10) & 15;
+                      uvMode = (s >> 10) & 15, cflU = int((s >> 19) & 63) - 16, cflV = int((s >> 25) & 63) - 16;
             int skip = 0, type = 0;
             const int x0 = gx * 8, y0 = gy * 8;
 #define PF_IRB(LW, LH)                                                                                         \
     if (be.lw == LW && be.lh == LH)                                                                            \
         intraReconBlock<LW, LH>(a, *reinterpret_cast<IntraScratch<1 << LW, 1 << LH> *>(&S), pt, x0, y0, haveA, haveL, \
-                                mode, ft, depth, uvMode, skip, type);
+                                mode, ft, depth, uvMode, cflU, cflV, skip, type);
             PF_IRB(3, 3) PF_IRB(4, 4) PF_IRB(5, 5) PF_IRB(6, 6)
             PF_IRB(4, 3) PF_IRB(3, 4) PF_IRB(5, 4) PF_IRB(4, 5) PF_IRB(6, 5) PF_IRB(5, 6)
             PF_IRB(5, 3) PF_IRB(3, 5) PF_IRB(6, 4) PF_IRB(4, 6)
@@ -3468,6 +3543,8 @@ __global__ void __launch_bounds__(96) intraRecon(IntraArgs a) {
                     bi.yMode = (uint8_t)(mode & 15);
                     bi.yAngle = (int8_t)lumaDelta(mode);
                     bi.uvMode = (uint8_t)uvMode;
+                    bi.cflU = (int8_t)cflU;
+                    bi.cflV = (int8_t)cflV;
                     bi.skip = (uint8_t)skip;
                     bi.txSplit = (uint8_t)depth;
                     int t = type;
@@ -4764,6 +4841,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
         ia.uvAll = !getenv("AV1GPU_PF_INTRA_UVSAD");
+        ia.cfl = !getenv("AV1GPU_PF_INTRA_NOCFL");   // video_1 -0.32%, video_2 -0.12%
+        ia.cflBits = getenv("AV1GPU_PF_INTRA_CFLBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_CFLBITS")) : 5.f;
         ia.uvTip = getenv("AV1GPU_PF_INTRA_UVTIP") != nullptr;   // every chroma mode by RD: video_2 -0.28%
         ia.topK = getenv("AV1GPU_PF_INTRA_TOPK") ? atoi(getenv("AV1GPU_PF_INTRA_TOPK")) : 10;   // every mode: video_2 -2.3% over 3
         ia.alt3 = !getenv("AV1GPU_PF_INTRA_NOALT3");   // video_1 -0.09%, video_2 -0.52%

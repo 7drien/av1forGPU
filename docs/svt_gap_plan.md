@@ -837,3 +837,6 @@ kernel (temporary).
 - Luma angle deltas (V +, H -, D113 / D135 / D157 +-1..3; bit-exact): with the ten base modes always RD-checked plus the
   three best deltas by SAD, neutral (video_1 -0.07%, video_2 +0.07%); ranking all 34 candidates by SAD lost 1.7% on
   video_2 (the deltas pushed base modes out of the RD check). Off (`AV1GPU_PF_INTRA_DELTA=1`).
+- CfL for intra blocks up to 32x32 (alphas by least SSE from the luma reconstruction, kept by RD; a skipped block
+  re-predicts chroma from the luma prediction): video_1 -0.32%, video_2 -0.12% (against SVT-AV1 preset 8: video_1 -1.0%,
+  video_2 +3.2%). `AV1GPU_PF_INTRA_NOCFL`, `AV1GPU_PF_INTRA_CFLBITS` (5).
