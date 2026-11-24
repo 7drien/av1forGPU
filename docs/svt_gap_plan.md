@@ -617,6 +617,10 @@ kernel (temporary).
   reference word; the phase planes carry 16 bytes of padding). Batching the eight neighbours' SADs into one pass was
   slower (register pressure); 32 or 128 lanes for other block sizes were slower.
 - `CUDA_DEVICE_MAX_CONNECTIONS` = 32 (set by the app): the 15 analysis streams no longer share 8 hardware queues (+1%).
+  Reverted (2026-11-24): measured per process, 32 queues add about 0.25 s to CUDA context creation and 0.23 s to
+  teardown (empty program: 0.17 s → 0.42 s context, 0.3 s → 0.79 s process). 120 frames of video_2 at q50: 6.25-6.27 s
+  → 5.64-5.67 s per process (about +10% fps), encoder wall time unchanged; 4K video_3: 17.0-17.3 s either way. Same
+  output. The driver default (8) is used again; the environment variable still overrides it.
 - Inter prediction (37% of a 64x64 evaluation with the filter search, `clock64()`): four horizontal outputs per lane
   step from three word loads, four vertical outputs from eleven intermediate rows, and the filter search's luma
   prediction of the chosen filter is kept instead of predicted again. Inlined into the 64-wide evaluations the passes

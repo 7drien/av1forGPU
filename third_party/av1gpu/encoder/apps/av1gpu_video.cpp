@@ -163,9 +163,9 @@ private:
 };
 
 int main(int argc, char **argv) {
-    // the P-frame analysis runs up to fifteen streams at once (concurrent shape evaluations and refinement trials);
-    // the default eight hardware queues serialize some of them (set before the first CUDA call)
-    setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32", 0);
+    // CUDA_DEVICE_MAX_CONNECTIONS stays at the driver default (8): 32 hardware queues let the fifteen analysis streams
+    // overlap a little more, but cost about 0.25 s of context creation and 0.23 s of teardown per process (1080p, 120
+    // frames: 6.26 -> 5.65 s; 4K: no difference)
     if (argc < 6) {
         fprintf(stderr, "usage: ffmpeg ... -f rawvideo -pix_fmt yuv420p - | av1gpu-video WIDTH HEIGHT FPS_NUM FPS_DEN OUT.ivf [--fast] [--inter] [--inter-tx8 | --inter-tx-adaptive] [--inter-rdoq] [--persistent-cdf] [--diagonal-motion] [--motion-step 2..16 | --auto-motion-step] [--motion-block 8|16|32|64] [--rolling-reference] [--anchor-reference [--anchor-interval N]] [--lossless-inter-residual | --inter-residual-threshold N | --inter-qindex N] [--keyint 1..10000] [--scene-cut-rms 1..255] [--adaptive-fps] [--grain 0..32] [--qindex 1..255] [--pframes [--bitrate KBPS [--rc-buffer S]] [--pf-gop 1..32] [--pf-qoffset N] [--pf-altref-boost N] [--pf-leaf-offset N] [--pf-qindex N] [--pf-lambda X] [--pf-tiles C R] [--pf-cpu-entropy | --pf-gpu-entropy] [--pf-tf-frames 0..8 [--pf-tf-strength X]] [--pf-rdoq] [--pf-no-switchable] [--pf-no-mode-refine] [--pf-refine-passes 0..8] [--pf-square-prune M] [--pf-no-filters] [--kf-tiles MIN_MP,C,R | 0]]\n");
         return 2;
