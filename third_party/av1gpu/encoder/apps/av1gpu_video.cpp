@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -56,6 +57,71 @@ static bool read_frame(FILE *f, int w, int h, std::vector<uint8_t> &src) {
     }
     return true;
 }
+
+// Sums of the subsampled samples (every second row and column) of each 16x16 luma block, raster order: the block
+// statistics of the scene-cut and motion measures (blockMeanDiff / blockMeanCorr).
+static std::vector<int> block_sums16(const std::vector<uint8_t> &f, int w, int h) {
+    std::vector<int> out;
+    out.reserve(size_t(w / 16) * (h / 16));
+    for (int by = 0; by + 16 <= h; by += 16)
+        for (int bx = 0; bx + 16 <= w; bx += 16) {
+            int s = 0;
+            for (int y = 0; y < 16; y += 2)
+                for (int x = 0; x < 16; x += 2) s += f[size_t(by + y) * w + bx + x];
+            out.push_back(s);
+        }
+    return out;
+}
+
+// Raw input frames read ahead on a thread, with their block sums, so reading and the frame statistics overlap the GPU
+// work. The state is shared with the thread, which is detached at destruction (it may be blocked reading stdin).
+class FrameReader {
+public:
+    struct Frame { std::vector<uint8_t> data; std::vector<int> sums; };
+    FrameReader(int w, int h, size_t ahead) : st_(std::make_shared<State>()) {
+        auto st = st_;
+        std::thread([st, w, h, ahead] {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(st->mu);
+                    st->cv.wait(lock, [&] { return st->stop || st->q.size() < ahead; });
+                    if (st->stop) return;
+                }
+                Frame f;
+                const bool ok = read_frame(stdin, w, h, f.data);
+                if (ok) f.sums = block_sums16(f.data, w, h);
+                std::lock_guard<std::mutex> lock(st->mu);
+                if (ok) st->q.push_back(std::move(f));
+                else st->eof = true;
+                st->cv.notify_all();
+                if (!ok) return;
+            }
+        }).detach();
+    }
+    ~FrameReader() {
+        std::lock_guard<std::mutex> lock(st_->mu);
+        st_->stop = true;
+        st_->cv.notify_all();
+    }
+    // the next frame, or false at the end of the input
+    bool next(Frame &f) {
+        std::unique_lock<std::mutex> lock(st_->mu);
+        st_->cv.wait(lock, [&] { return !st_->q.empty() || st_->eof; });
+        if (st_->q.empty()) return false;
+        f = std::move(st_->q.front());
+        st_->q.pop_front();
+        st_->cv.notify_all();
+        return true;
+    }
+private:
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Frame> q;
+        bool eof = false, stop = false;
+    };
+    std::shared_ptr<State> st_;
+};
 
 static void pad_plane(const uint8_t *src, int w, int h, int pitch, int paddedW, int paddedH, uint8_t *dst) {
     for (int y = 0; y < paddedH; ++y) {
@@ -655,11 +721,27 @@ int main(int argc, char **argv) {
             if (cudaMalloc(&tfBuf[p], sizes[p]) != cudaSuccess) { fprintf(stderr, "filter buffer allocation failed\n"); return 1; }
         std::vector<std::vector<uint8_t>> pending;   // raw frames read ahead
         bool eof = false;
+        // the reader thread keeps up to a mini-GOP of frames beyond the pending ones, with their 16x16 block sums
+        // (looked up by buffer address: a buffer keeps its address while it moves between pending and prevFrame)
+        FrameReader reader(w, h, size_t(G) + 1);
+        std::map<const uint8_t *, std::vector<int>> frameSums;
+        std::vector<uint8_t> prevFrame;   // the last frame before pending (scene cuts and motion)
         auto readMore = [&](size_t want) {
             while (!eof && pending.size() < want) {
-                std::vector<uint8_t> raw;
-                if (!read_frame(stdin, w, h, raw)) { eof = true; break; }
-                pending.push_back(std::move(raw));
+                FrameReader::Frame f;
+                if (!reader.next(f)) { eof = true; break; }
+                if (frameSums.size() > 4 * (size_t(G) + kTfKeyMax + 8)) {   // drop the sums of frames gone
+                    std::map<const uint8_t *, std::vector<int>> live;
+                    for (auto &q : pending) {
+                        auto it = frameSums.find(q.data());
+                        if (it != frameSums.end()) live.insert(*it);
+                    }
+                    auto it = frameSums.find(prevFrame.data());
+                    if (it != frameSums.end()) live.insert(*it);
+                    frameSums.swap(live);
+                }
+                frameSums[f.data.data()] = std::move(f.sums);
+                pending.push_back(std::move(f.data));
             }
         };
         auto dump = [&](const uint8_t *dev) -> int {
@@ -1090,26 +1172,21 @@ int main(int argc, char **argv) {
         bool keyPending = false;
         uint64_t keyPeriodBegin = 0;
         // scene cuts: mean absolute difference of 16x16 luma block means between consecutive frames
-        std::vector<uint8_t> prevFrame;
+        auto sumsOf = [&](const std::vector<uint8_t> &f) -> const std::vector<int> & {
+            auto it = frameSums.find(f.data());
+            if (it == frameSums.end()) it = frameSums.emplace(f.data(), block_sums16(f, w, h)).first;
+            return it->second;
+        };
         // memoized by buffer address pair: valid while the frames stay pending (cleared whenever frames leave)
         std::map<std::pair<const uint8_t *, const uint8_t *>, double> diffCache;
         auto blockMeanDiff = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
             const auto key = std::make_pair(a.data(), b.data());
             const auto hit = diffCache.find(key);
             if (hit != diffCache.end()) return hit->second;
+            const std::vector<int> &A = sumsOf(a), &B = sumsOf(b);
             double sum = 0;
-            int nb = 0;
-            for (int by = 0; by + 16 <= h; by += 16)
-                for (int bx = 0; bx + 16 <= w; bx += 16) {
-                    int sa = 0, sb = 0;
-                    for (int y = 0; y < 16; y += 2)
-                        for (int x = 0; x < 16; x += 2) {
-                            sa += a[size_t(by + y) * w + bx + x];
-                            sb += b[size_t(by + y) * w + bx + x];
-                        }
-                    sum += std::abs(sa - sb) / 64.0;
-                    ++nb;
-                }
+            const int nb = (int)A.size();
+            for (int i = 0; i < nb; ++i) sum += std::abs(A[i] - B[i]) / 64.0;
             const double v = nb ? sum / nb : 0.0;
             diffCache[key] = v;
             return v;
@@ -1134,19 +1211,13 @@ int main(int argc, char **argv) {
         // followed by a comparable one (sustained motion changes every frame)
         // correlation of the 16x16 block means (subsampled) of two frames
         auto blockMeanCorr = [&](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+            const std::vector<int> &A = sumsOf(a), &B = sumsOf(b);
             double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-            int nb = 0;
-            for (int by = 0; by + 16 <= h; by += 16)
-                for (int bx = 0; bx + 16 <= w; bx += 16) {
-                    int ma = 0, mb = 0;
-                    for (int y = 0; y < 16; y += 2)
-                        for (int x = 0; x < 16; x += 2) {
-                            ma += a[size_t(by + y) * w + bx + x];
-                            mb += b[size_t(by + y) * w + bx + x];
-                        }
-                    sa += ma; sb += mb; saa += double(ma) * ma; sbb += double(mb) * mb; sab += double(ma) * mb;
-                    ++nb;
-                }
+            const int nb = (int)A.size();
+            for (int i = 0; i < nb; ++i) {
+                const int ma = A[i], mb = B[i];
+                sa += ma; sb += mb; saa += double(ma) * ma; sbb += double(mb) * mb; sab += double(ma) * mb;
+            }
             if (!nb) return 0.0;
             const double va = saa - sa * sa / nb, vb = sbb - sb * sb / nb, cov = sab - sa * sb / nb;
             return va > 0 && vb > 0 ? cov / std::sqrt(va * vb) : 0.0;

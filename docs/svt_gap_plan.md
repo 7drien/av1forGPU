@@ -621,6 +621,12 @@ kernel (temporary).
   teardown (empty program: 0.17 s → 0.42 s context, 0.3 s → 0.79 s process). 120 frames of video_2 at q50: 6.25-6.27 s
   → 5.64-5.67 s per process (about +10% fps), encoder wall time unchanged; 4K video_3: 17.0-17.3 s either way. Same
   output. The driver default (8) is used again; the environment variable still overrides it.
+- Input on a reader thread (2026-11-24): the GPU sat idle about 0.7 s per 120-frame 1080p encode (nsys: 19% of the
+  span with no kernel; 53 ms before each temporal filter) while the main thread read the next mini-GOP from stdin
+  (300 ms) and computed the scene-cut / motion block statistics (391 ms). A reader thread now reads up to a mini-GOP
+  ahead and computes each frame's 16x16 block sums; the statistics use them. Same output (video_2, video_4 with a
+  scene cut, tests/check_pframes.py). video_2 120 frames q50: 5.58-5.82 → 5.19-5.31 s per process; 4K video_4
+  15.6 → 15.1 s.
 - Inter prediction (37% of a 64x64 evaluation with the filter search, `clock64()`): four horizontal outputs per lane
   step from three word loads, four vertical outputs from eleven intermediate rows, and the filter search's luma
   prediction of the chosen filter is kept instead of predicted again. Inlined into the 64-wide evaluations the passes
