@@ -2844,8 +2844,9 @@ __global__ void estimateNoise(const uint8_t *p, int pitch, int w, int h, unsigne
     if ((threadIdx.x & 31) == 0 && n) { atomicAdd(out, (unsigned long long)v); atomicAdd(out + 1, (unsigned long long)n); }
 }
 __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
-    __shared__ uint8_t cur[256];
-    __shared__ uint8_t win[kTfWin * kTfWin];
+    __shared__ __align__(16) uint8_t cur[256];
+    __shared__ __align__(16) uint8_t win[kTfWin * kTfWin];
+    __shared__ int hsumS[3][24][16];   // horizontal pass of the three column phases of a quarter-pel step
     __shared__ int sads[(2 * kTfRange + 1) * (2 * kTfRange + 1)];
     __shared__ float wsum[256], acc[256], wl[256];
     __shared__ int d2[256];
@@ -2891,12 +2892,22 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
             win[i] = ny[y * a.aw + x];
         }
         __syncthreads();
-        if (t < side * side) {
+        static_assert(kTfWin % 4 == 0, "word rows");
+        if (t < side * side) {   // four samples per step: aligned words of the window, funnel-shifted to the offset
             const int oy = t / side, ox = t % side;
+            const int c0 = kTfPad + ox, sh = (c0 & 3) * 8;
+            const uint32_t *cw32 = reinterpret_cast<const uint32_t *>(cur);
             int s = 0;
-            for (int r = 0; r < 16; r++)
-                for (int c = 0; c < 16; c++)
-                    s += abs((int)cur[r * 16 + c] - (int)win[(kTfPad + oy + r) * kTfWin + kTfPad + ox + c]);
+            for (int r = 0; r < 16; r++) {
+                const uint32_t *wr = reinterpret_cast<const uint32_t *>(win + (kTfPad + oy + r) * kTfWin) + (c0 >> 2);
+                uint32_t w0 = wr[0];
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint32_t w1 = wr[k + 1];
+                    s = __vsadu4(cw32[r * 4 + k], __funnelshift_r(w0, w1, sh)) + s;
+                    w0 = w1;
+                }
+            }
             sads[t] = s;
         }
         __syncthreads();
@@ -2925,10 +2936,26 @@ __global__ void __launch_bounds__(256) temporalFilterKernel(TfArgs a) {
         int by16 = (kTfPad + oy) * 16, bx16 = (kTfPad + ox) * 16;
         for (int step = 8; step >= 4; step >>= 1) {
             int best = 0, bestS = 0;
+            // the horizontal pass (full precision) of the three column phases over the rows of all three row phases,
+            // then each position's vertical pass: the same integer sums as predAt
+            const int rowBase = ((by16 - step) >> 4) - 3;
+            for (int i = t; i < 3 * 24 * 16; i += 256) {
+                const int dxi = i / (24 * 16), r = (i / 16) % 24, c = i % 16;
+                const int x16 = bx16 + (dxi - 1) * step, fx = x16 & 15, ix = (x16 >> 4) + c;
+                const uint8_t *row = win + min(rowBase + r, kTfWin - 1) * kTfWin + ix - 3;   // (an unused 24th row may lie past the window)
+                int hsum = 0;
+                for (int k = 0; k < 8; k++) hsum += c_filter[0][fx][k] * row[k];
+                hsumS[dxi][r][c] = hsum;
+            }
+            __syncthreads();
             for (int k = 0; k <= 8; k++) {
-                const int dy = (k / 3 - 1) * step, dx = (k % 3 - 1) * step;
+                const int dy = (k / 3 - 1) * step;
+                const int y16 = by16 + dy, fy = y16 & 15, iy = (y16 >> 4) + r0p - 3 - rowBase;
+                int v = 0;
+                for (int r = 0; r < 8; r++) v += c_filter[0][fy][r] * hsumS[k % 3][iy + r][c0p];
+                const int pv = min(max((v + 8192) >> 14, 0), 255);
                 int s;
-                int e = abs((int)cur[t] - predAt(by16 + dy, bx16 + dx));
+                int e = abs((int)cur[t] - pv);
                 for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
                 if ((t & 31) == 0) subSad[t >> 5] = e;
                 __syncthreads();
