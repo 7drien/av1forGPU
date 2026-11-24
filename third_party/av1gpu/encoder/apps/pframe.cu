@@ -4635,7 +4635,9 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
             std::vector<BlockInfo> g(gridCount());
             cudaMemcpyAsync(g.data(), s->grid, g.size() * sizeof(BlockInfo), cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);
-            for (const BlockInfo &b : g) if (b.log2) { area[4]++; if (b.intra) area[b.log2 - 3]++; }
+            long long fa = 0, fi = 0;
+            for (const BlockInfo &b : g) if (b.log2) { area[4]++; fa++; if (b.intra) { area[b.log2 - 3]++; fi++; } }
+            if (getenv("AV1GPU_PF_INTRA_STATS")[0] == '2') fprintf(stderr, "intra frame %lld: %.1f%%\n", frames, 100.0 * fi / fa);
             if (++frames % 30 == 0)
                 fprintf(stderr, "intra area: %.2f%% (8x8 %.2f, 16 %.2f, 32 %.2f, 64 %.2f)\n", 100.0 * (area[0] + area[1] + area[2] + area[3]) / area[4],
                         100.0 * area[0] / area[4], 100.0 * area[1] / area[4], 100.0 * area[2] / area[4], 100.0 * area[3] / area[4]);

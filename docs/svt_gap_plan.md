@@ -757,3 +757,7 @@ kernel (temporary).
 - With fast key frames, the still-content key-frame offset `AV1GPU_PF_KEYSTILL` 40 → 55: video_1 +4.1% → +2.7% against
   SVT-AV1 (video_2 / video_5 unchanged; against our own 40 the shared-range BD is +1.0% on video_1, the points shift to
   higher quality). Same speed. 8 refinement passes: video_1 -0.2%, video_2 -0.8% for -11% fps (kept 6).
+- video_2's intra area is in the ALTREFs: the first frame of each mini-GOP (8 frames from its reference) is 44-65%
+  intra, the others 0-20% (`AV1GPU_PF_INTRA_STATS=2` prints it per frame). `--pf-gop 4` is still worse (+1.3%).
+- `--pf-cpu-entropy` against the default (GPU symbol modeling, host range coder) on video_2: same output, same time
+  (4.7-4.9 s for 120 frames): entropy is not on the critical path; the analysis kernels are (the encode is GPU-bound).
