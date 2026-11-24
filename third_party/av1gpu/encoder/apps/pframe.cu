@@ -2784,6 +2784,7 @@ struct IntraArgs {
     int qindex, qctx, reduced;
     int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
     float splitGate;
+    int alt2;      // RD-check the second best luma mode by SAD (else the best non-directional one)
     int uvModes;   // choose the chroma mode (else UV_DC_PRED)
     float uvBits;
     float margin;
@@ -2864,8 +2865,13 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
                 sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, LW, LH, ab, lb));
             }
             sad = warp_sumi(sad);
-            if (sad < best) { best = sad; mode = m; }
-            if (k < kIntraModesNoDir && sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
+            if (a.alt2) {   // runner-up by SAD (checked by RD in intraBlock)
+                if (sad < best) { bestNd = best; if (altMode) *altMode = mode; best = sad; mode = m; }
+                else if (sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
+            } else {
+                if (sad < best) { best = sad; mode = m; }
+                if (k < kIntraModesNoDir && sad < bestNd) { bestNd = sad; if (altMode) *altMode = m; }
+            }
         }
         // the prediction error is at least SAD^2 / N^2: far above the inter cost, intra cannot win
         if ((float)best * (float)best * (1.f / (W * H)) > sseGate) {
@@ -4681,6 +4687,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.rnd = ea.rnd; ia.zbin = ea.zbin; ia.lambda = lambda;
         ia.txSplit = syntax.txModeSelect && !getenv("AV1GPU_PF_INTRA_NOSPLIT");
         ia.uvModes = !getenv("AV1GPU_PF_INTRA_UVDC");
+        ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%
         ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
