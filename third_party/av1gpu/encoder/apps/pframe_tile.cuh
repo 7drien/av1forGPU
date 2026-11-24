@@ -939,9 +939,15 @@ struct TileCoder {
     // Phase 3 of an intra block (square, 8x8 .. 64x64): inter_frame_mode_info with is_inter = 0, then
     // intra_block_mode_info (y_mode, angle_delta_y, uv_mode = UV_DC_PRED, use_filter_intra = 0), read_tx_size
     // (tx_depth 0) and the coefficients of one transform per plane.
+    AV1G_HDI static int bsizeOf(int lw, int lh) {   // AV1 BLOCK_WxH of log2 sides
+        for (int b = 0; b < 22; b++)
+            if (AV1G_T(Num_4x4_Blocks_Wide)[b] == 1 << (lw - 2) && AV1G_T(Num_4x4_Blocks_High)[b] == 1 << (lh - 2)) return b;
+        return -1;
+    }
     AV1G_HDI void intraBlock(int miRow, int miCol, int lw, int lh, const pf::BlockInfo &bi) {
         const int skip = bi.skip;
-        if (lw != lh || lw < 3) { st.error = 9; return; }
+        if (lw < 3 || lh < 3 || (lw != lh && bi.txSplit)) { st.error = 9; return; }
+        const int bsize = bsizeOf(lw, lh);
         const bool availU = inside(miRow - 1, miCol), availL = inside(miRow, miCol - 1);
         const MiInfo *above = availU ? &at(miRow - 1, miCol) : nullptr;
         const MiInfo *left = availL ? &at(miRow, miCol - 1) : nullptr;
@@ -965,24 +971,24 @@ struct TileCoder {
         else interCtx = 0;
         sym(ic->isInter[interCtx], 0, 2);
         const int mode = bi.yMode;
-        sym(ic->yMode[imin(lw - 2, 3)], mode, 13);   // Size_Group: 8x8 1, 16x16 2, 32x32 / 64x64 3
+        sym(ic->yMode[AV1G_T(Size_Group)[bsize]], mode, 13);
         if (av1g_is_directional(mode)) sym(cdf->angle_delta[mode - AV1G_V_PRED], 3, 7);   // angle_delta_y 0
         const int uvMode = bi.uvMode;
-        if (lw <= 5) sym(cdf->uv_mode_cfl_allowed[mode], uvMode, 14);
+        if (lw <= 5 && lh <= 5) sym(cdf->uv_mode_cfl_allowed[mode], uvMode, 14);   // CfL allowed up to 32x32
         else sym(cdf->uv_mode_cfl_not_allowed[mode], uvMode, 13);
         if (av1g_is_directional(uvMode)) sym(cdf->angle_delta[uvMode - AV1G_V_PRED], 3, 7);   // angle_delta_uv 0
-        const int bsize = lw == 3 ? AV1G_BLOCK_8X8 : lw == 4 ? AV1G_BLOCK_16X16 : lw == 5 ? AV1G_BLOCK_32X32 : AV1G_BLOCK_64X64;
-        if (fs->filterIntra && mode == AV1G_DC_PRED && lw <= 5) sym(cdf->filter_intra[bsize], 0, 2);
+        if (fs->filterIntra && mode == AV1G_DC_PRED && lw <= 5 && lh <= 5) sym(cdf->filter_intra[bsize], 0, 2);
         if (fs->txModeSelect) {
             // tx_depth = 0; context (spec): an inter neighbour contributes its block size, an intra one its transform
-            const int maxTx = imin(lw, 6);
+            const int maxRect = AV1G_T(Max_Tx_Size_Rect)[bsize];
+            const int maxTw = AV1G_T(Tx_Width_Log2)[maxRect], maxTh = AV1G_T(Tx_Height_Log2)[maxRect];
             const int aboveW = !availU ? 0 : above->isInter ? above->wLog2 : above->txW;
             const int leftH = !availL ? 0 : left->isInter ? left->hLog2 : left->txH;
-            const int ctx = (availU && aboveW >= maxTx) + (availL && leftH >= maxTx);
-            const int depth = bi.txSplit;
-            if (lw == 6) sym(cdf->tx_64x64[ctx], depth, 3);
-            else if (lw == 5) sym(cdf->tx_32x32[ctx], depth, 3);
-            else if (lw == 4) sym(cdf->tx_16x16[ctx], depth, 3);
+            const int ctx = (availU && aboveW >= maxTw) + (availL && leftH >= maxTh);
+            const int depth = bi.txSplit, maxDepth = AV1G_T(Max_Tx_Depth)[bsize];
+            if (maxDepth == 4) sym(cdf->tx_64x64[ctx], depth, 3);
+            else if (maxDepth == 3) sym(cdf->tx_32x32[ctx], depth, 3);
+            else if (maxDepth == 2) sym(cdf->tx_16x16[ctx], depth, 3);
             else sym(cdf->tx_8x8[ctx], depth, 2);
         } else if (bi.txSplit) { st.error = 10; return; }
         if (skip) return;
