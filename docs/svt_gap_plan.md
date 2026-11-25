@@ -861,3 +861,7 @@ kernel (temporary).
   -0.10%: also off. The transform-type search of the candidates is not where most of the intra decision time goes.
 - Clean-GPU timing of the intra early exit (`AV1GPU_PF_INTRA_EARLYGATE`): 1.5 / 1.2 / 1.05 at 6.50-6.76 / 6.56-6.66 /
   6.48-6.50 s against 6.84-6.94 s; 1.5 (+0.11% BD on video_1 / video_2) is now the default.
+- Clean nsys timeline (video_2): the serial chain is dominated by intraDecide<64x64> (358 ms solo over 40 frames) and
+  intraRecon (250 ms). Split transforms of the reconstruction with DCT_DCT only (`AV1GPU_PF_INTRA_SPLITDCT`): recon
+  331 -> 313 ms, video_1 +0.19%: off. Lighter search for blocks with a 64-sample side (`AV1GPU_PF_INTRA_TOPK64=0`,
+  `AV1GPU_PF_INTRA_UVSAD64`): 6.73 -> 6.20 s (-8%) but video_2 +1.76%: off.

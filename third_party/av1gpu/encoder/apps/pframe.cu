@@ -2802,6 +2802,8 @@ struct IntraArgs {
     int qindex, qctx, reduced;
     int txSplit;   // TX_MODE_SELECT: intra blocks may split their luma transform
     float splitGate;
+    int topK64;    // topK of blocks with a 64-sample side (-1: topK)
+    int uvSad64;   // blocks with a 64-sample side: chroma by SAD screen (not every mode by RD)
     int topK;      // RD-check this many best luma modes by SAD (3: the third, second and first)
     int alt3;      // also RD-check the third best luma mode by SAD
     int alt2;      // RD-check the second best luma mode by SAD (else the best non-directional one)
@@ -2814,6 +2816,7 @@ struct IntraArgs {
     float margin;
     float sadGate;
     float earlyGate;
+    int splitDct;   // split luma transforms of the reconstruction use DCT_DCT (no type search)
     int est;   // rank luma candidates by the quantizer estimate (DCT_DCT, no reconstruction), code the winner in full
     int satd;   // rank luma modes by 4x4 Hadamard SATD (else subsampled SAD)
     int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
@@ -3080,7 +3083,7 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S,
         e.resEnergy = warp_sum(en);
         EvalOut o;
         int type = AV1G_DCT_DCT;
-        if (set != AV1G_TX_SET_DCTONLY && write) {   // the decision pass estimates with DCT_DCT
+        if (set != AV1G_TX_SET_DCTONLY && write && !a.splitDct) {   // the decision pass estimates with DCT_DCT
             float bestJ = kInf;
             const int n = set == AV1G_TX_SET_INTRA_1 ? 7 : 5;
             for (int t = 0; t < n; t++) {
@@ -3330,12 +3333,13 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
         consider(q, alt3);
     }
     // AV1GPU_PF_INTRA_TOPK > 3: the next best modes by SAD too
-    if (a.topK > 0 && pt[0].dSkip < kInf) {
+    const int topK = (LW == 6 || LH == 6) && a.topK64 >= 0 ? a.topK64 : a.topK;   // 64-sample sides: lighter search
+    if (topK > 0 && pt[0].dSkip < kInf) {
         const int first = mode, second = alt, third = alt3;
         auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
         // base modes (angle_delta 0) first, then the deltaK best angle-delta candidates by SAD
-        for (int rank = 0; rank < a.topK + a.deltaK; rank++) {
-            const bool deltas = rank >= a.topK;
+        for (int rank = 0; rank < topK + a.deltaK; rank++) {
+            const bool deltas = rank >= topK;
             int pick = -1, ps = 0x7fffffff;   // the smallest SAD among the candidates not yet tried
             for (int k = deltas ? a.nModes : 0; k < (deltas ? a.nLuma : a.nModes); k++) {
                 const int m = c_lumaCands[k];
@@ -3371,11 +3375,12 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
         if (lb * a.margin >= jInter && (!a.txSplit || lb > a.splitGate * jInter || LW != LH || LW < 4)) return kInf;
     }
     // chroma: UV_DC_PRED against the best mode by SAD, by rate-distortion (one extra bit for the other mode)
-    const int uvCand = a.uvModes && !a.uvAll ? intraChromaMode<LW, LH>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
+    const bool uvAll = a.uvAll && !((LW == 6 || LH == 6) && a.uvSad64);
+    const int uvCand = a.uvModes && !uvAll ? intraChromaMode<LW, LH>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
     uvMode = AV1G_DC_PRED;
     pt[1] = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, AV1G_DC_PRED);
     pt[2] = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, AV1G_DC_PRED);
-    if (a.uvModes && a.uvAll) {   // every chroma mode by rate-distortion (AV1GPU_PF_INTRA_UVALL)
+    if (a.uvModes && uvAll) {   // every chroma mode by rate-distortion (AV1GPU_PF_INTRA_UVALL)
         auto jc = [&](const IntraPart &q) { return fminf(q.dCoded + a.lambda * q.rate, q.dSkip); };
         float best = jc(pt[1]) + jc(pt[2]);
         IntraPart bu = pt[1], bv = pt[2];
@@ -4918,6 +4923,8 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.cfl = !getenv("AV1GPU_PF_INTRA_NOCFL");   // video_1 -0.32%, video_2 -0.12%
         ia.cflBits = getenv("AV1GPU_PF_INTRA_CFLBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_CFLBITS")) : 5.f;
         ia.uvTip = getenv("AV1GPU_PF_INTRA_UVTIP") != nullptr;   // every chroma mode by RD: video_2 -0.28%
+        ia.topK64 = getenv("AV1GPU_PF_INTRA_TOPK64") ? atoi(getenv("AV1GPU_PF_INTRA_TOPK64")) : -1;
+        ia.uvSad64 = getenv("AV1GPU_PF_INTRA_UVSAD64") != nullptr;
         ia.topK = getenv("AV1GPU_PF_INTRA_TOPK") ? atoi(getenv("AV1GPU_PF_INTRA_TOPK")) : 10;   // every mode: video_2 -2.3% over 3
         ia.alt3 = !getenv("AV1GPU_PF_INTRA_NOALT3");   // video_1 -0.09%, video_2 -0.52%
         ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%
@@ -4925,6 +4932,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.satd = getenv("AV1GPU_PF_INTRA_SATD") != nullptr;
         ia.est = getenv("AV1GPU_PF_INTRA_EST") ? atoi(getenv("AV1GPU_PF_INTRA_EST")) : 0;
+        ia.splitDct = getenv("AV1GPU_PF_INTRA_SPLITDCT") != nullptr;
         ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 1.5f;   // -3.8% time, +0.11% BD (video_1 / video_2)
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
