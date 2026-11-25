@@ -868,3 +868,6 @@ kernel (temporary).
 - Decision-pass scratch with the chroma buffers aliased onto the luma ones (`IntraScratchD`; luma and chroma are coded
   in turn there): identical output; 64x64 decision 27 KB of shared memory per warp (was about 48 KB). video_2 6.45 s
   (clean GPU; the default measured 6.6-6.9 s before).
+- Thread teams (`team_*`): the forward transform, quantizer and inverse split over NT threads (32: the warp versions),
+  and the intra functions templated on NT; the 64x64 intra decision runs a 128-thread team per block. Identical output
+  (video_2 q50 / q130), dav1d 35/35; clean GPU 6.05-6.13 s against 6.14-7.11 s (within noise).

@@ -769,6 +769,229 @@ __device__ __forceinline__ void inverseAddCt(int16_t *q, int txSz, int txType, i
     if constexpr (dl >= -2 && dl <= 2) warpInverseAdd<lw, lh>(q, txSz, txType, dcQ, acQ, res, pred, recon);
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// Thread teams of NT threads (32: one warp, the warp primitives; more: the whole CTA, shared-memory reductions). The
+// team versions of the forward transform, quantizer and inverse below split each pass over the team.
+template <int NT> __device__ __forceinline__ int team_rank() { return NT == 32 ? (threadIdx.x & 31) : (int)threadIdx.x; }
+template <int NT> __device__ __forceinline__ void team_sync() { if constexpr (NT == 32) __syncwarp(); else __syncthreads(); }
+template <int NT> __device__ __forceinline__ float team_sumf(float v) {
+    v = warp_sum(v);
+    if constexpr (NT == 32) return v;
+    __shared__ float red[NT / 32];
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float t = 0.f;
+#pragma unroll
+    for (int k = 0; k < NT / 32; k++) t += red[k];
+    return t;
+}
+template <int NT> __device__ __forceinline__ int team_sumi(int v) {
+    v = warp_sumi(v);
+    if constexpr (NT == 32) return v;
+    __shared__ int redi[NT / 32];
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) redi[threadIdx.x >> 5] = v;
+    __syncthreads();
+    int t = 0;
+#pragma unroll
+    for (int k = 0; k < NT / 32; k++) t += redi[k];
+    return t;
+}
+template <int NT> __device__ __forceinline__ int team_maxi(int v) {
+    v = warp_max(v);
+    if constexpr (NT == 32) return v;
+    __shared__ int redm[NT / 32];
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) redm[threadIdx.x >> 5] = v;
+    __syncthreads();
+    int t = redm[0];
+#pragma unroll
+    for (int k = 1; k < NT / 32; k++) t = max(t, redm[k]);
+    return t;
+}
+template <int NT> __device__ __forceinline__ bool team_any(bool b) {
+    if constexpr (NT == 32) return __any_sync(0xffffffffu, b);
+    else return __syncthreads_or(b) != 0;
+}
+template <int W, int H, int NT>
+__device__ __forceinline__ void team_fwd_ct(const int16_t *res, float *tmp, int txSz, int txType) {
+    constexpr int TH = H > 32 ? 32 : H, TW = W > 32 ? 32 : W, TS = W + 1;
+    constexpr int GC0 = (TH <= 4) ? 1 : (NT / W < TH / 4 ? NT / W : TH / 4), GC = GC0 < 1 ? 1 : GC0, OC = TH / GC;
+    constexpr int GR0 = (TW <= 4) ? 1 : (NT / TH < TW / 4 ? NT / TH : TW / 4), GR = GR0 < 1 ? 1 : GR0, OR = TW / GR;
+    const int lane = team_rank<NT>();
+    const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
+    const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
+    const float *Fc = g_fwd + g_fwdOff[ck][log2i(H)];
+    const float *Fr = g_fwd + g_fwdOff[rk][log2i(W)];
+    const float *FcT = g_fwdT + g_fwdOff[ck][log2i(H)];
+    const float *FrT = g_fwdT + g_fwdOff[rk][log2i(W)];
+    for (int it = lane; it < W * GC; it += NT) {
+        const int j = it % W, i0 = (it / W) * OC;
+        const int jj = flr ? W - 1 - j : j;
+        float acc[OC];
+        if (ck == AV1G_K_IDT) {   // diagonal (identity transforms are never 64 long, so TH == H)
+#pragma unroll
+            for (int i = 0; i < OC; i++)
+                acc[i] = __ldg(&Fc[(i0 + i) * H + i0 + i]) * (float)res[(fud ? H - 1 - (i0 + i) : i0 + i) * W + jj];
+        } else {
+#pragma unroll
+            for (int i = 0; i < OC; i++) acc[i] = 0.f;
+            for (int k = 0; k < H; k++) {
+                const float x = (float)res[(fud ? H - 1 - k : k) * W + jj];
+                const float4 *f4 = (const float4 *)(FcT + k * H + i0);
+#pragma unroll
+                for (int i4 = 0; i4 < OC / 4; i4++) {
+                    const float4 f = __ldg(&f4[i4]);
+                    acc[4 * i4 + 0] = fmaf(f.x, x, acc[4 * i4 + 0]);
+                    acc[4 * i4 + 1] = fmaf(f.y, x, acc[4 * i4 + 1]);
+                    acc[4 * i4 + 2] = fmaf(f.z, x, acc[4 * i4 + 2]);
+                    acc[4 * i4 + 3] = fmaf(f.w, x, acc[4 * i4 + 3]);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < OC; i++) tmp[(i0 + i) * TS + j] = acc[i];
+    }
+    team_sync<NT>();
+    const float scale = g_txScale[txSz];
+    // rows, in place: every lane of a row reads it before any of them writes
+    for (int it0 = 0; it0 < TH * GR; it0 += NT) {
+        const int it = it0 + lane, i = it % TH, j0 = (it / TH) * OR;
+        const bool act = it < TH * GR;
+        float acc[OR];
+        if (act) {
+            if (rk == AV1G_K_IDT) {
+#pragma unroll
+                for (int jj = 0; jj < OR; jj++) acc[jj] = __ldg(&Fr[(j0 + jj) * W + j0 + jj]) * tmp[i * TS + j0 + jj];
+            } else {
+#pragma unroll
+                for (int jj = 0; jj < OR; jj++) acc[jj] = 0.f;
+                for (int k = 0; k < W; k++) {
+                    const float x = tmp[i * TS + k];
+                    const float4 *f4 = (const float4 *)(FrT + k * W + j0);
+#pragma unroll
+                    for (int j4 = 0; j4 < OR / 4; j4++) {
+                        const float4 f = __ldg(&f4[j4]);
+                        acc[4 * j4 + 0] = fmaf(f.x, x, acc[4 * j4 + 0]);
+                        acc[4 * j4 + 1] = fmaf(f.y, x, acc[4 * j4 + 1]);
+                        acc[4 * j4 + 2] = fmaf(f.z, x, acc[4 * j4 + 2]);
+                        acc[4 * j4 + 3] = fmaf(f.w, x, acc[4 * j4 + 3]);
+                    }
+                }
+            }
+        }
+        team_sync<NT>();
+        if (act) {
+#pragma unroll
+            for (int jj = 0; jj < OR; jj++) tmp[i * TS + j0 + jj] = acc[jj] * scale;
+        }
+    }
+    team_sync<NT>();
+}
+
+template <int NT, int BD = 8>
+__device__ __forceinline__ void team_quant_rate_rt(const float *tmp, int16_t *q, const EvalIn &e, EvalOut &o, int W, int H) {
+    const int lane = team_rank<NT>();
+    const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1, n = tw * th;
+    const int lt = log2i(tw);
+    const int den = av1g_dq_denom(e.txSz);
+    float dist = 0.f, kept = 0.f;
+    for (int idx = lane; idx < n; idx += NT) {
+        const int i = idx >> lt, j = idx & (tw - 1);
+        const float v = tmp[i * TS + j];
+        const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
+        const float a = fabsf(v) * (float)den / (float)step;
+        const float wr = e.qm ? 32.f / (float)e.qm[idx] : 1.f;
+        int l = a < e.zbin ? 0 : (int)(a + (e.qmRnd ? e.rnd * wr : e.rnd));
+        l = min(l, 16383);
+        const int qv = v < 0 ? -l : l;
+        q[idx] = (int16_t)qv;
+        const float dq = l ? (float)av1g_dequant_coef<BD>(qv, step, den) : 0.f;
+        const float d = v - dq;
+        dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
+        kept = fmaf(v, v, kept);
+    }
+    dist = team_sumf<NT>(dist);
+    team_sync<NT>();
+    const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
+    int last = 0;
+    for (int c = lane; c < n; c += NT)
+        if (q[scan[c]]) last = c + 1;
+    const int eob = team_maxi<NT>(last);
+    float bits = lane == 0 ? base_bits(e, eob) : 0.f;
+    if (eob > 0) {
+        const int txClass = av1g_tx_class(e.txType);
+        for (int c = lane; c < eob; c += NT) bits += coeff_bits(c, eob, q, scan, e.txSz, txClass, e.plane > 0, e.dcCtx, e.C);
+    }
+    bits = team_sumf<NT>(bits);
+    const float g = g_txg[e.txSz][e.txType];
+    float D = g * dist;
+    if (W == 64 || H == 64) {
+        kept = team_sumf<NT>(kept);
+        D += fmaxf(0.f, e.resEnergy - g * kept);
+    }
+    o.D = D;
+    o.R = bits;
+    o.eob = eob;
+}
+
+template <int LW, int LH, int NT>
+__device__ void teamInverseAdd(int16_t *q, int txSz, int txType, int dcQ, int acQ, int16_t *res, const uint8_t *pred,
+                               uint8_t *recon) {
+    constexpr int W = 1 << LW, H = 1 << LH, TW = W > 32 ? 32 : W, TH = H > 32 ? 32 : H;
+    constexpr bool rect = LW - LH == 1 || LH - LW == 1;
+    const int lane = team_rank<NT>();
+    const int den = av1g_dq_denom(txSz);
+    const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
+    const int rowShift = AV1G_T(Transform_Row_Shift)[txSz];
+    for (;;) {
+        int any = 0;
+        for (int i = lane; i < TW * TH; i += NT) any |= q[i];
+        if (!team_any<NT>(any)) {
+            for (int i = lane; i < W * H; i += NT) recon[i] = pred[i];
+            team_sync<NT>();
+            return;
+        }
+        uint32_t err = 0;
+        for (int i = lane; i < H; i += NT) err |= rci::row<LW, 8>(i, TH, TW, q, dcQ, acQ, nullptr, den, rect, rk, rowShift, res);
+        team_sync<NT>();
+        for (int j = lane; j < W; j += NT) err |= rci::col<LH>(j, W, ck, res);
+        team_sync<NT>();
+        if (!team_any<NT>(err != 0)) break;
+        for (int i = lane; i < TW * TH; i += NT) q[i] = (int16_t)(q[i] / 2);
+        team_sync<NT>();
+    }
+    // flipped types: Residual[i][j] lands at (flipUD ? H-1-i : i, flipLR ? W-1-j : j) (spec 7.13.3 step 3)
+    const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
+    for (int i = lane; i < W * H; i += NT) {
+        const int r = i >> LW, c = i & (W - 1);
+        const int src = (fud ? H - 1 - r : r) * W + (flr ? W - 1 - c : c);
+        recon[i] = (uint8_t)min(max((int)pred[i] + res[src], 0), 255);
+    }
+    team_sync<NT>();
+}
+
+template <int LW, int LH, int NT>
+__device__ __forceinline__ void teamInverseAddCt(int16_t *q, int txSz, int txType, int dcQ, int acQ, int16_t *res,
+                                                 const uint8_t *pred, uint8_t *recon) {
+    constexpr int lw = LW < 2 ? 2 : LW > 6 ? 6 : LW, lh = LH < 2 ? 2 : LH > 6 ? 6 : LH;
+    constexpr int dl = lw - lh;
+    if constexpr (NT == 32) inverseAddCt<LW, LH>(q, txSz, txType, dcQ, acQ, res, pred, recon);
+    else if constexpr (dl >= -2 && dl <= 2) teamInverseAdd<lw, lh, NT>(q, txSz, txType, dcQ, acQ, res, pred, recon);
+}
+template <int W, int H, int NT>
+__device__ __forceinline__ void team_fwd(const int16_t *res, float *tmp, int txSz, int txType) {
+    if constexpr (NT == 32) warp_fwd_ct<W, H>(res, tmp, txSz, txType);
+    else team_fwd_ct<W, H, NT>(res, tmp, txSz, txType);
+}
+template <int NT>
+__device__ __forceinline__ void team_quant(const float *tmp, int16_t *q, const EvalIn &e, EvalOut &o, int W, int H) {
+    if constexpr (NT == 32) warp_quant_rate_rt<8>(tmp, q, e, o, W, H);
+    else team_quant_rate_rt<NT, 8>(tmp, q, e, o, W, H);
+}
+
 // Greedy RD-optimized quantization (one lane): in reverse scan order, each nonzero level may drop by one or to zero
 // when D + lambda * R improves. Rates use the AV1 coefficient contexts of the levels already decided (later scan
 // positions), matching the order in which contexts are formed. tmp: transform coefficients (row stride W + 1).
@@ -2853,7 +3076,8 @@ struct IntraScratch {
 // AV1GPU_PF_INTRA_WORK: samples processed by the intra decision, [0] luma coding, [1] chroma coding, [2] CfL alpha
 // search, [3] SAD screens (a deterministic work measure).
 __device__ unsigned long long g_intraWork[4];
-__device__ __forceinline__ void intraWork(int k, int n) { if ((threadIdx.x & 31) == 0) atomicAdd(&g_intraWork[k], (unsigned long long)n); }
+template <int NT = 32>
+__device__ __forceinline__ void intraWork(int k, int n) { if ((team_rank<NT>()) == 0) atomicAdd(&g_intraWork[k], (unsigned long long)n); }
 // Decision-pass scratch: luma and chroma are coded one after the other, so the chroma buffers share the luma
 // prediction / residual / transform / level buffers (the luma reconstruction stays: CfL reads it).
 template <int W, int H = W>
@@ -2882,12 +3106,13 @@ struct IntraPart { float dSkip, dCoded, rate; int nz, type, noSkip; };
 // AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
 // inside the frame, so the above-right and frame limits do not matter for these indices). L2 loads: other
 // superblocks' samples were written by other CTAs of the same launch.
+template <int NT = 32>
 __device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int nA, int nL, bool haveA, bool haveL,
                            uint8_t *ab, uint8_t *lb) {
-    const int lane = threadIdx.x & 31;
-    for (int i = lane; i < nA; i += 32)
+    const int lane = team_rank<NT>();
+    for (int i = lane; i < nA; i += NT)
         ab[1 + i] = haveA ? __ldcg(plane + size_t(y - 1) * pitch + x + i) : haveL ? __ldcg(plane + size_t(y) * pitch + x - 1) : 127;
-    for (int i = lane; i < nL; i += 32)
+    for (int i = lane; i < nL; i += NT)
         lb[1 + i] = haveL ? __ldcg(plane + size_t(y + i) * pitch + x - 1) : haveA ? __ldcg(plane + size_t(y - 1) * pitch + x) : 129;
     if (!lane) {
         const uint8_t c = haveA && haveL ? __ldcg(plane + size_t(y - 1) * pitch + x - 1)
@@ -2895,7 +3120,7 @@ __device__ void intraEdges(const uint8_t *plane, int pitch, int x, int y, int nA
                         : haveL ? __ldcg(plane + size_t(y) * pitch + x - 1) : 128;
         ab[0] = lb[0] = c;
     }
-    __syncwarp();
+    team_sync<NT>();
 }
 __device__ __forceinline__ int intraPixel(int code, int dc, int i, int j, int lw, int lh, const uint8_t *ab, const uint8_t *lb) {
     const int mode = code & 15;   // code: mode | (angle_delta + 4) << 4 for luma candidates with a delta
@@ -2904,15 +3129,15 @@ __device__ __forceinline__ int intraPixel(int code, int dc, int i, int j, int lw
 }
 // Luma of an intra block (one warp). mode < 0: choose the luma mode by SAD first; forcedType < 0: search the transform
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
-template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+template <int LW, int LH = LW, int NT = 32, class SC = IntraScratch<1 << LW, 1 << LH>>
 __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                                int forcedType, int *altMode = nullptr, float sseGate = kInf, int *alt3Mode = nullptr,
                                int *sadOut = nullptr) {
     constexpr int W = 1 << LW, H = 1 << LH, TW = W > 32 ? 32 : W, TH = H > 32 ? 32 : H;
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     const uint8_t *src = a.src[0];
     const int sp = a.pitch[0];
-    intraEdges(a.recon, a.w, x0, y0, W, H, haveA, haveL, S.above, S.left);
+    intraEdges<NT>(a.recon, a.w, x0, y0, W, H, haveA, haveL, S.above, S.left);
     const uint8_t *ab = S.above + 1, *lb = S.left + 1;
     const int dcY = av1g_dc_value<8>(ab, lb, haveL, haveA, LW, LH);
     if (mode < 0) {
@@ -2924,7 +3149,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
             constexpr int SS = W >= 16 && H >= 16 ? 1 : 0, LS = LW - SS, WS = W >> SS, HS = H >> SS;
             int sad = 0;
             if (a.satd) {
-                for (int b4 = lane; b4 < (W / 4) * (H / 4); b4 += 32) {
+                for (int b4 = lane; b4 < (W / 4) * (H / 4); b4 += NT) {
                     const int r0 = (b4 / (W / 4)) * 4, c0 = (b4 % (W / 4)) * 4;
                     int d[16];
 #pragma unroll
@@ -2943,13 +3168,13 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
                     }
                 }
             } else {
-                for (int i = lane; i < WS * HS; i += 32) {
+                for (int i = lane; i < WS * HS; i += NT) {
                     const int r = (i >> LS) << SS, c = (i & (WS - 1)) << SS;
                     sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, LW, LH, ab, lb));
                 }
             }
-            intraWork(3, WS * HS);
-            sad = warp_sumi(sad);
+            intraWork<NT>(3, WS * HS);
+            sad = team_sumi<NT>(sad);
             if (sadOut) sadOut[k] = sad;
             if (a.alt2) {   // runner-up by SAD (checked by RD in intraBlock)
                 if (sad < best) {
@@ -2975,7 +3200,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
     }
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     float en = 0.f;
-    for (int i = lane; i < W * H; i += 32) {
+    for (int i = lane; i < W * H; i += NT) {
         const int r = i >> LW, c = i & (W - 1);
         const int p = intraPixel(mode, dcY, r, c, LW, LH, ab, lb);
         const int d = (int)src[(y0 + r) * sp + x0 + c] - p;
@@ -2983,7 +3208,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
         S.res[i] = (int16_t)d;
         en += (float)(d * d);
     }
-    __syncwarp();
+    team_sync<NT>();
     EvalIn e{};
     e.txSz = txSizeOf(LW, LH);
     e.txType = AV1G_DCT_DCT;
@@ -2992,8 +3217,8 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
     e.rnd = a.rnd; e.zbin = a.zbin;
     e.skipCtx = 0; e.dcCtx = 0; e.intraDir = mode & 15; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
-    intraWork(0, W * H);
-    e.resEnergy = warp_sum(en);
+    intraWork<NT>(0, W * H);
+    e.resEnergy = team_sumf<NT>(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
     int type = AV1G_DCT_DCT;
@@ -3006,20 +3231,20 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
         for (int k = 0; k < n; k++) {
             const int t = set == AV1G_TX_SET_INTRA_1 ? AV1G_T(Tx_Type_Intra_Inv_Set1)[k] : AV1G_T(Tx_Type_Intra_Inv_Set2)[k];
             e.txType = t;
-            warp_fwd_ct<W, H>(S.res, S.tmp, e.txSz, t);
-            warp_quant_rate_rt<8>(S.tmp, S.q, e, o, W, H);
+            team_fwd<W, H, NT>(S.res, S.tmp, e.txSz, t);
+            team_quant<NT>(S.tmp, S.q, e, o, W, H);
             const float J = o.D + a.lambda * o.R;
             if (J < bestJ) { bestJ = J; type = t; }
         }
     }
     e.txType = type;
-    warp_fwd_ct<W, H>(S.res, S.tmp, e.txSz, type);
-    warp_quant_rate_rt<8>(S.tmp, S.q, e, o, W, H);
+    team_fwd<W, H, NT>(S.res, S.tmp, e.txSz, type);
+    team_quant<NT>(S.tmp, S.q, e, o, W, H);
     if (forcedType == -3) {   // the quantizer's distortion estimate, no reconstruction
         int any = 0;
-        for (int i = lane; i < TW * TH; i += 32) any |= S.q[i];
+        for (int i = lane; i < TW * TH; i += NT) any |= S.q[i];
         IntraPart r;
-        r.nz = __any_sync(0xffffffffu, any != 0);
+        r.nz = team_any<NT>(any != 0);
         r.dCoded = o.D;
         r.dSkip = e.resEnergy;
         r.rate = o.R;
@@ -3027,17 +3252,17 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
         r.noSkip = 0;
         return r;
     }
-    inverseAddCt<LW, LH>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, S.rec);
+    teamInverseAddCt<LW, LH, NT>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, S.rec);
     int sse = 0, any = 0;
-    for (int i = lane; i < W * H; i += 32) {
+    for (int i = lane; i < W * H; i += NT) {
         const int r = i >> LW, c = i & (W - 1);
         const int d = (int)src[(y0 + r) * sp + x0 + c] - S.rec[i];
         sse += d * d;
     }
-    for (int i = lane; i < TW * TH; i += 32) any |= S.q[i];
+    for (int i = lane; i < TW * TH; i += NT) any |= S.q[i];
     IntraPart r;
-    r.nz = __any_sync(0xffffffffu, any != 0);
-    r.dCoded = (float)warp_sumi(sse);
+    r.nz = team_any<NT>(any != 0);
+    r.dCoded = (float)team_sumi<NT>(sse);
     r.dSkip = e.resEnergy;
     r.rate = o.R;
     r.type = r.nz ? type : AV1G_DCT_DCT;   // an all-zero luma transform codes no type
@@ -3046,15 +3271,15 @@ __device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool h
 }
 // Edges of a transform at (x, y) inside the intra block at (x0, y0) (n x n): samples of the block come from its local
 // reconstruction S.rec (earlier transforms in raster order), the others from the frame.
-template <int N, class SC>
+template <int N, int NT, class SC>
 __device__ void intraEdgesLocal(const IntraArgs &a, const SC &S, int x0, int y0, int x, int y, int n, bool haveA,
                                 bool haveL, uint8_t *ab, uint8_t *lb) {
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     auto at = [&](int xx, int yy) -> uint8_t {
         if (xx >= x0 && yy >= y0) return S.rec[(yy - y0) * N + xx - x0];
         return __ldcg(a.recon + size_t(yy) * a.w + xx);
     };
-    for (int i = lane; i < n; i += 32) {
+    for (int i = lane; i < n; i += NT) {
         ab[1 + i] = haveA ? at(x + i, y - 1) : haveL ? at(x - 1, y) : 127;
         lb[1 + i] = haveL ? at(x - 1, y + i) : haveA ? at(x, y - 1) : 129;
     }
@@ -3062,17 +3287,17 @@ __device__ void intraEdgesLocal(const IntraArgs &a, const SC &S, int x0, int y0,
         const uint8_t c = haveA && haveL ? at(x - 1, y - 1) : haveA ? at(x, y - 1) : haveL ? at(x - 1, y) : 128;
         ab[0] = lb[0] = c;
     }
-    __syncwarp();
+    team_sync<NT>();
 }
 // Luma of an intra block with tx_depth D (2^D x 2^D transforms of side N >> D, predicted one after the other in raster
 // order from the reconstruction of the earlier ones), one warp, for a given mode. Transform types are searched per
 // transform (S.ttype). With write, each transform's levels go to the frame's level planes. Such blocks never code skip.
-template <int L, int D, class SC = IntraScratch<1 << L>>
+template <int L, int D, int NT = 32, class SC = IntraScratch<1 << L>>
 __device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL,
                                     int mode, bool write) {
     constexpr int N = 1 << L, LT = L - D, T = 1 << LT, PER = 1 << D;
     static_assert(T <= 32 && T >= 8, "split transforms of 8..32");
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     const uint8_t *src = a.src[0];
     const int sp = a.pitch[0];
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
@@ -3090,11 +3315,11 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, b
     uint8_t *recT = reinterpret_cast<uint8_t *>(S.res + T * T);   // compact reconstruction of one transform
     for (int k = 0; k < PER * PER; k++) {
         const int tx = (k % PER) * T, ty = (k / PER) * T;
-        intraEdgesLocal<N>(a, S, x0, y0, x0 + tx, y0 + ty, T, ty > 0 || haveA, tx > 0 || haveL, S.above, S.left);
+        intraEdgesLocal<N, NT>(a, S, x0, y0, x0 + tx, y0 + ty, T, ty > 0 || haveA, tx > 0 || haveL, S.above, S.left);
         const uint8_t *ab = S.above + 1, *lb = S.left + 1;
         const int dc = av1g_dc_value<8>(ab, lb, tx > 0 || haveL, ty > 0 || haveA, LT, LT);
         float en = 0.f;
-        for (int i = lane; i < T * T; i += 32) {
+        for (int i = lane; i < T * T; i += NT) {
             const int r = i >> LT, c = i & (T - 1);
             const int pv = intraPixel(mode, dc, r, c, LT, LT, ab, lb);
             const int d = (int)src[(y0 + ty + r) * sp + x0 + tx + c] - pv;
@@ -3102,8 +3327,8 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, b
             S.res[i] = (int16_t)d;
             en += (float)(d * d);
         }
-        __syncwarp();
-        e.resEnergy = warp_sum(en);
+        team_sync<NT>();
+        e.resEnergy = team_sumf<NT>(en);
         EvalOut o;
         int type = AV1G_DCT_DCT;
         if (set != AV1G_TX_SET_DCTONLY && write && !a.splitDct) {   // the decision pass estimates with DCT_DCT
@@ -3112,18 +3337,18 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, b
             for (int t = 0; t < n; t++) {
                 const int tt = set == AV1G_TX_SET_INTRA_1 ? AV1G_T(Tx_Type_Intra_Inv_Set1)[t] : AV1G_T(Tx_Type_Intra_Inv_Set2)[t];
                 e.txType = tt;
-                warp_fwd_ct<T, T>(S.res, S.tmp, e.txSz, tt);
-                warp_quant_rate_rt<8>(S.tmp, S.q, e, o, T, T);
+                team_fwd<T, T, NT>(S.res, S.tmp, e.txSz, tt);
+                team_quant<NT>(S.tmp, S.q, e, o, T, T);
                 const float J = o.D + a.lambda * o.R;
                 if (J < bestJ) { bestJ = J; type = tt; }
             }
         }
         e.txType = type;
-        warp_fwd_ct<T, T>(S.res, S.tmp, e.txSz, type);
-        warp_quant_rate_rt<8>(S.tmp, S.q, e, o, T, T);
-        inverseAddCt<LT, LT>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, recT);
+        team_fwd<T, T, NT>(S.res, S.tmp, e.txSz, type);
+        team_quant<NT>(S.tmp, S.q, e, o, T, T);
+        teamInverseAddCt<LT, LT, NT>(S.q, e.txSz, type, dcQ, acQ, S.res, S.pred, recT);
         int sse = 0, any = 0;
-        for (int i = lane; i < T * T; i += 32) {
+        for (int i = lane; i < T * T; i += NT) {
             const int r = i >> LT, c = i & (T - 1);
             const int d = (int)src[(y0 + ty + r) * sp + x0 + tx + c] - recT[i];
             sse += d * d;
@@ -3131,12 +3356,12 @@ __device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, b
             any |= S.q[i];
             if (write) a.levels[size_t(y0 + ty + r) * a.aw + x0 + tx + c] = S.q[i];
         }
-        const bool nz = __any_sync(0xffffffffu, any != 0);
+        const bool nz = team_any<NT>(any != 0);
         if (!lane) S.ttype[k] = (uint8_t)(nz ? type : AV1G_DCT_DCT);
         anyTot |= nz;
-        dTot += (float)warp_sumi(sse);
+        dTot += (float)team_sumi<NT>(sse);
         rTot += o.R;
-        __syncwarp();
+        team_sync<NT>();
     }
     IntraPart r;
     r.nz = anyTot;
@@ -3154,34 +3379,34 @@ __device__ __forceinline__ int cflLumaAt(const uint8_t *luma, int W, int r, int 
     const uint8_t *l = luma + (2 * r) * W + 2 * c;
     return (l[0] + l[1] + l[W] + l[W + 1]) << 1;
 }
-template <int LCW, int LCH>
+template <int LCW, int LCH, int NT = 32>
 __device__ __forceinline__ int cflLumaAvg(const uint8_t *luma) {
     constexpr int CW = 1 << LCW, CH = 1 << LCH;
     int t = 0;
-    for (int i = threadIdx.x & 31; i < CW * CH; i += 32) t += cflLumaAt(luma, 2 * CW, i >> LCW, i & (CW - 1));
-    return av1g_round2(warp_sumi(t), LCW + LCH);
+    for (int i = team_rank<NT>(); i < CW * CH; i += NT) t += cflLumaAt(luma, 2 * CW, i >> LCW, i & (CW - 1));
+    return av1g_round2(team_sumi<NT>(t), LCW + LCH);
 }
 __device__ __forceinline__ int cflPixel(int dc, int alpha, int v, int avg) {
     return min(max(dc + av1g_round2signed(alpha * (v - avg), 6), 0), 255);
 }
-template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+template <int LW, int LH = LW, int NT = 32, class SC = IntraScratch<1 << LW, 1 << LH>>
 __device__ IntraPart intraChroma(const IntraArgs &a, SC &S, int p, int x0, int y0, bool haveA, bool haveL,
                                  int uvMode, int cflAlpha = 0, const uint8_t *cflLuma = nullptr) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
     const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
     const uint8_t *cs = a.src[p];
     const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
-    intraEdges(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
+    intraEdges<NT>(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
     const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1;
     const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LCW, LCH);
     uint8_t *pr = S.predC[k], *rc = S.recC[k];
     int16_t *q = S.qC[k], *res = S.resC[k];
     const bool cfl = uvMode == AV1G_UV_CFL_PRED;
-    const int avg = cfl ? cflLumaAvg<LCW, LCH>(cflLuma) : 0;
+    const int avg = cfl ? cflLumaAvg<LCW, LCH, NT>(cflLuma) : 0;
     float en = 0.f;
-    for (int i = lane; i < CW * CH; i += 32) {
+    for (int i = lane; i < CW * CH; i += NT) {
         const int r = i >> LCW, c = i & (CW - 1);
         const int pv = cfl ? cflPixel(dc, cflAlpha, cflLumaAt(cflLuma, 2 * CW, r, c), avg)
                            : intraPixel(uvMode, dc, r, c, LCW, LCH, ab, lb);
@@ -3190,7 +3415,7 @@ __device__ IntraPart intraChroma(const IntraArgs &a, SC &S, int p, int x0, int y
         res[i] = (int16_t)d;
         en += (float)(d * d);
     }
-    __syncwarp();
+    team_sync<NT>();
     const int dcQ = av1g_dc_q(a.qindex), acQ = av1g_ac_q(a.qindex);
     EvalIn e{};
     e.txSz = txSizeOf(LCW, LCH);
@@ -3200,23 +3425,23 @@ __device__ IntraPart intraChroma(const IntraArgs &a, SC &S, int p, int x0, int y
     e.rnd = a.rnd; e.zbin = a.zbin;
     e.skipCtx = 7; e.dcCtx = 0; e.intraDir = 0; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
-    intraWork(1, CW * CH);
-    e.resEnergy = warp_sum(en);
+    intraWork<NT>(1, CW * CH);
+    e.resEnergy = team_sumf<NT>(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
-    warp_fwd_ct<CW, CH>(res, S.tmpC[k], e.txSz, e.txType);
-    warp_quant_rate_rt<8>(S.tmpC[k], q, e, o, CW, CH);
-    inverseAddCt<LCW, LCH>(q, e.txSz, e.txType, dcQ, acQ, res, pr, rc);
+    team_fwd<CW, CH, NT>(res, S.tmpC[k], e.txSz, e.txType);
+    team_quant<NT>(S.tmpC[k], q, e, o, CW, CH);
+    teamInverseAddCt<LCW, LCH, NT>(q, e.txSz, e.txType, dcQ, acQ, res, pr, rc);
     int sse = 0, any = 0;
-    for (int i = lane; i < CW * CH; i += 32) {
+    for (int i = lane; i < CW * CH; i += NT) {
         const int r = i >> LCW, c = i & (CW - 1);
         const int d = (int)cs[(cy + r) * cp + cx + c] - rc[i];
         sse += d * d;
         any |= q[i];
     }
     IntraPart r;
-    r.nz = __any_sync(0xffffffffu, any != 0);
-    r.dCoded = (float)warp_sumi(sse);
+    r.nz = team_any<NT>(any != 0);
+    r.dCoded = (float)team_sumi<NT>(sse);
     r.dSkip = e.resEnergy;
     r.rate = o.R;
     r.type = AV1G_DCT_DCT;
@@ -3224,20 +3449,20 @@ __device__ IntraPart intraChroma(const IntraArgs &a, SC &S, int p, int x0, int y
     return r;
 }
 // CfL alpha of plane p (-16..16, 1/8 units) with the least prediction SSE, from a W-wide luma reconstruction.
-template <int LW, int LH, class SC>
+template <int LW, int LH, int NT, class SC>
 __device__ int cflBestAlpha(const IntraArgs &a, SC &S, int p, int x0, int y0, bool haveA, bool haveL,
                             const uint8_t *luma) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     const int cw = a.w >> 1, ch = a.h >> 1, k = p - 1;
     const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
     const uint8_t *cs = a.src[p];
     const int cp = a.pitch[p], cx = x0 >> 1, cy = y0 >> 1;
-    intraEdges(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
+    intraEdges<NT>(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
     const int dc = av1g_dc_value<8>(S.aboveC[k] + 1, S.leftC[k] + 1, haveL, haveA, LCW, LCH);
-    const int avg = cflLumaAvg<LCW, LCH>(luma);
+    const int avg = cflLumaAvg<LCW, LCH, NT>(luma);
     int sse[33] = {};
-    for (int i = lane; i < CW * CH; i += 32) {
+    for (int i = lane; i < CW * CH; i += NT) {
         const int r = i >> LCW, c = i & (CW - 1);
         const int v = cflLumaAt(luma, 2 * CW, r, c), sv = cs[(cy + r) * cp + cx + c];
 #pragma unroll
@@ -3246,11 +3471,11 @@ __device__ int cflBestAlpha(const IntraArgs &a, SC &S, int p, int x0, int y0, bo
             sse[al + 16] += d * d;
         }
     }
-    intraWork(2, CW * CH * 33);
+    intraWork<NT>(2, CW * CH * 33);
     int best = 0x7fffffff, bestA = 0;
 #pragma unroll
     for (int al = 0; al < 33; al++) {
-        const int t = warp_sumi(sse[al]);
+        const int t = team_sumi<NT>(sse[al]);
         if (t < best) { best = t; bestA = al - 16; }
     }
     return bestA;
@@ -3291,41 +3516,41 @@ __device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << LW, 1 << 
     }
 }
 // Chroma mode of an intra block by SAD over both planes (one warp).
-template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+template <int LW, int LH = LW, int NT = 32, class SC = IntraScratch<1 << LW, 1 << LH>>
 __device__ int intraChromaMode(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
-    const int lane = threadIdx.x & 31;
+    const int lane = team_rank<NT>();
     const int cw = a.w >> 1, ch = a.h >> 1, cx = x0 >> 1, cy = y0 >> 1;
     int sad[kIntraModes] = {};
     for (int k = 0; k < 2; k++) {
         const uint8_t *plane = a.recon + size_t(a.w) * a.h + size_t(k) * cw * ch;
-        intraEdges(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
+        intraEdges<NT>(plane, cw, cx, cy, CW, CH, haveA, haveL, S.aboveC[k], S.leftC[k]);
         const uint8_t *ab = S.aboveC[k] + 1, *lb = S.leftC[k] + 1, *cs = a.src[k + 1];
         const int cp = a.pitch[k + 1];
         const int dc = av1g_dc_value<8>(ab, lb, haveL, haveA, LCW, LCH);
         constexpr int SS = CW >= 16 && CH >= 16 ? 1 : 0, LS = LCW - SS, WS = CW >> SS, HS = CH >> SS;
         for (int m = 0; m < a.nModes; m++)
-            for (int i = lane; i < WS * HS; i += 32) {
+            for (int i = lane; i < WS * HS; i += NT) {
                 const int r = (i >> LS) << SS, c = (i & (WS - 1)) << SS;
                 sad[m] += abs((int)cs[(cy + r) * cp + cx + c] - intraPixel(c_intraModes[m], dc, r, c, LCW, LCH, ab, lb));
             }
     }
     int best = 0x7fffffff, mode = AV1G_DC_PRED;
     for (int m = 0; m < a.nModes; m++) {
-        const int v = warp_sumi(sad[m]);
+        const int v = team_sumi<NT>(sad[m]);
         if (v < best) { best = v; mode = c_intraModes[m]; }
     }
     return mode;
 }
 // Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
-template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+template <int LW, int LH = LW, int NT = 32, class SC = IntraScratch<1 << LW, 1 << LH>>
 __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                             int &type, int &depth, float jInter, int &uvMode, int &cflU, int &cflV) {
     IntraPart pt[3];
     cflU = cflV = 0;
     int alt = -1, alt3 = -1, sads[kLumaCands];
     const int cft = a.est ? -3 : -1;   // candidate ranking: estimate only (the winner is coded in full below)
-    pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, cft, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
+    pt[0] = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mode, cft, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
                               a.alt3 ? &alt3 : nullptr, sads);
     if (pt[0].dSkip >= kInf) return kInf;
     // the first luma candidate already puts intra far above the inter cost: skip the other candidates, chroma and CfL
@@ -3347,12 +3572,12 @@ __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool have
     if (alt >= 0 && alt != mode) {
         // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
         int m2 = alt;
-        const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m2, cft);
+        const IntraPart q = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, m2, cft);
         consider(q, alt);
     }
     if (alt3 >= 0 && alt3 != mode && alt3 != alt) {   // third best by SAD (AV1GPU_PF_INTRA_ALT3)
         int m3 = alt3;
-        const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m3, cft);
+        const IntraPart q = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, m3, cft);
         consider(q, alt3);
     }
     // AV1GPU_PF_INTRA_TOPK > 3: the next best modes by SAD too
@@ -3372,22 +3597,22 @@ __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool have
             if (pick < 0) break;
             sads[pick] = -1;
             int mk = c_lumaCands[pick];
-            const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mk, cft);
+            const IntraPart q = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mk, cft);
             consider(q, c_lumaCands[pick]);
         }
     }
     if (a.est) {   // the chosen mode in full: transform type search and exact reconstruction (and the runner-up)
         if (a.est >= 2 && runner >= 0 && runner != mode) {
             int mr = runner;
-            const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mr, -1);
+            const IntraPart q = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mr, -1);
             int mf = mode;
-            const IntraPart b = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mf, -1);
+            const IntraPart b = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mf, -1);
             const float jq = fminf(q.dCoded + a.lambda * q.rate, q.dSkip), jb = fminf(b.dCoded + a.lambda * b.rate, b.dSkip);
             if (jq < jb) { pt[0] = q; mode = runner; }
             else pt[0] = b;
         } else {
             int mf = mode;
-            pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mf, -1);
+            pt[0] = intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mf, -1);
         }
     }
     {
@@ -3399,18 +3624,18 @@ __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool have
     }
     // chroma: UV_DC_PRED against the best mode by SAD, by rate-distortion (one extra bit for the other mode)
     const bool uvAll = a.uvAll && !((LW == 6 || LH == 6) && a.uvSad64);
-    const int uvCand = a.uvModes && !uvAll ? intraChromaMode<LW, LH>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
+    const int uvCand = a.uvModes && !uvAll ? intraChromaMode<LW, LH, NT>(a, S, x0, y0, haveA, haveL) : AV1G_DC_PRED;
     uvMode = AV1G_DC_PRED;
-    pt[1] = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, AV1G_DC_PRED);
-    pt[2] = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, AV1G_DC_PRED);
+    pt[1] = intraChroma<LW, LH, NT>(a, S, 1, x0, y0, haveA, haveL, AV1G_DC_PRED);
+    pt[2] = intraChroma<LW, LH, NT>(a, S, 2, x0, y0, haveA, haveL, AV1G_DC_PRED);
     if (a.uvModes && uvAll) {   // every chroma mode by rate-distortion (AV1GPU_PF_INTRA_UVALL)
         auto jc = [&](const IntraPart &q) { return fminf(q.dCoded + a.lambda * q.rate, q.dSkip); };
         float best = jc(pt[1]) + jc(pt[2]);
         IntraPart bu = pt[1], bv = pt[2];
         for (int k = 1; k < a.nModes; k++) {
             const int m = c_intraModes[k];
-            const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, m);
-            const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, m);
+            const IntraPart u = intraChroma<LW, LH, NT>(a, S, 1, x0, y0, haveA, haveL, m);
+            const IntraPart v = intraChroma<LW, LH, NT>(a, S, 2, x0, y0, haveA, haveL, m);
             const float j = jc(u) + jc(v) + a.lambda * a.uvBits;
             if (j < best) { best = j; uvMode = m; bu = u; bv = v; }
         }
@@ -3419,20 +3644,20 @@ __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool have
         if constexpr ((1 << LW) <= 32 && (1 << LH) <= 32) {
             if (a.cfl) {
                 int mt = mode;
-                intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mt, pt[0].type);   // S.rec: the luma reconstruction
-                const int aU = cflBestAlpha<LW, LH>(a, S, 1, x0, y0, haveA, haveL, S.rec);
-                const int aV = cflBestAlpha<LW, LH>(a, S, 2, x0, y0, haveA, haveL, S.rec);
+                intraLuma<LW, LH, NT>(a, S, x0, y0, haveA, haveL, mt, pt[0].type);   // S.rec: the luma reconstruction
+                const int aU = cflBestAlpha<LW, LH, NT>(a, S, 1, x0, y0, haveA, haveL, S.rec);
+                const int aV = cflBestAlpha<LW, LH, NT>(a, S, 2, x0, y0, haveA, haveL, S.rec);
                 if (aU || aV) {
-                    const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aU, S.rec);
-                    const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aV, S.rec);
+                    const IntraPart u = intraChroma<LW, LH, NT>(a, S, 1, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aU, S.rec);
+                    const IntraPart v = intraChroma<LW, LH, NT>(a, S, 2, x0, y0, haveA, haveL, AV1G_UV_CFL_PRED, aV, S.rec);
                     const float j = jc(u) + jc(v) + a.lambda * a.cflBits;
                     if (j < best) { best = j; uvMode = AV1G_UV_CFL_PRED; cflU = aU; cflV = aV; }
                 }
             }
         }
     } else if (uvCand != AV1G_DC_PRED) {
-        const IntraPart u = intraChroma<LW, LH>(a, S, 1, x0, y0, haveA, haveL, uvCand);
-        const IntraPart v = intraChroma<LW, LH>(a, S, 2, x0, y0, haveA, haveL, uvCand);
+        const IntraPart u = intraChroma<LW, LH, NT>(a, S, 1, x0, y0, haveA, haveL, uvCand);
+        const IntraPart v = intraChroma<LW, LH, NT>(a, S, 2, x0, y0, haveA, haveL, uvCand);
         auto jc = [&](const IntraPart &q) { return fminf(q.dCoded + a.lambda * q.rate, q.dSkip); };
         if (jc(u) + jc(v) + a.lambda * a.uvBits < jc(pt[1]) + jc(pt[2])) uvMode = uvCand;
     }
@@ -3446,12 +3671,12 @@ __device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool have
     // splits only where intra is close to winning (AV1GPU_PF_INTRA_SPLITGATE, default 1.3)
     if (!a.txSplit || J > a.splitGate * jInter) return J;
     if constexpr (LW == LH && LW >= 4) {
-        pt[0] = intraLumaSplit<LW, 1>(a, S, x0, y0, haveA, haveL, mode, false);
+        pt[0] = intraLumaSplit<LW, 1, NT>(a, S, x0, y0, haveA, haveL, mode, false);
         const float j1 = intraCombine(a, pt, skip);
         if (j1 < J) { J = j1; depth = 1; type = 0; }
     }
     if constexpr (LW == LH && LW >= 5) {
-        pt[0] = intraLumaSplit<LW, 2>(a, S, x0, y0, haveA, haveL, mode, false);
+        pt[0] = intraLumaSplit<LW, 2, NT>(a, S, x0, y0, haveA, haveL, mode, false);
         const float j2 = intraCombine(a, pt, skip);
         if (j2 < J) { J = j2; depth = 2; type = 0; }
     }
@@ -3467,6 +3692,9 @@ __device__ __forceinline__ void intraAvail(const TileJob &j, int miRow, int miCo
 // Warps per CTA of the intra decision of a W x H block (shared memory per warp grows with the area).
 template <int LW, int LH> struct IntraCfg {
     static constexpr int area = (1 << LW) * (1 << LH), warps = area >= 2048 ? 1 : area >= 512 ? 2 : 4;
+    // threads per block: 64x64 blocks use a 128-thread team (the whole CTA) over one scratch
+    static constexpr int team = area >= 4096 ? 128 : 32;
+    static constexpr int threads = team > 32 ? team : 32 * warps;
 };
 // Log2 width and height of a grid unit's block (square, HORZ / VERT halves, HORZ_4 / VERT_4 quarters).
 __device__ __forceinline__ void blockDims(const BlockInfo &bi, int &lw, int &lh) {
@@ -3486,11 +3714,11 @@ __device__ __forceinline__ const Cand &blockCand(const IntraArgs &a, const Block
     return a.rcand[rk][(gy >> (lh - 3)) * a.rcols[rk] + (gx >> (lw - 3))];
 }
 template <int LW, int LH>
-__global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(IntraArgs a) {
-    constexpr int W = 1 << LW, H = 1 << LH, WARPS = IntraCfg<LW, LH>::warps, UW = W / 8, UH = H / 8;
-    constexpr int L = LW;   // square blocks: their size
+__global__ void __launch_bounds__(IntraCfg<LW, LH>::threads) intraDecide(IntraArgs a) {
+    constexpr int NT = IntraCfg<LW, LH>::team;
+    constexpr int W = 1 << LW, H = 1 << LH, WARPS = NT > 32 ? 1 : IntraCfg<LW, LH>::warps, UW = W / 8, UH = H / 8;
     __shared__ IntraScratchD<W, H> S[WARPS];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp = NT > 32 ? 0 : threadIdx.x >> 5, lane = team_rank<NT>();
     const int gcols = a.j.fs.gcols, bcols = (gcols + UW - 1) / UW;
     const int idx = blockIdx.x * WARPS + warp;
     const int gx = (idx % bcols) * UW, gy = (idx / bcols) * UH;
@@ -3515,7 +3743,7 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
     intraAvail(a.j, gy * 2, gx * 2, haveA, haveL);
     int mode = -1;
     int type = 0, depth = 0, uvMode = 0, cflU = 0, cflV = 0;
-    const float jIntra = intraBlock<LW, LH>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode, cflU, cflV);
+    const float jIntra = intraBlock<LW, LH, NT>(a, S[warp], x0, y0, haveA, haveL, mode, type, depth, jInter, uvMode, cflU, cflV);
     const bool useIntra = jIntra * a.margin < jInter;
     // bits 19-24 / 25-30: CfL alphas + 16
     uint32_t v = useIntra ? (uint32_t)(((mode & 15) + 1) | type << 4 | depth << 8 | uvMode << 10 | (mode >> 4) << 16 |
@@ -3529,7 +3757,7 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
             uint32_t cs[4];
             for (int q = 0; q < 4 && j4 < kInf; q++) {
                 int m = -1, t = 0, d = 0, uv = 0, cu = 0, cv = 0;
-                const float jq = intraBlock<5, 5>(a, S32, x0 + (q & 1) * 32, y0 + (q >> 1) * 32, (q >> 1) ? true : haveA,
+                const float jq = intraBlock<5, 5, NT>(a, S32, x0 + (q & 1) * 32, y0 + (q >> 1) * 32, (q >> 1) ? true : haveA,
                                                (q & 1) ? true : haveL, m, t, d, kInf, uv, cu, cv);
                 j4 += jq;
                 cs[q] = (uint32_t)(((m & 15) + 1) | t << 4 | d << 8 | uv << 10 | (m >> 4) << 16 | (uint32_t)(cu + 16) << 19 |
@@ -4988,9 +5216,10 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         int si = 0;
 #define PF_IDEC(LW, LH)                                                                                            \
         {                                                                                                          \
-            constexpr int uw = 1 << (LW - 3), uh = 1 << (LH - 3), wp = IntraCfg<LW, LH>::warps;                    \
+            constexpr int uw = 1 << (LW - 3), uh = 1 << (LH - 3);                                                  \
+            constexpr int wp = IntraCfg<LW, LH>::team > 32 ? 1 : IntraCfg<LW, LH>::warps;                          \
             const int n = ((gc + uw - 1) / uw) * ((gr + uh - 1) / uh);                                             \
-            intraDecide<LW, LH><<<(n + wp - 1) / wp, 32 * wp, 0, s->shapeStream[si++]>>>(ia);                      \
+            intraDecide<LW, LH><<<(n + wp - 1) / wp, IntraCfg<LW, LH>::threads, 0, s->shapeStream[si++]>>>(ia);    \
         }
         PF_IDEC(6, 6) PF_IDEC(5, 5) PF_IDEC(4, 4) PF_IDEC(3, 3)
         if (intraRect) {
