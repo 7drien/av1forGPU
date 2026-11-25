@@ -12,8 +12,8 @@ Full measurements: [docs/svt_gap_plan.md](docs/svt_gap_plan.md).
   - intra early exit at 1.5× the inter cost (−3.8% time for +0.11% BD-rate)
   - decision buffers shared between luma and chroma (identical output)
   - thread-team transforms for the 64x64 decision (identical output)
-- Standing against SVT-AV1 preset 8: video_1 −0.9%, video_2 +3.3%, video_3 −18.7%, video_4 −33.5%, video_5 −10.9%
-  (mean −12.2%); about half its speed.
+- Standing against SVT-AV1 preset 8 (clean GPU): size video_1 −0.6%, video_2 +3.2%, video_3 −18.7%, video_4 −33.5%,
+  video_5 −11.0% (mean −12.1%); speed −27%, −38%, −65%, −62%, −50%.
 
 ## 2026-11-24
 

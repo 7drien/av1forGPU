@@ -6,23 +6,21 @@ syntax and the bitstream.
 
 ## Results at a glance
 
-First 120 frames of five test clips, RTX 3060 Ti. Negative BD-rate means fewer bits than SVT-AV1 preset 8 at the same
-quality ([details](docs/benchmark.md)).
+First 120 frames of five test clips, RTX 3060 Ti, clean GPU (2026-11-25). **Size** is BD-rate against SVT-AV1 preset 8:
+bits needed for the same quality (negative = smaller files). **Speed** is our median fps relative to SVT-AV1 preset 8,
+wall time including process start ([details](docs/benchmark.md)).
 
-| Clip | BD-rate vs SVT-AV1 p8 | fps (ours / SVT-AV1 p8) ¹ |
-| --- | ---: | ---: |
-| video_1, 1080×1920 static | **−0.9%** | not re-measured / 36.5 |
-| video_2, 1080p concert | +3.3% | about 20 / 34.4 |
-| video_3, 4K street | **−18.7%** | not re-measured / 17.3 |
-| video_4, 4K advert | **−33.5%** | not re-measured / 16.4 |
-| video_5, 1080p animation | **−10.9%** | not re-measured / 41.2 |
+| Clip | Size vs SVT-AV1 p8 | Speed vs SVT-AV1 p8 | fps (ours / SVT) |
+| --- | ---: | ---: | ---: |
+| video_1, 1080×1920 static | **−0.6%** | −27% | 26.7 / 36.7 |
+| video_2, 1080p concert | +3.2% | −38% | 20.4 / 33.1 |
+| video_3, 4K street | **−18.7%** | −65% | 6.1 / 17.6 |
+| video_4, 4K advert | **−33.5%** | −62% | 6.2 / 16.2 |
+| video_5, 1080p animation | **−11.0%** | −50% | 21.1 / 41.9 |
+| Mean | **−12.1%** | | |
 
-¹ The full intra search costs speed: on a clean GPU, 120 frames of video_2 take about 6.1 s, against about 3.5 s for
-SVT-AV1 preset 8. The other clips have not been re-timed since the intra searches were added; they ran at 0.5× to
-0.95× of SVT before them. Encoding is currently about half SVT-AV1 preset 8's speed.
-
-Every stream decodes with dav1d to exactly the encoder's reconstruction. The `--pframes` streams also decode
-identically with libaom and NVDEC.
+Files are smaller than SVT-AV1 preset 8's on four of five clips, but encoding is 27 to 65% slower. Every stream decodes
+with dav1d to exactly the encoder's reconstruction.
 
 ## Build
 

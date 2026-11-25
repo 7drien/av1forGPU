@@ -2,41 +2,39 @@
 
 All results: NVIDIA GeForce RTX 3060 Ti (8 GB, `sm_86`), driver 595.99.02, CUDA 12.4.
 
-## Current results (`--pframes`, 2026-11-25)
+## Current results (`--pframes`, 2026-11-25, clean GPU)
 
 First 120 frames of every clip in `benckmark/`, encoded with
-`--pframes --persistent-cdf --qindex {20,50,90,130}`, decoded with dav1d. BD-rate uses YUV-weighted PSNR (6:1:1).
-**Negative BD-rate means fewer bits than the reference at the same quality.**
+`--pframes --persistent-cdf --qindex {20,50,90,130}`, decoded with dav1d. **Size** is BD-rate with YUV-weighted PSNR
+(6:1:1) against SVT-AV1 preset 8 at CRF 24/32/40/48: the bits needed for the same quality (negative = smaller).
+**Speed** is the ratio of median fps (four encodes each, wall time including process start).
 
-| Clip | Content | BD-rate vs SVT-AV1 preset 8 | BD-rate vs libaom cpu-used 8 | fps (ours) | fps (SVT-AV1 p8) |
+| Clip | Content | Size vs SVT-AV1 p8 | Speed vs SVT-AV1 p8 | fps (ours) | fps (SVT-AV1 p8) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| video_1 | 1080×1920, 30 fps, static | **−0.9%** | | not re-measured | 36.5 |
-| video_2 | 1920×1080, 30 fps, concert, cuts | +3.3% | | about 20 | 34.4 |
-| video_3 | 3840×2160, 24 fps, handheld street | **−18.7%** | | not re-measured | 17.3 |
-| video_4 | 3840×2160, 24 fps, advert | **−33.5%** | | not re-measured | 16.4 |
-| video_5 | 1920×1080, animation | **−10.9%** | | 26.3 | 41.2 |
-| **Mean** | | **−12.2%** | | | |
+| video_1 | 1080×1920, 30 fps, static | **−0.6%** | −27% (0.73×) | 26.7 | 36.7 |
+| video_2 | 1920×1080, 30 fps, concert, cuts | +3.2% | −38% (0.62×) | 20.4 | 33.1 |
+| video_3 | 3840×2160, 24 fps, handheld street | **−18.7%** | −65% (0.35×) | 6.1 | 17.6 |
+| video_4 | 3840×2160, 24 fps, advert | **−33.5%** | −62% (0.38×) | 6.2 | 16.2 |
+| video_5 | 1920×1080, animation | **−11.0%** | −50% (0.50×) | 21.1 | 41.9 |
+| **Mean** | | **−12.1%** | | | |
 
-- **Compression:** better than SVT-AV1 preset 8 on four of five clips, behind on video_2.
-  libaom cpu-used 8 (before rectangular intra: +25.4%, +15.7%, +43.4%, +9.6%, +4.9%, mean +19.8%) is not re-measured.
-- **Speed:** about half of SVT-AV1 preset 8. The exhaustive intra search (every shape, every mode checked by
-  rate-distortion, CfL) costs time: on a clean GPU, 120 frames of video_2 take about 6.1 s, against about 3.5 s for SVT
-  (4.4 s with `--pf-no-intra`, at about +10% BD-rate). The other clips have not been re-timed on a clean GPU since; before
-  the intra searches they ran at 0.5× to 0.95× of SVT.
-- SVT and libaom figures come from cached reference encodes (`tests/compare.py`).
-- Another job used the GPU intermittently while these were measured; speed was timed only in windows where the GPU
-  had no other process.
+- **Size:** smaller than SVT-AV1 preset 8 on four of five clips, 3.2% larger on video_2.
+- **Speed:** 0.35× to 0.73× of SVT-AV1 preset 8. The exhaustive intra search (every shape, every mode checked by
+  rate-distortion, CfL) is a large part of it: video_2 takes 4.4 s for 120 frames with `--pf-no-intra` against about 6 s
+  by default (and about +10% size).
+- No other GPU process ran during this benchmark (load average below 1). SVT figures come from cached reference
+  encodes (`tests/compare.py`).
 
 ### Progress during the day (BD-rate vs SVT-AV1 preset 8)
 
 | Clip | Morning (`b40`) | Now | fps morning → now |
 | --- | ---: | ---: | ---: |
-| video_1 | +5.3% | −0.9% | 24.5 → not re-measured |
-| video_2 | +18.4% | +3.3% | 19.5 → about 20 |
-| video_3 | −13.2% | −18.7% | 7.8 → not re-measured |
-| video_4 | −25.6% | −33.5% | 7.9 → not re-measured |
-| video_5 | −10.8% | −10.9% | 21.0 → not re-measured |
-| Mean | −5.2% | −12.2% | |
+| video_1 | +5.3% | −0.6% | 24.5 → 26.7 |
+| video_2 | +18.4% | +3.2% | 19.5 → 20.4 |
+| video_3 | −13.2% | −18.7% | 7.8 → 6.1 |
+| video_4 | −25.6% | −33.5% | 7.9 → 6.2 |
+| video_5 | −10.8% | −11.0% | 21.0 → 21.1 |
+| Mean | −5.2% | −12.1% | |
 
 Main changes:
 
