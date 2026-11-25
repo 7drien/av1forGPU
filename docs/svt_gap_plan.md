@@ -855,3 +855,5 @@ kernel (temporary).
   search 6.1 s, exhaustive intra (default) 6.8 s, without rectangular intra 5.8 s; intra decision 2.28 s, reconstruction
   0.33 s (synchronized timers). The intra decision started from snapshots during the last three refinement passes (all
   shapes, own stream) was slower (7.35 vs 6.8 s) and +0.2 to 0.4% BD: reverted.
+- Intra luma candidates ranked by the quantizer estimate (DCT_DCT, no reconstruction; the winner coded in full,
+  `AV1GPU_PF_INTRA_EST`): 6.5-6.7 vs 6.9-7.0 s (clean GPU), video_1 +0.72%, video_2 -0.06%: off.
