@@ -846,3 +846,8 @@ kernel (temporary).
   decision with the full mode searches is the expensive part (`AV1GPU_PF_INTRA_NORECT` took the encode from about 14 to
   6 s in one contended pair). Cheaper settings measured for BD only: top-5 luma + SAD chroma +0.28% / +0.53%; an early
   exit after the first luma candidate (`AV1GPU_PF_INTRA_EARLYGATE` 1.5 / 1.2) +0.11% / +0.19% (video_1 / video_2 mean).
+- Intra decision work (`AV1GPU_PF_INTRA_WORK`, samples per 1080p video_2 frame, deterministic): default luma coding 21.5 M,
+  chroma 7.7 M, CfL alpha search 2.1 M (x33 candidates folded in), mode screens 5.0 M. Without rectangular intra: luma 16.9 M.
+  Top-3 luma + SAD chroma + no CfL: luma 6.4 M, chroma 1.7 M. SATD ranking (`AV1GPU_PF_INTRA_SATD`) with 3 / 5 RD-checked
+  modes: luma 6.5 / 10.5 M, BD video_2 +1.08% / +0.75% (video_1 +0.15% / +0.01%) against the exhaustive default: kept off.
+  The speed cost of the exhaustive search still needs a clean-GPU measurement.

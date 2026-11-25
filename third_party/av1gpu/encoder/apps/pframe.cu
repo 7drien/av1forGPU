@@ -2814,6 +2814,7 @@ struct IntraArgs {
     float margin;
     float sadGate;
     float earlyGate;
+    int satd;   // rank luma modes by 4x4 Hadamard SATD (else subsampled SAD)
     int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
     float splitPartBits;   // extra partition bits of that split   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
     int deltaK;   // angle-delta candidates RD-checked (best by SAD) after the base modes
@@ -2845,6 +2846,10 @@ struct IntraScratch {
     float tmpC[2][TCH * (CW + 1)];
     uint8_t aboveC[2][CW + 4], leftC[2][CH + 4];
 };
+// AV1GPU_PF_INTRA_WORK: samples processed by the intra decision, [0] luma coding, [1] chroma coding, [2] CfL alpha
+// search, [3] SAD screens (a deterministic work measure).
+__device__ unsigned long long g_intraWork[4];
+__device__ __forceinline__ void intraWork(int k, int n) { if ((threadIdx.x & 31) == 0) atomicAdd(&g_intraWork[k], (unsigned long long)n); }
 // Rate-distortion terms of one plane of an intra block.
 struct IntraPart { float dSkip, dCoded, rate; int nz, type, noSkip; };
 // AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
@@ -2887,13 +2892,36 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
         int best = 0x7fffffff, bestNd = 0x7fffffff, third = 0x7fffffff;
         for (int k = 0; k < a.nLuma; k++) {
             const int m = c_lumaCands[k];
-            // SAD screen on every other row and column of blocks >= 16x16 (the choice is checked by RD after)
+            // SAD screen on every other row and column of blocks >= 16x16 (the choice is checked by RD after), or
+            // with AV1GPU_PF_INTRA_SATD the 4x4 Hadamard SATD of the residual over the whole block
             constexpr int SS = W >= 16 && H >= 16 ? 1 : 0, LS = LW - SS, WS = W >> SS, HS = H >> SS;
             int sad = 0;
-            for (int i = lane; i < WS * HS; i += 32) {
-                const int r = (i >> LS) << SS, c = (i & (WS - 1)) << SS;
-                sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, LW, LH, ab, lb));
+            if (a.satd) {
+                for (int b4 = lane; b4 < (W / 4) * (H / 4); b4 += 32) {
+                    const int r0 = (b4 / (W / 4)) * 4, c0 = (b4 % (W / 4)) * 4;
+                    int d[16];
+#pragma unroll
+                    for (int t = 0; t < 16; t++)
+                        d[t] = (int)src[(y0 + r0 + t / 4) * sp + x0 + c0 + t % 4] - intraPixel(m, dcY, r0 + t / 4, c0 + t % 4, LW, LH, ab, lb);
+#pragma unroll
+                    for (int rr = 0; rr < 4; rr++) {   // rows
+                        int *v = d + 4 * rr;
+                        const int a0 = v[0] + v[1], a1 = v[0] - v[1], a2 = v[2] + v[3], a3 = v[2] - v[3];
+                        v[0] = a0 + a2; v[1] = a1 + a3; v[2] = a0 - a2; v[3] = a1 - a3;
+                    }
+#pragma unroll
+                    for (int cc = 0; cc < 4; cc++) {   // columns
+                        const int a0 = d[cc] + d[4 + cc], a1 = d[cc] - d[4 + cc], a2 = d[8 + cc] + d[12 + cc], a3 = d[8 + cc] - d[12 + cc];
+                        sad += abs(a0 + a2) + abs(a1 + a3) + abs(a0 - a2) + abs(a1 - a3);
+                    }
+                }
+            } else {
+                for (int i = lane; i < WS * HS; i += 32) {
+                    const int r = (i >> LS) << SS, c = (i & (WS - 1)) << SS;
+                    sad += abs((int)src[(y0 + r) * sp + x0 + c] - intraPixel(m, dcY, r, c, LW, LH, ab, lb));
+                }
             }
+            intraWork(3, WS * HS);
             sad = warp_sumi(sad);
             if (sadOut) sadOut[k] = sad;
             if (a.alt2) {   // runner-up by SAD (checked by RD in intraBlock)
@@ -2937,6 +2965,7 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
     e.rnd = a.rnd; e.zbin = a.zbin;
     e.skipCtx = 0; e.dcCtx = 0; e.intraDir = mode & 15; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
+    intraWork(0, W * H);
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
@@ -3132,6 +3161,7 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << 
     e.rnd = a.rnd; e.zbin = a.zbin;
     e.skipCtx = 7; e.dcCtx = 0; e.intraDir = 0; e.reduced = a.reduced;
     e.C = g_cost[a.qctx];
+    intraWork(1, CW * CH);
     e.resEnergy = warp_sum(en);
     e.qmDist = 0; e.qmRnd = 0;
     EvalOut o;
@@ -3177,6 +3207,7 @@ __device__ int cflBestAlpha(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
             sse[al + 16] += d * d;
         }
     }
+    intraWork(2, CW * CH * 33);
     int best = 0x7fffffff, bestA = 0;
 #pragma unroll
     for (int al = 0; al < 33; al++) {
@@ -3278,7 +3309,7 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
         if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt3; }
     }
     // AV1GPU_PF_INTRA_TOPK > 3: the next best modes by SAD too
-    if (a.topK > 3 && pt[0].dSkip < kInf) {
+    if (a.topK > 0 && pt[0].dSkip < kInf) {
         const int first = mode, second = alt, third = alt3;
         auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
         // base modes (angle_delta 0) first, then the deltaK best angle-delta candidates by SAD
@@ -4857,6 +4888,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%
         ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
+        ia.satd = getenv("AV1GPU_PF_INTRA_SATD") != nullptr;
         ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 0.f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
@@ -4910,6 +4942,19 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         { FineTimer t3("intra recon");
         intraRecon<<<nSb, 96, 0, stream>>>(ia); }
+        static const bool intraWorkStats = getenv("AV1GPU_PF_INTRA_WORK") != nullptr;
+        if (intraWorkStats) {
+            static unsigned long long tot[4];
+            static int nf;
+            unsigned long long wk[4], zero[4] = {};
+            cudaStreamSynchronize(stream);
+            cudaMemcpyFromSymbol(wk, g_intraWork, sizeof wk);
+            cudaMemcpyToSymbol(g_intraWork, zero, sizeof zero);
+            for (int k = 0; k < 4; k++) tot[k] += wk[k];
+            if (++nf % 20 == 0)
+                fprintf(stderr, "intra work per frame (Msamples): luma %.2f chroma %.2f cfl %.2f sad %.2f\n", tot[0] / 1e6 / nf,
+                        tot[1] / 1e6 / nf, tot[2] / 1e6 / nf, tot[3] / 1e6 / nf);
+        }
         static const bool intraStats = getenv("AV1GPU_PF_INTRA_STATS") != nullptr;
         if (intraStats) {   // share of the frame area in intra blocks, by size (AV1GPU_PF_INTRA_STATS)
             static long long area[5], frames;
