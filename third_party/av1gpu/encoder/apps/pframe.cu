@@ -3309,18 +3309,25 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
                          a.lambda * (a.intraBits + a.modeBase);
         if (lb > a.earlyGate * jInter) return kInf;
     }
+    // candidate comparison; with the estimate ranking the runner-up is kept too (coded in full below)
+    int runner = -1;
+    float runnerJ = kInf;
+    auto consider = [&](const IntraPart &q, int m) {
+        const float jq = fminf(q.dCoded + a.lambda * q.rate, q.dSkip);
+        const float jb = fminf(pt[0].dCoded + a.lambda * pt[0].rate, pt[0].dSkip);
+        if (jq <= jb) { runner = mode; runnerJ = jb; pt[0] = q; mode = m; }
+        else if (jq < runnerJ) { runner = m; runnerJ = jq; }
+    };
     if (alt >= 0 && alt != mode) {
         // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
         int m2 = alt;
         const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m2, cft);
-        auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
-        if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt; }
+        consider(q, alt);
     }
     if (alt3 >= 0 && alt3 != mode && alt3 != alt) {   // third best by SAD (AV1GPU_PF_INTRA_ALT3)
         int m3 = alt3;
         const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, m3, cft);
-        auto jl = [&](const IntraPart &v) { return fminf(v.dCoded + a.lambda * v.rate, v.dSkip); };
-        if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = alt3; }
+        consider(q, alt3);
     }
     // AV1GPU_PF_INTRA_TOPK > 3: the next best modes by SAD too
     if (a.topK > 0 && pt[0].dSkip < kInf) {
@@ -3339,12 +3346,22 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
             sads[pick] = -1;
             int mk = c_lumaCands[pick];
             const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mk, cft);
-            if (jl(q) <= jl(pt[0])) { pt[0] = q; mode = c_lumaCands[pick]; }
+            consider(q, c_lumaCands[pick]);
         }
     }
-    if (a.est) {   // the chosen mode in full: transform type search and exact reconstruction
-        int mf = mode;
-        pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mf, -1);
+    if (a.est) {   // the chosen mode in full: transform type search and exact reconstruction (and the runner-up)
+        if (a.est >= 2 && runner >= 0 && runner != mode) {
+            int mr = runner;
+            const IntraPart q = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mr, -1);
+            int mf = mode;
+            const IntraPart b = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mf, -1);
+            const float jq = fminf(q.dCoded + a.lambda * q.rate, q.dSkip), jb = fminf(b.dCoded + a.lambda * b.rate, b.dSkip);
+            if (jq < jb) { pt[0] = q; mode = runner; }
+            else pt[0] = b;
+        } else {
+            int mf = mode;
+            pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mf, -1);
+        }
     }
     {
         // lower bound of the final cost (chroma adds distortion and bits; splits are only tried below splitGate x the
@@ -4907,7 +4924,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.satd = getenv("AV1GPU_PF_INTRA_SATD") != nullptr;
-        ia.est = getenv("AV1GPU_PF_INTRA_EST") != nullptr;
+        ia.est = getenv("AV1GPU_PF_INTRA_EST") ? atoi(getenv("AV1GPU_PF_INTRA_EST")) : 0;
         ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 0.f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;

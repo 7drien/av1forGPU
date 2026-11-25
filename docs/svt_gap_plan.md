@@ -857,3 +857,5 @@ kernel (temporary).
   shapes, own stream) was slower (7.35 vs 6.8 s) and +0.2 to 0.4% BD: reverted.
 - Intra luma candidates ranked by the quantizer estimate (DCT_DCT, no reconstruction; the winner coded in full,
   `AV1GPU_PF_INTRA_EST`): 6.5-6.7 vs 6.9-7.0 s (clean GPU), video_1 +0.72%, video_2 -0.06%: off.
+  With the two best candidates coded in full (`AV1GPU_PF_INTRA_EST=2`): 6.66-6.72 vs 6.91-6.97 s, video_1 +0.49%, video_2
+  -0.10%: also off. The transform-type search of the candidates is not where most of the intra decision time goes.
