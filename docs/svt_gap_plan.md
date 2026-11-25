@@ -851,3 +851,7 @@ kernel (temporary).
   Top-3 luma + SAD chroma + no CfL: luma 6.4 M, chroma 1.7 M. SATD ranking (`AV1GPU_PF_INTRA_SATD`) with 3 / 5 RD-checked
   modes: luma 6.5 / 10.5 M, BD video_2 +1.08% / +0.75% (video_1 +0.15% / +0.01%) against the exhaustive default: kept off.
   The speed cost of the exhaustive search still needs a clean-GPU measurement.
+- Clean-GPU timings (video_2, 120 frames, q50; runs only while no other GPU process existed): no intra 4.4 s, cheap intra
+  search 6.1 s, exhaustive intra (default) 6.8 s, without rectangular intra 5.8 s; intra decision 2.28 s, reconstruction
+  0.33 s (synchronized timers). The intra decision started from snapshots during the last three refinement passes (all
+  shapes, own stream) was slower (7.35 vs 6.8 s) and +0.2 to 0.4% BD: reverted.
