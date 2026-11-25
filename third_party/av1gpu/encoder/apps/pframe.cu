@@ -2854,6 +2854,29 @@ struct IntraScratch {
 // search, [3] SAD screens (a deterministic work measure).
 __device__ unsigned long long g_intraWork[4];
 __device__ __forceinline__ void intraWork(int k, int n) { if ((threadIdx.x & 31) == 0) atomicAdd(&g_intraWork[k], (unsigned long long)n); }
+// Decision-pass scratch: luma and chroma are coded one after the other, so the chroma buffers share the luma
+// prediction / residual / transform / level buffers (the luma reconstruction stays: CfL reads it).
+template <int W, int H = W>
+struct IntraScratchD {
+    static constexpr int TW = W > 32 ? 32 : W, TH = H > 32 ? 32 : H, CW = W / 2, CH = H / 2, TCH = CH > 32 ? 32 : CH;
+    uint8_t ttype[16];
+    uint8_t rec[W * H];
+    uint8_t above[W + 4], left[H + 4];
+    uint8_t aboveC[2][CW + 4], leftC[2][CH + 4];
+    union {
+        struct {
+            float tmp[TH * (W + 1)];
+            int16_t res[W * H];
+            int16_t q[TW * TH];
+            uint8_t pred[W * H];
+        };
+        struct {
+            float tmpC[2][TCH * (CW + 1)];
+            int16_t qC[2][CW * CH], resC[2][CW * CH];
+            uint8_t predC[2][CW * CH], recC[2][CW * CH];
+        };
+    };
+};
 // Rate-distortion terms of one plane of an intra block.
 struct IntraPart { float dSkip, dCoded, rate; int nz, type, noSkip; };
 // AboveRow[-1 .. n-1] and LeftCol[-1 .. n-1] of an n x n block at (x, y) of a plane (spec 7.11.2; the samples are
@@ -2881,8 +2904,8 @@ __device__ __forceinline__ int intraPixel(int code, int dc, int i, int j, int lw
 }
 // Luma of an intra block (one warp). mode < 0: choose the luma mode by SAD first; forcedType < 0: search the transform
 // type of the intra set (8x8 / 16x16) by the quantizer's estimate.
-template <int LW, int LH = LW>
-__device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
+template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+__device__ IntraPart intraLuma(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                                int forcedType, int *altMode = nullptr, float sseGate = kInf, int *alt3Mode = nullptr,
                                int *sadOut = nullptr) {
     constexpr int W = 1 << LW, H = 1 << LH, TW = W > 32 ? 32 : W, TH = H > 32 ? 32 : H;
@@ -3023,8 +3046,8 @@ __device__ IntraPart intraLuma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
 }
 // Edges of a transform at (x, y) inside the intra block at (x0, y0) (n x n): samples of the block come from its local
 // reconstruction S.rec (earlier transforms in raster order), the others from the frame.
-template <int N>
-__device__ void intraEdgesLocal(const IntraArgs &a, const IntraScratch<N> &S, int x0, int y0, int x, int y, int n, bool haveA,
+template <int N, class SC>
+__device__ void intraEdgesLocal(const IntraArgs &a, const SC &S, int x0, int y0, int x, int y, int n, bool haveA,
                                 bool haveL, uint8_t *ab, uint8_t *lb) {
     const int lane = threadIdx.x & 31;
     auto at = [&](int xx, int yy) -> uint8_t {
@@ -3044,8 +3067,8 @@ __device__ void intraEdgesLocal(const IntraArgs &a, const IntraScratch<N> &S, in
 // Luma of an intra block with tx_depth D (2^D x 2^D transforms of side N >> D, predicted one after the other in raster
 // order from the reconstruction of the earlier ones), one warp, for a given mode. Transform types are searched per
 // transform (S.ttype). With write, each transform's levels go to the frame's level planes. Such blocks never code skip.
-template <int L, int D>
-__device__ IntraPart intraLumaSplit(const IntraArgs &a, IntraScratch<1 << L> &S, int x0, int y0, bool haveA, bool haveL,
+template <int L, int D, class SC = IntraScratch<1 << L>>
+__device__ IntraPart intraLumaSplit(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL,
                                     int mode, bool write) {
     constexpr int N = 1 << L, LT = L - D, T = 1 << LT, PER = 1 << D;
     static_assert(T <= 32 && T >= 8, "split transforms of 8..32");
@@ -3141,8 +3164,8 @@ __device__ __forceinline__ int cflLumaAvg(const uint8_t *luma) {
 __device__ __forceinline__ int cflPixel(int dc, int alpha, int v, int avg) {
     return min(max(dc + av1g_round2signed(alpha * (v - avg), 6), 0), 255);
 }
-template <int LW, int LH = LW>
-__device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int p, int x0, int y0, bool haveA, bool haveL,
+template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+__device__ IntraPart intraChroma(const IntraArgs &a, SC &S, int p, int x0, int y0, bool haveA, bool haveL,
                                  int uvMode, int cflAlpha = 0, const uint8_t *cflLuma = nullptr) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
     const int lane = threadIdx.x & 31;
@@ -3201,8 +3224,8 @@ __device__ IntraPart intraChroma(const IntraArgs &a, IntraScratch<1 << LW, 1 << 
     return r;
 }
 // CfL alpha of plane p (-16..16, 1/8 units) with the least prediction SSE, from a W-wide luma reconstruction.
-template <int LW, int LH>
-__device__ int cflBestAlpha(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int p, int x0, int y0, bool haveA, bool haveL,
+template <int LW, int LH, class SC>
+__device__ int cflBestAlpha(const IntraArgs &a, SC &S, int p, int x0, int y0, bool haveA, bool haveL,
                             const uint8_t *luma) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
     const int lane = threadIdx.x & 31;
@@ -3268,8 +3291,8 @@ __device__ void intraWrite(const IntraArgs &a, const IntraScratch<1 << LW, 1 << 
     }
 }
 // Chroma mode of an intra block by SAD over both planes (one warp).
-template <int LW, int LH = LW>
-__device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL) {
+template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+__device__ int intraChromaMode(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL) {
     constexpr int CW = (1 << LW) / 2, CH = (1 << LH) / 2, LCW = LW - 1, LCH = LH - 1;
     const int lane = threadIdx.x & 31;
     const int cw = a.w >> 1, ch = a.h >> 1, cx = x0 >> 1, cy = y0 >> 1;
@@ -3295,8 +3318,8 @@ __device__ int intraChromaMode(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH
     return mode;
 }
 // Decision pass: one warp codes all three planes; returns the cost and the mode / luma type.
-template <int LW, int LH = LW>
-__device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &S, int x0, int y0, bool haveA, bool haveL, int &mode,
+template <int LW, int LH = LW, class SC = IntraScratch<1 << LW, 1 << LH>>
+__device__ float intraBlock(const IntraArgs &a, SC &S, int x0, int y0, bool haveA, bool haveL, int &mode,
                             int &type, int &depth, float jInter, int &uvMode, int &cflU, int &cflV) {
     IntraPart pt[3];
     cflU = cflV = 0;
@@ -3466,7 +3489,7 @@ template <int LW, int LH>
 __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(IntraArgs a) {
     constexpr int W = 1 << LW, H = 1 << LH, WARPS = IntraCfg<LW, LH>::warps, UW = W / 8, UH = H / 8;
     constexpr int L = LW;   // square blocks: their size
-    __shared__ IntraScratch<W, H> S[WARPS];
+    __shared__ IntraScratchD<W, H> S[WARPS];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int gcols = a.j.fs.gcols, bcols = (gcols + UW - 1) / UW;
     const int idx = blockIdx.x * WARPS + warp;
@@ -3501,7 +3524,7 @@ __global__ void __launch_bounds__(32 * IntraCfg<LW, LH>::warps) intraDecide(Intr
         // four 32x32 intra blocks instead (partition SPLIT), each with its own modes; the quadrants' neighbours inside
         // the block are approximated by the inter reconstruction, as the outer ones are
         if (a.splitIntra && jIntra < kInf) {
-            auto &S32 = *reinterpret_cast<IntraScratch<32> *>(&S[warp]);
+            auto &S32 = *reinterpret_cast<IntraScratchD<32> *>(&S[warp]);
             float j4 = a.lambda * a.splitPartBits;
             uint32_t cs[4];
             for (int q = 0; q < 4 && j4 < kInf; q++) {

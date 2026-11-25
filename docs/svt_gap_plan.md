@@ -865,3 +865,6 @@ kernel (temporary).
   intraRecon (250 ms). Split transforms of the reconstruction with DCT_DCT only (`AV1GPU_PF_INTRA_SPLITDCT`): recon
   331 -> 313 ms, video_1 +0.19%: off. Lighter search for blocks with a 64-sample side (`AV1GPU_PF_INTRA_TOPK64=0`,
   `AV1GPU_PF_INTRA_UVSAD64`): 6.73 -> 6.20 s (-8%) but video_2 +1.76%: off.
+- Decision-pass scratch with the chroma buffers aliased onto the luma ones (`IntraScratchD`; luma and chroma are coded
+  in turn there): identical output; 64x64 decision 27 KB of shared memory per warp (was about 48 KB). video_2 6.45 s
+  (clean GPU; the default measured 6.6-6.9 s before).
