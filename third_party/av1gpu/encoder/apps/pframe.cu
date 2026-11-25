@@ -5209,7 +5209,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         // the four sizes are independent (they read the reconstruction, write their own block positions): one shape
         // stream each, joined before the reconstruction pass
         // rectangular shapes too unless AV1GPU_PF_INTRA_NORECT
-        static const bool intraRect = !getenv("AV1GPU_PF_INTRA_NORECT");
+        const bool intraRect = st.intraRect && !getenv("AV1GPU_PF_INTRA_NORECT");
         const int nStreams = intraRect ? kShapes : 4;
         cudaEventRecord(s->trialFork, stream);
         for (int k = 0; k < nStreams; k++) cudaStreamWaitEvent(s->shapeStream[k], s->trialFork, 0);
@@ -5223,8 +5223,13 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         }
         PF_IDEC(6, 6) PF_IDEC(5, 5) PF_IDEC(4, 4) PF_IDEC(3, 3)
         if (intraRect) {
-            PF_IDEC(4, 3) PF_IDEC(3, 4) PF_IDEC(5, 4) PF_IDEC(4, 5) PF_IDEC(6, 5) PF_IDEC(5, 6)
-            PF_IDEC(5, 3) PF_IDEC(3, 5) PF_IDEC(6, 4) PF_IDEC(4, 6)
+            // AV1GPU_PF_INTRA_RECTMIN: smallest rectangle area (samples) tried as intra
+            static const int rectMin = getenv("AV1GPU_PF_INTRA_RECTMIN") ? atoi(getenv("AV1GPU_PF_INTRA_RECTMIN")) : 1024;   // 64x16 and up: +15-22% fps
+            if (128 >= rectMin) { PF_IDEC(4, 3) PF_IDEC(3, 4) }
+            if (512 >= rectMin) { PF_IDEC(5, 4) PF_IDEC(4, 5) }
+            if (2048 >= rectMin) { PF_IDEC(6, 5) PF_IDEC(5, 6) }
+            if (256 >= rectMin) { PF_IDEC(5, 3) PF_IDEC(3, 5) }
+            if (1024 >= rectMin) { PF_IDEC(6, 4) PF_IDEC(4, 6) }
         }
 #undef PF_IDEC
         for (int k = 0; k < nStreams; k++) {

@@ -275,6 +275,7 @@ int main(int argc, char **argv) {
     int pfCutQoffset = 30;      // scene-cut key frames: inter quantizer minus this (--pf-cut-qoffset)   // scene cut: mean luma block-mean difference (0 disables, --pf-scene-cut)
     int pfRefs = 2;   // references per inter frame: 2 (LAST + ALTREF) or 3 (+ the next anchor as ALTREF2, --pf-refs 3)
     int pfEntropyMode = 1;   // 0: CPU, 1: GPU modeling + host range coder, 2: all GPU
+    int pfIntraRect = -1;   // rectangular intra blocks: -1 by resolution (below 4 MP), 0 off, 1 on
     int pfTfFrames = 8;   // ALTREF temporal filter over +-8 frames (noisy content only; --pf-tf-frames 0 off)
     float pfTfStrength = 1.0f;
     bool pfFilters = true, pfCdef = false;
@@ -427,6 +428,10 @@ int main(int argc, char **argv) {
             pfSettings.blocks8 = false;
         } else if (!strcmp(argv[i], "--pf-no-rect4")) {
             pfSettings.rect4 = false;
+        } else if (!strcmp(argv[i], "--pf-intra-rect")) {
+            pfIntraRect = 1;
+        } else if (!strcmp(argv[i], "--pf-no-intra-rect")) {
+            pfIntraRect = 0;
         } else if (!strcmp(argv[i], "--pf-no-intra")) {
             pfSettings.intra = false;
         } else if (!strcmp(argv[i], "--pf-no-mode-refine")) {
@@ -1000,6 +1005,9 @@ int main(int argc, char **argv) {
             ein.switchableFilter = pfSettings.switchableFilter;
             ein.filterIntra = cfg.P.filterIntra != 0;
             st.intraDirectional = cfg.edgeFilter == 0;   // directional intra modes are modeled without the edge filter
+            // rectangular intra blocks below 4 MP only: on 4K they cost about 30% of the encode for 2-4% of size, where the
+            // encoder is already far smaller than SVT-AV1 preset 8 (--pf-intra-rect / --pf-no-intra-rect override)
+            st.intraRect = pfIntraRect >= 0 ? pfIntraRect != 0 : double(w) * h < 4.0e6;
             ein.qindex = qindex;
             ein.tileColsLog2 = pfTileCols;
             ein.tileRowsLog2 = pfTileRows;

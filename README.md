@@ -12,14 +12,15 @@ wall time including process start ([details](docs/benchmark.md)).
 
 | Clip | Size vs SVT-AV1 p8 | Speed vs SVT-AV1 p8 | fps (ours / SVT) |
 | --- | ---: | ---: | ---: |
-| video_1, 1080×1920 static | **−0.6%** | −27% | 26.7 / 36.7 |
-| video_2, 1080p concert | +3.2% | −38% | 20.4 / 33.1 |
-| video_3, 4K street | **−18.7%** | −65% | 6.1 / 17.6 |
-| video_4, 4K advert | **−33.5%** | −62% | 6.2 / 16.2 |
-| video_5, 1080p animation | **−11.0%** | −50% | 21.1 / 41.9 |
-| Mean | **−12.1%** | | |
+| video_1, 1080×1920 static | +1.9% | −11% | 32.7 / 36.7 |
+| video_2, 1080p concert | +4.6% | −30% | 23.3 / 33.1 |
+| video_3, 4K street | **−16.5%** | −55% | 7.9 / 17.6 |
+| video_4, 4K advert | **−29.8%** | −49% | 8.2 / 16.2 |
+| video_5, 1080p animation | **−10.9%** | −41% | 24.8 / 41.9 |
+| Mean | **−10.1%** | | |
 
-Files are smaller than SVT-AV1 preset 8's on four of five clips, but encoding is 27 to 65% slower. Every stream decodes
+Files are smaller than SVT-AV1 preset 8's on three of five clips (and within 5% on the other two); encoding is 11 to 55%
+slower. Every stream decodes
 with dav1d to exactly the encoder's reconstruction.
 
 ## Build

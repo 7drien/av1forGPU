@@ -71,6 +71,7 @@ struct Settings {
     int modeRefinePasses = 6;    // passes of that check (each against the neighbours' vectors of the previous one)
     bool intra = true;           // intra blocks in the inter frame (square blocks, decided after mode refinement)
     float intraBits = 6.f;       // extra mode bits charged to an intra block in that decision
+    bool intraRect = true;       // intra blocks of rectangular shapes too (22-36% of the encode time, 2-7% of size)
     bool intraDirectional = true;   // D113 / D135 / D157 intra modes (requires enable_intra_edge_filter = 0)
 };
 

@@ -11,17 +11,18 @@ First 120 frames of every clip in `benckmark/`, encoded with
 
 | Clip | Content | Size vs SVT-AV1 p8 | Speed vs SVT-AV1 p8 | fps (ours) | fps (SVT-AV1 p8) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| video_1 | 1080×1920, 30 fps, static | **−0.6%** | −27% (0.73×) | 26.7 | 36.7 |
-| video_2 | 1920×1080, 30 fps, concert, cuts | +3.2% | −38% (0.62×) | 20.4 | 33.1 |
-| video_3 | 3840×2160, 24 fps, handheld street | **−18.7%** | −65% (0.35×) | 6.1 | 17.6 |
-| video_4 | 3840×2160, 24 fps, advert | **−33.5%** | −62% (0.38×) | 6.2 | 16.2 |
-| video_5 | 1920×1080, animation | **−11.0%** | −50% (0.50×) | 21.1 | 41.9 |
-| **Mean** | | **−12.1%** | | | |
+| video_1 | 1080×1920, 30 fps, static | +1.9% | −11% (0.89×) | 32.7 | 36.7 |
+| video_2 | 1920×1080, 30 fps, concert, cuts | +4.6% | −30% (0.70×) | 23.3 | 33.1 |
+| video_3 | 3840×2160, 24 fps, handheld street | **−16.5%** | −55% (0.45×) | 7.9 | 17.6 |
+| video_4 | 3840×2160, 24 fps, advert | **−29.8%** | −49% (0.51×) | 8.2 | 16.2 |
+| video_5 | 1920×1080, animation | **−10.9%** | −41% (0.59×) | 24.8 | 41.9 |
+| **Mean** | | **−10.1%** | | | |
 
-- **Size:** smaller than SVT-AV1 preset 8 on four of five clips, 3.2% larger on video_2.
-- **Speed:** 0.35× to 0.73× of SVT-AV1 preset 8. The exhaustive intra search (every shape, every mode checked by
-  rate-distortion, CfL) is a large part of it: video_2 takes 4.4 s for 120 frames with `--pf-no-intra` against about 6 s
-  by default (and about +10% size).
+- **Size:** smaller than SVT-AV1 preset 8 on three of five clips, 1.9% / 4.6% larger on video_1 / video_2.
+- **Speed:** 0.45× to 0.89× of SVT-AV1 preset 8. Rectangular intra blocks are the costly part of the intra search
+  (22-36% of the encode with every rectangle): they are now off at 4 MP and above and limited to 64x16 and larger
+  rectangles below (`--pf-intra-rect` / `--pf-no-intra-rect`, `AV1GPU_PF_INTRA_RECTMIN`; all rectangles at 1080p:
+  video_1 -0.6% / 26.7 fps, video_2 +3.2% / 20.4 fps).
 - No other GPU process ran during this benchmark (load average below 1). SVT figures come from cached reference
   encodes (`tests/compare.py`).
 
@@ -29,12 +30,12 @@ First 120 frames of every clip in `benckmark/`, encoded with
 
 | Clip | Morning (`b40`) | Now | fps morning → now |
 | --- | ---: | ---: | ---: |
-| video_1 | +5.3% | −0.6% | 24.5 → 26.7 |
-| video_2 | +18.4% | +3.2% | 19.5 → 20.4 |
-| video_3 | −13.2% | −18.7% | 7.8 → 6.1 |
-| video_4 | −25.6% | −33.5% | 7.9 → 6.2 |
-| video_5 | −10.8% | −11.0% | 21.0 → 21.1 |
-| Mean | −5.2% | −12.1% | |
+| video_1 | +5.3% | +1.9% | 24.5 → 32.7 |
+| video_2 | +18.4% | +4.6% | 19.5 → 23.3 |
+| video_3 | −13.2% | −16.5% | 7.8 → 7.9 |
+| video_4 | −25.6% | −29.8% | 7.9 → 8.2 |
+| video_5 | −10.8% | −10.9% | 21.0 → 24.8 |
+| Mean | −5.2% | −10.1% | |
 
 Main changes:
 

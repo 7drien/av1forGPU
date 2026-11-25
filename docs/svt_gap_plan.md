@@ -871,3 +871,7 @@ kernel (temporary).
 - Thread teams (`team_*`): the forward transform, quantizer and inverse split over NT threads (32: the warp versions),
   and the intra functions templated on NT; the 64x64 intra decision runs a 128-thread team per block. Identical output
   (video_2 q50 / q130), dav1d 35/35; clean GPU 6.05-6.13 s against 6.14-7.11 s (within noise).
+- Speed configurations (clean GPU, five clips): the cheap intra search alone is barely faster; without rectangular intra
+  +22 to 36% fps (video_2 +10.5% size). New defaults: rectangular intra off at 4 MP and above (4K +30% fps, video_3
+  -16.5% / video_4 -29.8%), and only rectangles of 1024+ samples below (+15 to 22% fps; 512+: +10 to 15%). With the extra
+  4K settings (`--pf-no-8x8 --pf-no-rect4 --pf-refine-passes 4`): another +8%, video_3 -15.1% / video_4 -26.7% (not default).

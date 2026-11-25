@@ -5,6 +5,10 @@ Full measurements: [docs/svt_gap_plan.md](docs/svt_gap_plan.md).
 
 ## 2026-11-25
 
+- **Speed:** rectangular intra blocks off at 4 MP and above and limited to 64x16 and larger below: +15 to 32% fps
+  (video_1 0.89×, video_2 0.70×, video_3 0.45×, video_4 0.51×, video_5 0.59× of SVT-AV1 preset 8) for 1 to 4 points of
+  size (video_1 +1.9%, video_2 +4.6%, video_3 −16.5%, video_4 −29.8%, video_5 −10.9%).
+
 - **Intra mode search by rate-distortion:** every luma mode (`AV1GPU_PF_INTRA_TOPK`), every chroma mode, CfL for blocks up
   to 32x32: video_2 about −3%, video_1 about −1%. It costs speed: on a clean GPU, video_2 takes about 6.1 s for 120 frames
   against about 3.5 s for SVT-AV1 preset 8.
