@@ -3,6 +3,18 @@
 Notable changes to the `--pframes` inter encoder. BD-rate is against SVT-AV1 preset 8; negative is better.
 Full measurements: [docs/svt_gap_plan.md](docs/svt_gap_plan.md).
 
+## 2026-11-25
+
+- **Intra mode search by rate-distortion:** every luma mode (`AV1GPU_PF_INTRA_TOPK`), every chroma mode, CfL for blocks up
+  to 32x32: video_2 about −3%, video_1 about −1%. It costs speed: on a clean GPU, video_2 takes about 6.1 s for 120 frames
+  against about 3.5 s for SVT-AV1 preset 8.
+- **Speed:**
+  - intra early exit at 1.5× the inter cost (−3.8% time for +0.11% BD-rate)
+  - decision buffers shared between luma and chroma (identical output)
+  - thread-team transforms for the 64x64 decision (identical output)
+- Standing against SVT-AV1 preset 8: video_1 −0.9%, video_2 +3.3%, video_3 −18.7%, video_4 −33.5%, video_5 −10.9%
+  (mean −12.2%); about half its speed.
+
 ## 2026-11-24
 
 - **Rectangular intra blocks** (HORZ / VERT, HORZ_4 / VERT_4, three-way halves): video_2 −3.8%, video_1 −2.7%, video_3
