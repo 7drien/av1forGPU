@@ -859,3 +859,5 @@ kernel (temporary).
   `AV1GPU_PF_INTRA_EST`): 6.5-6.7 vs 6.9-7.0 s (clean GPU), video_1 +0.72%, video_2 -0.06%: off.
   With the two best candidates coded in full (`AV1GPU_PF_INTRA_EST=2`): 6.66-6.72 vs 6.91-6.97 s, video_1 +0.49%, video_2
   -0.10%: also off. The transform-type search of the candidates is not where most of the intra decision time goes.
+- Clean-GPU timing of the intra early exit (`AV1GPU_PF_INTRA_EARLYGATE`): 1.5 / 1.2 / 1.05 at 6.50-6.76 / 6.56-6.66 /
+  6.48-6.50 s against 6.84-6.94 s; 1.5 (+0.11% BD on video_1 / video_2) is now the default.

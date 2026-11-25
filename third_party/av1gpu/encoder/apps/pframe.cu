@@ -4925,7 +4925,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
         ia.satd = getenv("AV1GPU_PF_INTRA_SATD") != nullptr;
         ia.est = getenv("AV1GPU_PF_INTRA_EST") ? atoi(getenv("AV1GPU_PF_INTRA_EST")) : 0;
-        ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 0.f;
+        ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 1.5f;   // -3.8% time, +0.11% BD (video_1 / video_2)
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;
