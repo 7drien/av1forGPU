@@ -2813,6 +2813,7 @@ struct IntraArgs {
     int uvTip;    // the chosen chroma mode's cost (not UV_DC's) enters the intra / inter decision    // every chroma mode by RD (else UV_DC against the best by SAD)
     float margin;
     float sadGate;
+    float earlyGate;
     int splitIntra;        // 64x64 blocks may become four 32x32 intra blocks
     float splitPartBits;   // extra partition bits of that split   // > 0: skip blocks whose best intra SAD^2 / N^2 exceeds sadGate * the inter cost   // intra wins when margin * its cost is below the inter cost
     int deltaK;   // angle-delta candidates RD-checked (best by SAD) after the base modes
@@ -3256,6 +3257,13 @@ __device__ float intraBlock(const IntraArgs &a, IntraScratch<1 << LW, 1 << LH> &
     pt[0] = intraLuma<LW, LH>(a, S, x0, y0, haveA, haveL, mode, -1, &alt, a.sadGate > 0.f ? a.sadGate * jInter : kInf,
                               a.alt3 ? &alt3 : nullptr, sads);
     if (pt[0].dSkip >= kInf) return kInf;
+    // the first luma candidate already puts intra far above the inter cost: skip the other candidates, chroma and CfL
+    // (heuristic, AV1GPU_PF_INTRA_EARLYGATE; 0 off)
+    if (a.earlyGate > 0.f) {
+        const float lb = fminf(pt[0].dCoded + a.lambda * (pt[0].rate + a.skipBits0), pt[0].dSkip + a.lambda * a.skipBits1) +
+                         a.lambda * (a.intraBits + a.modeBase);
+        if (lb > a.earlyGate * jInter) return kInf;
+    }
     if (alt >= 0 && alt != mode) {
         // the SAD choice is one of the directional modes: keep it only if it also wins by rate-distortion
         int m2 = alt;
@@ -4849,6 +4857,7 @@ int Analyzer::analyze(const uint8_t *const src[3], const int pitch[3], const uin
         ia.alt2 = !getenv("AV1GPU_PF_INTRA_NOALT2");   // video_1 -0.24%, video_2 -0.48%
         ia.splitIntra = getenv("AV1GPU_PF_INTRA_QUAD") != nullptr;   // off: 6% of the encode for -0.07% (video_2)
         ia.splitPartBits = getenv("AV1GPU_PF_INTRA_QUADBITS") ? (float)atof(getenv("AV1GPU_PF_INTRA_QUADBITS")) : 1.5f;
+        ia.earlyGate = getenv("AV1GPU_PF_INTRA_EARLYGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_EARLYGATE")) : 0.f;
         ia.sadGate = getenv("AV1GPU_PF_INTRA_SADGATE") ? (float)atof(getenv("AV1GPU_PF_INTRA_SADGATE")) : 0.f;
         ia.margin = getenv("AV1GPU_PF_INTRA_MARGIN") ? (float)atof(getenv("AV1GPU_PF_INTRA_MARGIN")) : 1.f;
         ia.nModes = st.intraDirectional && !getenv("AV1GPU_PF_INTRA_NODIR") ? kIntraModes : kIntraModesNoDir;

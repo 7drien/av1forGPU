@@ -840,3 +840,9 @@ kernel (temporary).
 - CfL for intra blocks up to 32x32 (alphas by least SSE from the luma reconstruction, kept by RD; a skipped block
   re-predicts chroma from the luma prediction): video_1 -0.32%, video_2 -0.12% (against SVT-AV1 preset 8: video_1 -1.0%,
   video_2 +3.2%). `AV1GPU_PF_INTRA_NOCFL`, `AV1GPU_PF_INTRA_CFLBITS` (5).
+- Full five-clip run with every intra search on (m6): video_1 -1.0%, video_2 +3.2%, video_3 -18.7%, video_4 -33.5%,
+  video_5 -10.9% against SVT-AV1 preset 8 (mean -12.2%; -3.8% over m2). Speed could not be measured: another job used the
+  GPU intermittently (m6 fps 3.5 to 15.5, an older binary also ran at half its clean speed). The rectangular intra
+  decision with the full mode searches is the expensive part (`AV1GPU_PF_INTRA_NORECT` took the encode from about 14 to
+  6 s in one contended pair). Cheaper settings measured for BD only: top-5 luma + SAD chroma +0.28% / +0.53%; an early
+  exit after the first luma candidate (`AV1GPU_PF_INTRA_EARLYGATE` 1.5 / 1.2) +0.11% / +0.19% (video_1 / video_2 mean).
